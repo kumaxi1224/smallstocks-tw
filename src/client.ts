@@ -16,6 +16,7 @@ let preview: Snapshot = {
     showChangePoints: true,
     quoteSource: "mis",
     sidecarPort: 18765,
+    windowOpacity: 1,
   },
   quotes: {},
   rules: [],

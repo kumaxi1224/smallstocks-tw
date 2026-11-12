@@ -83,6 +83,8 @@ export interface Snapshot {
     updateCheck?: boolean;
     quoteSource?: "mis" | "shioaji";
     sidecarPort?: number;
+    /** Shell background opacity, 0.4–1.0; absent means fully opaque. */
+    windowOpacity?: number;
   };
   quotes: Record<string, Quote>;
   rules: Rule[];
@@ -133,6 +135,9 @@ export const change = (n: number | null | undefined) =>
 /** A signed point change, e.g. +12.5 / -3.25, trimmed the same way as `number`. */
 export const points = (n: number | null | undefined) =>
   n == null ? "—" : `${n > 0 ? "+" : ""}${number(n)}`;
+/** Shell background opacity, clamped to the range the core accepts (0.4–1). */
+export const shellOpacity = (v: number | null | undefined) =>
+  v == null || !Number.isFinite(v) ? 1 : Math.min(1, Math.max(0.4, v));
 export const time = (n: number | null | undefined) =>
   n
     ? new Date(n).toLocaleTimeString("zh-TW", {
@@ -146,12 +151,14 @@ export const time = (n: number | null | undefined) =>
 // Stock snapshots arrive about every one to two minutes; the core uses the same three minutes.
 export const FRESH_MS = 180_000;
 /**
- * Yahoo-routed symbols mirror the core's route rule: a ^ prefix, or no digit
- * at all (US tickers). Taiwan codes always contain a digit. Yahoo symbols
- * have no TWSE close-day machinery: their rows always render from the live
- * quote, whatever the Taiwan session is doing.
+ * Yahoo-routed symbols mirror the core's route rule: a ^ prefix, an =F/=X
+ * suffix (futures and FX, whose bodies may contain digits), or no digit at
+ * all (US tickers). Taiwan codes always contain a digit and never an '='.
+ * Yahoo symbols have no TWSE close-day machinery: their rows always render
+ * from the live quote, whatever the Taiwan session is doing.
  */
-export const isYahooSymbol = (c: string) => c.startsWith("^") || !/\d/.test(c);
+export const isYahooSymbol = (c: string) =>
+  c.startsWith("^") || c.includes("=") || !/\d/.test(c);
 /** How a stored symbol is written for the user: indices lose their ^ prefix. */
 export const displaySymbol = (c: string) => c.replace(/^\^/, "");
 export const stale = (q: Quote | undefined, now: number) =>

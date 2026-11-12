@@ -86,9 +86,10 @@ fn index_alias(s: &str) -> Option<&'static str> {
         _ => return None,
     })
 }
-/// Built-in display names for those same indices. Yahoo's own longName for them
-/// is truncated or padded ("TSEC CAPITALIZATION WEIGHTED ST…"), so this table
-/// wins wherever a Yahoo quote is parsed for one of them.
+/// Built-in display names for those same indices, plus the Yahoo futures and
+/// FX codes users paste from the same sheet. Yahoo's own longName for the
+/// indices is truncated or padded ("TSEC CAPITALIZATION WEIGHTED ST…"), so
+/// this table wins wherever a Yahoo quote is parsed for one of them.
 pub fn index_name(code: &str) -> Option<&'static str> {
     Some(match code {
         "^TWII" => "加權指數",
@@ -99,14 +100,21 @@ pub fn index_name(code: &str) -> Option<&'static str> {
         "^DJI" => "Dow Jones Industrial Average",
         "^GSPC" => "S&P 500",
         "^RUT" => "Russell 2000 Index",
+        "BZ=F" => "布蘭特原油",
+        "CL=F" => "西德州原油",
+        "GC=F" => "黃金",
+        "TWD=X" => "美元／台幣",
         _ => return None,
     })
 }
 /// The quote route of a canonical symbol: Taiwan codes (they contain a digit
 /// and carry no ^) come from TWSE MIS / the Shioaji sidecar; everything else
-/// (US tickers, ^ indices) comes from Yahoo. t00/o00 are Taiwan index codes.
+/// (US tickers, ^ indices, =F futures, =X exchange rates) comes from Yahoo.
+/// t00/o00 are Taiwan index codes.
 pub fn is_tw_symbol(code: &str) -> bool {
-    !code.starts_with('^') && code.bytes().any(|b| b.is_ascii_digit())
+    !code.contains('=')
+        && !code.starts_with('^')
+        && code.bytes().any(|b| b.is_ascii_digit())
 }
 /// How a stored symbol is written for the user: indices lose their ^ prefix.
 pub fn display_symbol(code: &str) -> &str {
@@ -115,7 +123,8 @@ pub fn display_symbol(code: &str) -> &str {
 /// Canonical form of a user-typed code, shared by the UI and MCP through
 /// execute. Taiwan codes keep their historic shapes (2330, 00685L, t00, o00);
 /// index shorthands fold to Yahoo symbols (.IXIC → ^IXIC, IX0001 → ^TWII, …);
-/// US tickers pass through uppercased, class-share dot included (VOO, BRK.B).
+/// US tickers pass through uppercased, class-share dot included (VOO, BRK.B);
+/// Yahoo futures and FX codes keep their =F / =X suffix (BZ=F, TWD=X).
 pub fn symbol(s: &str) -> Option<String> {
     let s = s.trim().to_uppercase();
     if matches!(s.as_str(), "大盤" | "加權" | "加權指數" | "T00") {
@@ -143,6 +152,16 @@ pub fn symbol(s: &str) -> Option<String> {
             || tw.len() == digits + 1 && tw.as_bytes()[digits].is_ascii_uppercase())
     {
         return Some(tw.to_owned());
+    }
+    // A Yahoo future or FX code: an alphanumeric body carrying exactly one
+    // =F (futures) or =X (exchange rate) suffix — BZ=F, CL=F, TWD=X, JPY=X.
+    // Any other shape with an '=' in it falls through and is rejected below.
+    if let Some(body) = s.strip_suffix("=F").or_else(|| s.strip_suffix("=X")) {
+        let valid = (1..=6).contains(&body.len())
+            && body
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
+        return valid.then(|| s.clone());
     }
     // A US ticker: letters only, with at most one class-share suffix (BRK.B).
     let (head, tail) = match s.split_once('.') {
@@ -376,6 +395,10 @@ pub struct Settings {
     pub quote_source: String,
     #[serde(default = "default_sidecar_port")]
     pub sidecar_port: u16,
+    /// Opacity of the main window's shell background, 0.4–1.0 (1.0 = opaque).
+    /// Only the background fades; text and numbers stay fully opaque.
+    #[serde(default = "default_window_opacity")]
+    pub window_opacity: f64,
 }
 fn default_row_display() -> String {
     "numbers".into()
@@ -396,6 +419,19 @@ fn default_show_change_points() -> bool {
 fn default_update_check() -> bool {
     true
 }
+pub const MIN_WINDOW_OPACITY: f64 = 0.4;
+fn default_window_opacity() -> f64 {
+    1.0
+}
+/// Clamp a window-opacity value into the supported range; non-finite input
+/// falls back to fully opaque.
+pub fn clamp_window_opacity(v: f64) -> f64 {
+    if v.is_finite() {
+        v.clamp(MIN_WINDOW_OPACITY, 1.0)
+    } else {
+        1.0
+    }
+}
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -410,6 +446,7 @@ impl Default for Settings {
             refresh_seconds: 15,
             quote_source: default_quote_source(),
             sidecar_port: DEFAULT_SIDECAR_PORT,
+            window_opacity: 1.0,
         }
     }
 }
@@ -1082,6 +1119,10 @@ impl Core {
                         return Err("sidecar 連接埠需為 1024–65535".into());
                     };
                     next.saved.settings.sidecar_port = p as u16;
+                }
+                if let Some(v) = args.get("windowOpacity") {
+                    let v = v.as_f64().ok_or("視窗透明度需為數字")?;
+                    next.saved.settings.window_opacity = clamp_window_opacity(v);
                 }
                 next.next_poll = 0;
             }
@@ -2226,6 +2267,42 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
+    fn window_opacity_defaults_clamps_and_persists() {
+        // Settings saved before the field existed are fully opaque.
+        let old: Settings = serde_json::from_value(json!({
+            "appearance":"small", "paused":false, "refreshSeconds":15
+        }))
+        .unwrap();
+        assert_eq!(old.window_opacity, 1.0);
+        let dir =
+            std::env::temp_dir().join(format!("smallstocks-opacity-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let mut c = Core::load(path.clone(), true).unwrap();
+        assert_eq!(c.saved.settings.window_opacity, 1.0);
+        c.execute("set_settings", json!({"windowOpacity":0.65}))
+            .unwrap();
+        assert_eq!(c.saved.settings.window_opacity, 0.65);
+        let reloaded = Core::load(path, true).unwrap();
+        assert_eq!(reloaded.saved.settings.window_opacity, 0.65);
+        // Out-of-range values clamp into 0.4–1.0 instead of failing.
+        c.execute("set_settings", json!({"windowOpacity":0.1}))
+            .unwrap();
+        assert_eq!(c.saved.settings.window_opacity, MIN_WINDOW_OPACITY);
+        c.execute("set_settings", json!({"windowOpacity":2.0}))
+            .unwrap();
+        assert_eq!(c.saved.settings.window_opacity, 1.0);
+        assert!(
+            c.execute("set_settings", json!({"windowOpacity":"50%"}))
+                .is_err()
+        );
+        assert_eq!(
+            c.saved.settings.window_opacity, 1.0,
+            "a failed change changes nothing"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn index_aliases_us_tickers_and_canonical_forms_normalize() {
         // The spreadsheet shorthands of the daily report fold to Yahoo symbols.
         assert_eq!(symbol(".IXIC"), Some("^IXIC".into()));
@@ -2263,11 +2340,42 @@ mod tests {
         assert_eq!(display_symbol("2330"), "2330");
     }
     #[test]
+    fn yahoo_futures_and_fx_codes_normalize() {
+        // Futures and FX codes keep their =F / =X suffix, uppercased.
+        assert_eq!(symbol("BZ=F"), Some("BZ=F".into()));
+        assert_eq!(symbol("bz=f"), Some("BZ=F".into()));
+        assert_eq!(symbol("CL=F"), Some("CL=F".into()));
+        assert_eq!(symbol("GC=F"), Some("GC=F".into()));
+        assert_eq!(symbol("TWD=X"), Some("TWD=X".into()));
+        assert_eq!(symbol("twd=x"), Some("TWD=X".into()));
+        assert_eq!(symbol("JPY=X"), Some("JPY=X".into()));
+        // A body may carry digits (euro FX future) and stays Yahoo-routed.
+        assert_eq!(symbol("6E=F"), Some("6E=F".into()));
+        // Any other shape with an '=' in it is rejected.
+        assert_eq!(symbol("=F"), None);
+        assert_eq!(symbol("=X"), None);
+        assert_eq!(symbol("BZ=Y"), None);
+        assert_eq!(symbol("BZ==F"), None);
+        assert_eq!(symbol("A=F=X"), None);
+        assert_eq!(symbol("TOOLONG=F"), None);
+        assert_eq!(symbol("BZ =F"), None);
+        // The built-in names win for the four the user asked about; an
+        // unlisted future simply has no built-in name.
+        assert_eq!(index_name("BZ=F"), Some("布蘭特原油"));
+        assert_eq!(index_name("CL=F"), Some("西德州原油"));
+        assert_eq!(index_name("GC=F"), Some("黃金"));
+        assert_eq!(index_name("TWD=X"), Some("美元／台幣"));
+        assert_eq!(index_name("ES=F"), None);
+        // Nothing to strip: futures and FX codes display exactly as stored.
+        assert_eq!(display_symbol("BZ=F"), "BZ=F");
+        assert_eq!(display_symbol("TWD=X"), "TWD=X");
+    }
+    #[test]
     fn routes_split_taiwan_from_yahoo() {
         for tw in ["2330", "00685L", "t00", "o00", "6488"] {
             assert!(is_tw_symbol(tw), "{tw} is a Taiwan code");
         }
-        for y in ["VOO", "NVDA", "BRK.B", "^IXIC", "^TWII", "^N225"] {
+        for y in ["VOO", "NVDA", "BRK.B", "^IXIC", "^TWII", "^N225", "BZ=F", "TWD=X", "6E=F"] {
             assert!(!is_tw_symbol(y), "{y} is Yahoo-routed");
         }
     }

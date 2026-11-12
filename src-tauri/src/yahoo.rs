@@ -22,15 +22,22 @@ fn num(v: &Value) -> Option<f64> {
 fn yahoo_code(code: &str) -> String {
     code.replace('.', "-")
 }
-/// Batch quote URL for the spark endpoint: every symbol in one request, the ^
-/// of an index percent-encoded, class-share dashes already translated.
+/// Percent-encodes the two characters Yahoo's own spelling carries that a
+/// query value cannot be trusted with raw: ^ (%5E) and the '=' of the =F/=X
+/// suffixes (%3D). Yahoo currently tolerates a raw '=' inside the symbols
+/// value, but %3D is the form that parses identically everywhere, so the
+/// URLs are pinned to it.
+fn encode_symbol(yahoo: String) -> String {
+    yahoo.replace('^', "%5E").replace('=', "%3D")
+}
+/// Batch quote URL for the spark endpoint: every symbol in one request, each
+/// percent-encoded by encode_symbol, class-share dashes already translated.
 pub fn spark_url(codes: &[String]) -> String {
     let symbols = codes
         .iter()
-        .map(|c| yahoo_code(c))
+        .map(|c| encode_symbol(yahoo_code(c)))
         .collect::<Vec<_>>()
-        .join(",")
-        .replace('^', "%5E");
+        .join(",");
     format!(
         "https://query2.finance.yahoo.com/v7/finance/spark?symbols={symbols}&range=1d&interval=1m"
     )
@@ -38,7 +45,7 @@ pub fn spark_url(codes: &[String]) -> String {
 /// Single-symbol chart URL, the batch fallback. Built by hand like spark_url:
 /// reqwest's path-segment encoder leaves `^` raw, and Yahoo wants %5E.
 pub fn chart_url(code: &str) -> String {
-    let symbol = yahoo_code(code).replace('^', "%5E");
+    let symbol = encode_symbol(yahoo_code(code));
     format!(
         "https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1m&range=1d"
     )
@@ -268,9 +275,56 @@ mod tests {
         assert!(parse_chart(&empty, "VOO", 0).is_err());
     }
     #[test]
-    fn urls_encode_index_carets_and_class_share_dashes() {
+    fn spark_rows_parse_futures_and_fx_codes_with_builtin_names() {
+        // Meta blocks in the exact shape Yahoo answered with for BZ=F and
+        // TWD=X (live check 2026-11-12): an encoded batch request returns
+        // futures and FX rows alongside everything else, previousClose and
+        // chartPreviousClose both present.
+        let at_s = 1794494823;
+        let codes: Vec<String> = vec!["BZ=F".into(), "TWD=X".into()];
+        let bz = json!({
+            "symbol": "BZ=F", "currency": "USD", "instrumentType": "FUTURE",
+            "regularMarketPrice": 93.55, "regularMarketTime": at_s,
+            "regularMarketChangePercent": 0.852,
+            "regularMarketDayHigh": 94.36, "regularMarketDayLow": 91.19,
+            "previousClose": 92.76, "chartPreviousClose": 92.76,
+            "longName": "Brent Crude Oil Last Day Financial Futures",
+        });
+        let twd = json!({
+            "symbol": "TWD=X", "currency": "TWD", "instrumentType": "CURRENCY",
+            "regularMarketPrice": 32.967, "regularMarketTime": at_s,
+            "regularMarketChangePercent": 0.3195,
+            "previousClose": 32.862, "chartPreviousClose": 32.862,
+            "longName": "USD/TWD",
+        });
+        let v = json!({"spark":{"result":[
+            {"symbol":"TWD=X","response":[{"meta":twd}]},
+            {"symbol":"BZ=F","response":[{"meta":bz}]}
+        ]}});
+        let out = parse_spark(&v, &codes, at_s * 1000);
+        assert_eq!(out.len(), 2);
+        let bz = out.iter().find(|q| q.symbol == "BZ=F").unwrap();
+        assert_eq!(bz.name, "布蘭特原油", "the built-in table wins over the wire name");
+        assert_eq!(bz.price, Some(93.55));
+        assert_eq!(bz.previous, Some(92.76));
+        assert!((bz.change_percent.unwrap() - (93.55 / 92.76 - 1.) * 100.).abs() < 1e-9);
+        assert_eq!(bz.day_high, Some(94.36));
+        assert_eq!(bz.source, "Yahoo");
+        let twd = out.iter().find(|q| q.symbol == "TWD=X").unwrap();
+        assert_eq!(twd.name, "美元／台幣");
+        assert_eq!(twd.price, Some(32.967));
+        assert_eq!(twd.previous, Some(32.862));
+    }
+    #[test]
+    fn urls_encode_carets_equals_and_class_share_dashes() {
         let u = spark_url(&["^IXIC".into(), "BRK.B".into(), "VOO".into()]);
         assert!(u.contains("symbols=%5EIXIC,BRK-B,VOO"), "{u}");
+        // The '=' of a futures/FX suffix must reach Yahoo as %3D, in the
+        // batch and in the chart fallback alike.
+        let f = spark_url(&["BZ=F".into(), "TWD=X".into()]);
+        assert!(f.contains("symbols=BZ%3DF,TWD%3DX"), "{f}");
+        assert!(chart_url("BZ=F").contains("/chart/BZ%3DF?"));
+        assert!(chart_url("TWD=X").contains("/chart/TWD%3DX?"));
         let c = chart_url("^GSPC");
         assert!(c.contains("/chart/%5EGSPC?"), "{c}");
         assert!(chart_url("BRK.B").contains("/chart/BRK-B?"));

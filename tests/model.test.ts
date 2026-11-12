@@ -3,6 +3,7 @@ import {
   esc,
   stale,
   change,
+  shellOpacity,
   ruleText,
   latestCloseDate,
   livePrice,
@@ -202,11 +203,14 @@ describe("how old the data is", () => {
 });
 import { displaySymbol, isYahooSymbol, terminalRows } from "../src/model.ts";
 describe("Yahoo symbols", () => {
-  it("routes by the core's rule: a ^ prefix, or no digit at all", () => {
+  it("routes by the core's rule: a ^ prefix, an '=' suffix, or no digit at all", () => {
     expect(isYahooSymbol("^IXIC")).toBe(true);
     expect(isYahooSymbol("^TWII")).toBe(true);
     expect(isYahooSymbol("VOO")).toBe(true);
     expect(isYahooSymbol("BRK.B")).toBe(true);
+    expect(isYahooSymbol("BZ=F")).toBe(true);
+    expect(isYahooSymbol("TWD=X")).toBe(true);
+    expect(isYahooSymbol("6E=F")).toBe(true);
     expect(isYahooSymbol("2330")).toBe(false);
     expect(isYahooSymbol("00685L")).toBe(false);
     expect(isYahooSymbol("t00")).toBe(false);
@@ -215,6 +219,8 @@ describe("Yahoo symbols", () => {
     expect(displaySymbol("^IXIC")).toBe("IXIC");
     expect(displaySymbol("^GSPC")).toBe("GSPC");
     expect(displaySymbol("VOO")).toBe("VOO");
+    expect(displaySymbol("BZ=F")).toBe("BZ=F");
+    expect(displaySymbol("TWD=X")).toBe("TWD=X");
     expect(displaySymbol("2330")).toBe("2330");
   });
   it("renders a Yahoo row from its live quote while Taiwan is closed", () => {
@@ -246,5 +252,19 @@ describe("Yahoo symbols", () => {
     expect(row).toContain("25,466.19");
     expect(row).toContain("OK");
     expect(row).not.toContain("CLOSE");
+  });
+});
+
+describe("window opacity", () => {
+  it("defaults to fully opaque and clamps into 0.4–1", () => {
+    expect(shellOpacity(undefined)).toBe(1);
+    expect(shellOpacity(null)).toBe(1);
+    expect(shellOpacity(Number.NaN)).toBe(1);
+    expect(shellOpacity(1)).toBe(1);
+    expect(shellOpacity(0.65)).toBe(0.65);
+    expect(shellOpacity(0.4)).toBe(0.4);
+    expect(shellOpacity(0.1)).toBe(0.4);
+    expect(shellOpacity(0)).toBe(0.4);
+    expect(shellOpacity(2)).toBe(1);
   });
 });

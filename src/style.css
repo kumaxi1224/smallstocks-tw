@@ -57,7 +57,11 @@ textarea:focus-visible {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  background: var(--background);
+  background: color-mix(
+    in srgb,
+    var(--background) calc(var(--bg-alpha, 1) * 100%),
+    transparent
+  );
   border: 1px solid var(--border);
   border-radius: 14px;
 }
@@ -181,7 +185,8 @@ nav .gear {
 }
 .price {
   font: 500 12px var(--mono);
-  min-width: 56px;
+  width: 72px;
+  flex: none;
   text-align: right;
 }
 .stealth-btn {
@@ -226,11 +231,22 @@ nav .gear {
 }
 .change {
   font: 11px var(--mono);
-  min-width: 54px;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex: none;
+}
+/* Fixed-width columns keep the percent in the same place on every row; the
+   points span is emitted (empty) even without a point change for that. */
+.change-points {
+  width: 62px;
+  flex: none;
   text-align: right;
 }
-.change-points {
-  margin-right: 6px;
+.change-pct {
+  width: 56px;
+  flex: none;
+  text-align: right;
 }
 .group-tabs {
   display: flex;
@@ -397,6 +413,20 @@ small {
 }
 .setting-row input {
   width: 80px;
+}
+.opacity-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.opacity-control input[type="range"] {
+  width: 130px;
+}
+.opacity-control output {
+  font: 11px var(--mono);
+  color: var(--text);
+  min-width: 38px;
+  text-align: right;
 }
 label {
   display: flex;
