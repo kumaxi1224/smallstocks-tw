@@ -23,8 +23,17 @@ describe("MCP setup text", () => {
       `codex mcp add smallstocks-tw -- "${win}" --mcp`,
     );
   });
+  it("gives Gemini CLI the same JSON, plus the file to paste it into", () => {
+    const text = mcpSetup("gemini", mac);
+    expect(text).toContain("~/.gemini/settings.json");
+    const parsed = JSON.parse(text.slice(text.indexOf("{")));
+    expect(parsed.mcpServers["smallstocks-tw"]).toEqual({
+      command: mac,
+      args: ["--mcp"],
+    });
+  });
   it("never puts a token or connection file in the text", () => {
-    for (const kind of ["json", "claude", "codex"] as const)
+    for (const kind of ["json", "claude", "codex", "gemini"] as const)
       expect(mcpSetup(kind, mac)).not.toMatch(/token|mcp-connection/i);
   });
 });

@@ -8,6 +8,8 @@ import {
   livePrice,
   closeDay,
   oldestDataAt,
+  displaySymbol,
+  isYahooSymbol,
 } from "./model.ts";
 import type { Snapshot } from "./model.ts";
 import { minimalMarkup, bindMinimal, updateMinimal } from "./minimal.ts";
@@ -46,12 +48,15 @@ const pad = (text: string, cells: number) => {
 };
 function values(s: Snapshot, c: string) {
   const q = s.quotes[c],
-    closed = !s.marketOpen && !s.demo,
+    // Yahoo symbols never take the Taiwan close-day view.
+    closed = !s.marketOpen && !s.demo && !isYahooSymbol(c),
     d = closed ? closeDay(s, c) : undefined,
     live = livePrice(q);
+  const fullName =
+    q?.name || (c === "t00" ? "加權指數" : c === "o00" ? "櫃買指數" : "");
   return {
-    code: c,
-    name: q?.name || (c === "t00" ? "加權指數" : c === "o00" ? "櫃買指數" : ""),
+    code: displaySymbol(c),
+    name: s.settings.hideNames ? displaySymbol(c) : fullName,
     price: closed ? d?.close : live.price,
     book: !closed && live.basis === "book",
     date: d?.date,

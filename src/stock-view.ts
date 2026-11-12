@@ -8,6 +8,8 @@ import {
   livePrice,
   closeDay,
   ageSeconds,
+  displaySymbol,
+  isYahooSymbol,
   BOOK_NOTE,
 } from "./model.ts";
 import type { Snapshot } from "./model.ts";
@@ -29,10 +31,16 @@ export interface StockDetail {
 }
 export function stockDetail(s: Snapshot, c: string): StockDetail {
   const q = s.quotes[c],
-    closed = !s.marketOpen && !s.demo,
+    // Yahoo symbols follow their own session, not the Taiwan close-day view.
+    closed = !s.marketOpen && !s.demo && !isYahooSymbol(c),
     d = closed ? closeDay(s, c) : undefined;
   const name =
-      q?.name || (c === "t00" ? "加權指數" : c === "o00" ? "櫃買指數" : c),
+      q?.name ||
+      (c === "t00"
+        ? "加權指數"
+        : c === "o00"
+          ? "櫃買指數"
+          : displaySymbol(c)),
     live = livePrice(q),
     age = closed ? null : ageSeconds(q, s.now),
     price = (closed ? d?.close : live.price) ?? null,
@@ -57,7 +65,7 @@ export function stockDetail(s: Snapshot, c: string): StockDetail {
     ? (d?.date ?? "—")
     : q?.date?.replace(/^(\d{4})(\d{2})(\d{2})$/, "$1-$2-$3") || "—";
   return {
-    symbol: c,
+    symbol: displaySymbol(c),
     name,
     price,
     pct,

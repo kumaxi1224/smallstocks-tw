@@ -25,9 +25,12 @@ import {
   esc,
   number,
   change,
+  points,
   time,
   stale,
   ruleText,
+  displaySymbol,
+  isYahooSymbol,
   latestCloseDate,
   livePrice,
   closeDay,
@@ -121,7 +124,7 @@ async function loadDaily() {
 function dailyPage() {
   if (!state.watchlist.includes(dailySymbol))
     dailySymbol = state.watchlist[0] ?? "";
-  content.innerHTML = `<div class="pane"><h1>一天一點，回看走勢</h1><p class="intro">正式日行情與收盤摘要，不會觸發即時通知。</p><div class="daily-controls"><label>自選標的<select id="daily-symbol">${state.watchlist.map((c) => `<option value="${esc(c)}" ${c === dailySymbol ? "selected" : ""}>${esc(state.quotes[c]?.name ?? c)} · ${esc(c)}</option>`).join("")}</select></label><label>月份<input id="daily-month" type="month" min="2000-01" max="${new Date(state.now).toLocaleDateString("sv-SE", { timeZone: "Asia/Taipei" }).slice(0, 7)}" value="${dailyMonth}"></label></div><div id="daily-body">${dailyData && dailyData.symbol === dailySymbol ? historyBody(dailyData) : '<div class="empty">正在取得每日行情…</div>'}</div></div>`;
+  content.innerHTML = `<div class="pane"><h1>一天一點，回看走勢</h1><p class="intro">正式日行情與收盤摘要，不會觸發即時通知。</p><div class="daily-controls"><label>自選標的<select id="daily-symbol">${state.watchlist.map((c) => `<option value="${esc(c)}" ${c === dailySymbol ? "selected" : ""}>${esc(state.quotes[c]?.name ?? displaySymbol(c))} · ${esc(displaySymbol(c))}</option>`).join("")}</select></label><label>月份<input id="daily-month" type="month" min="2000-01" max="${new Date(state.now).toLocaleDateString("sv-SE", { timeZone: "Asia/Taipei" }).slice(0, 7)}" value="${dailyMonth}"></label></div><div id="daily-body">${dailyData && dailyData.symbol === dailySymbol ? historyBody(dailyData) : '<div class="empty">正在取得每日行情…</div>'}</div></div>`;
   document.querySelector("#daily-symbol")!.addEventListener("change", (e) => {
     dailySymbol = (e.target as HTMLSelectElement).value;
     dailyData = undefined;
@@ -243,6 +246,7 @@ async function resize() {
           Math.max(
             100,
             76 +
+              28 +
               state.watchlist.length * 24 +
               (state.demo ? 20 : 0) +
               (state.events.length ? 18 : 0),
@@ -457,14 +461,27 @@ function apply() {
 }
 function rows() {
   const commonDate = latestCloseDate(state);
+  const hideName = Boolean(state.settings.hideNames);
+  // Point change rides next to the percent in numbers mode only; the trend cell
+  // already spends the row's width on the line itself.
+  const showPts =
+    state.settings.rowDisplay !== "trend" &&
+    state.settings.showChangePoints !== false;
   return (
     state.watchlist
       .map((c) => {
         const q = state.quotes[c];
-        const closed = !state.marketOpen && !state.demo;
+        // Yahoo symbols render from their live quote around the clock; the
+        // Taiwan close-day view (official/final close) is a TWSE-only idea.
+        const closed = !state.marketOpen && !state.demo && !isYahooSymbol(c);
         const d = closed ? closeDay(state, c) : undefined;
         const live = livePrice(q);
         const pct = closed ? d?.changePercent : live.pct;
+        const pts = closed
+          ? (d?.changePoints ?? null)
+          : live.price != null && q?.previous != null
+            ? live.price - q.previous
+            : null;
         const stamp = closed
           ? (d?.date ?? "尚未取得正式收盤")
           : time(q?.sourceAt);
@@ -473,10 +490,21 @@ function rows() {
         const sign = (pct ?? 0) > 0 ? "up" : (pct ?? 0) < 0 ? "down" : "flat";
         const trend =
           state.settings.rowDisplay === "trend" ? trendCell(state, c) : null;
-        return `<button class="quote ${sign}${!closed && stale(q, state.now) ? " stale" : !closed && aging(q, state.now) ? " aging" : ""}" data-quote="${esc(c)}" title="${esc(name && name !== c ? `${name}（${c}）` : c)} · ${closed ? "正式收盤" : "來源時間"} ${esc(stamp)} · ${!closed && live.basis === "book" ? BOOK_NOTE : "價格"} ${number(closed ? d?.close : live.price)}${trend ? " · " + esc(trend.title) : ""} · 點擊查看行情"><span class="stock-name">${state.settings.showCodes || !name ? `<span class="stock-code">${esc(c)}</span>` : ""}<strong>${esc(name)}</strong></span>${trend ? `<span class="trend-slot">${trend.html}</span>` : `<span class="price${!closed && live.basis === "book" ? " book" : ""}">${number(closed ? d?.close : live.price)}</span>`}<span class="change">${change(pct)}</span>${closed && d && d.date !== commonDate ? `<span class="as-of">${d.date.slice(5).replace("-", "/")}</span>` : ""}</button>`;
+        return `<button class="quote ${sign}${!closed && stale(q, state.now) ? " stale" : !closed && aging(q, state.now) ? " aging" : ""}" data-quote="${esc(c)}" title="${esc(name && name !== c ? `${name}（${displaySymbol(c)}）` : displaySymbol(c))} · ${closed ? "正式收盤" : "來源時間"} ${esc(stamp)} · ${!closed && live.basis === "book" ? BOOK_NOTE : "價格"} ${number(closed ? d?.close : live.price)}${trend ? " · " + esc(trend.title) : ""} · 點擊查看行情"><span class="stock-name">${hideName || state.settings.showCodes || !name ? `<span class="stock-code">${esc(displaySymbol(c))}</span>` : ""}${hideName ? "" : `<strong>${esc(name)}</strong>`}</span>${trend ? `<span class="trend-slot">${trend.html}</span>` : `<span class="price${!closed && live.basis === "book" ? " book" : ""}">${number(closed ? d?.close : live.price)}</span>`}<span class="change">${showPts && pts != null ? `<span class="change-points">${points(pts)}</span>` : ""}${change(pct)}</span>${closed && d && d.date !== commonDate ? `<span class="as-of">${d.date.slice(5).replace("-", "/")}</span>` : ""}</button>`;
       })
       .join("") || '<div class="empty">加入第一檔自選，讓重要變化來找你。</div>'
   );
+}
+const viewGroups = () =>
+  state.groups?.length
+    ? state.groups
+    : [{ name: "自選1", codes: state.watchlist }];
+const viewActive = () =>
+  Math.max(0, Math.min(state.activeGroup ?? 0, viewGroups().length - 1));
+function groupTabs() {
+  const groups = viewGroups(),
+    active = viewActive();
+  return `<div class="group-tabs" role="tablist" aria-label="自選分組">${groups.map((g, i) => `<button type="button" role="tab" aria-selected="${i === active}" class="group-tab${i === active ? " active" : ""}" data-group="${i}">${esc(g.name)}</button>`).join("")}${groups.length < 10 ? '<button type="button" class="group-tab add" data-group-add title="新增分組" aria-label="新增分組">＋</button>' : ""}</div>`;
 }
 function watch() {
   const a = state.settings.appearance;
@@ -485,7 +513,7 @@ function watch() {
   if (a === "terminal" || a === "txt") return disguiseMarkup(state);
   if (state.settings.rowDisplay === "minimal")
     return `<div class="minimal-bar"><span class="minimal-grip" data-tauri-drag-region><i data-tauri-drag-region></i></span>${state.demo ? '<span class="minimal-demo-tag">示範</span>' : ""}${minimalMarkup(state)}<span class="minimal-bar-actions"><button id="minimal-cycle" aria-label="切換顯示內容" title="回到數字">≡</button><button id="minimal-stealth" class="stealth-btn" aria-label="隱藏全部視窗" title="完全隱藏（含通知），監看持續。叫回：${privacyShortcutLabel}"><svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M8 3.5C4.6 3.5 2 6 1 8c1 2 3.6 4.5 7 4.5s6-2.5 7-4.5c-1-2-3.6-4.5-7-4.5zm0 1.8a2.7 2.7 0 1 1 0 5.4 2.7 2.7 0 0 1 0-5.4z" fill="currentColor"/><path d="M2.3 2.3 13.7 13.7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button><button id="minimal-pin" class="pin-btn" aria-pressed="${state.settings.alwaysOnTop !== false}" aria-label="視窗保持置頂" title="${state.settings.alwaysOnTop !== false ? "已置頂：點一下取消置頂" : "未置頂：點一下保持置頂"}"><svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M9.8 1.2 14.8 6.2 13.4 7.6 12.3 7.2 9.4 10.1 9.9 12 8.5 13.4 5.6 10.5 2.2 13.9 1.5 13.2 4.9 9.8 2 6.9 3.4 5.5 5.3 6 8.2 3.1 7.8 2z" fill="currentColor"/></svg></button><button id="minimal-settings" aria-label="極簡顯示設定" title="顯示設定">⋯</button></span></div>`;
-  return `<div class="quotes">${rows()}</div>${last ? `<div class="latest"><span class="latest-dot"></span><span>${esc(last.text)}</span></div>` : ""}`;
+  return `${groupTabs()}<div class="quotes">${rows()}</div>${last ? `<div class="latest"><span class="latest-dot"></span><span>${esc(last.text)}</span></div>` : ""}`;
 }
 function render() {
   hideDetail();
@@ -522,7 +550,7 @@ function render() {
       )
       .join(
         "",
-      )}</div><div class="setting-row"><label>顯示內容<select id="display-mode"><option value="numbers" ${state.settings.rowDisplay === "numbers" || !state.settings.rowDisplay ? "selected" : ""}>純數字</option><option value="trend" ${state.settings.rowDisplay === "trend" ? "selected" : ""}>單行走勢</option><option value="minimal" ${state.settings.rowDisplay === "minimal" ? "selected" : ""}>極簡：方向與名稱</option></select></label><label class="setting-check"><input id="show-codes" type="checkbox" ${state.settings.showCodes ? "checked" : ""}> 顯示代號</label></div><div class="note density-note">極簡方向為當日漲跌；— 平盤，○ 資料未確認。名稱尚未取得時會使用代號。</div><div class="setting-row"><label class="setting-check"><input id="always-on-top" type="checkbox" ${state.settings.alwaysOnTop !== false ? "checked" : ""}> 視窗保持置頂</label></div><div class="setting-row"><div><strong>監看狀態</strong><small>隱藏視窗仍會監看，暫停則停止判定。</small></div><button id="pause" class="secondary">${state.settings.paused ? "繼續監看" : "暫停監看"}</button></div>${desktop ? `<div class="setting-row"><div><strong>程式</strong><small>找不到系統匣時，從這裡重新啟動或結束。結束後就不再監看。</small></div><span class="update-actions"><button id="restart-app" class="secondary">重新啟動</button><button id="quit-app" class="secondary">結束程式</button></span></div>` : ""}<label class="setting-row">更新間隔（秒）<input id="refresh" type="number" min="5" max="300" value="${state.settings.refreshSeconds}"></label><button id="save-refresh" class="secondary">儲存更新間隔</button><div class="setting-row"><label>行情來源<select id="quote-source"><option value="mis" ${state.settings.quoteSource !== "shioaji" ? "selected" : ""}>證交所 MIS（快照，約 1–2 分鐘）</option><option value="shioaji" ${state.settings.quoteSource === "shioaji" ? "selected" : ""}>永豐 Shioaji（即時逐筆）</option></select></label><label>sidecar 連接埠<input id="sidecar-port" type="number" min="1024" max="65535" value="${state.settings.sidecarPort ?? 18765}"></label></div><div class="note">Shioaji 需先完成永豐 API 開通並在本機啟動 sidecar（見 sidecar/README）；sidecar 無回應或缺檔時自動退回 MIS，頁尾會註明。${state.sourceNote ? `<br>目前狀態：${esc(state.sourceNote)}` : ""}</div>${desktop ? `<div class="setting-row"><label class="setting-check"><input id="update-check" type="checkbox" ${state.settings.updateCheck !== false ? "checked" : ""}> 啟動時檢查新版本</label></div><div class="setting-row"><div><strong>版本 ${esc(appVersion)}</strong><small id="update-status">${esc(updateMessage || "只會連到 GitHub 詢問有沒有新版本")}</small></div><span class="update-actions"><button id="check-update" class="secondary" ${updateBusy ? "disabled" : ""}>檢查更新</button>${newer ? (newer.update ? `<button id="install-update" class="primary">更新並重新啟動</button>` : `<button id="open-release" class="secondary">前往下載頁</button>`) : ""}</span></div>` : ""}${desktop ? `<div class="setting-row"><div><strong>agent（MCP，選配）</strong><small id="mcp-status">${esc(mcpMessage || "複製後貼到 Claude、Codex 或其他支援本機 MCP 的程式；基本監看不需要它")}</small></div><span class="update-actions"><button id="mcp-json" class="secondary">複製 JSON 設定</button><button id="mcp-claude" class="secondary">Claude Code 指令</button><button id="mcp-codex" class="secondary">Codex 指令</button></span></div>` : ""}<div class="note">所有外觀預設無聲。灰階通知跟隨外觀。<br>${privacyShortcutLabel} 隱藏全部視窗，從系統匣恢復。<br>${state.privacyShortcutError ? esc(state.privacyShortcutError) + "<br>" : ""}資料：TWSE MIS；來源時間與取得時間分開顯示。<br>更新檢查只向 GitHub 詢問版本，不傳送任何使用資料；要更新時由你按下按鈕才會下載安裝。<br>首次觀測只建立基準；過期或缺少成交價時不觸發。<br>${desktop ? "agent：上方按鈕複製連接設定，說明見 README。" : "瀏覽器僅顯示合成預覽；桌面版才會實際監看與提供 MCP。"}</div></div>`;
+      )}</div><div class="setting-row"><label>顯示內容<select id="display-mode"><option value="numbers" ${state.settings.rowDisplay === "numbers" || !state.settings.rowDisplay ? "selected" : ""}>純數字</option><option value="trend" ${state.settings.rowDisplay === "trend" ? "selected" : ""}>單行走勢</option><option value="minimal" ${state.settings.rowDisplay === "minimal" ? "selected" : ""}>極簡：方向與名稱</option></select></label><label class="setting-check"><input id="show-codes" type="checkbox" ${state.settings.showCodes ? "checked" : ""}> 顯示代號</label><label class="setting-check"><input id="hide-names" type="checkbox" ${state.settings.hideNames ? "checked" : ""}> 只顯示代號（隱藏名稱）</label><label class="setting-check"><input id="show-change-points" type="checkbox" ${state.settings.showChangePoints !== false ? "checked" : ""}> 顯示漲跌點數</label></div><div class="note density-note">極簡方向為當日漲跌；— 平盤，○ 資料未確認。名稱尚未取得時會使用代號。</div><div class="setting-row"><label class="setting-check"><input id="always-on-top" type="checkbox" ${state.settings.alwaysOnTop !== false ? "checked" : ""}> 視窗保持置頂</label></div><div class="setting-row"><div><strong>監看狀態</strong><small>隱藏視窗仍會監看，暫停則停止判定。</small></div><button id="pause" class="secondary">${state.settings.paused ? "繼續監看" : "暫停監看"}</button></div>${desktop ? `<div class="setting-row"><div><strong>程式</strong><small>找不到系統匣時，從這裡重新啟動或結束。結束後就不再監看。</small></div><span class="update-actions"><button id="restart-app" class="secondary">重新啟動</button><button id="quit-app" class="secondary">結束程式</button></span></div>` : ""}<label class="setting-row">更新間隔（秒）<input id="refresh" type="number" min="5" max="300" value="${state.settings.refreshSeconds}"></label><button id="save-refresh" class="secondary">儲存更新間隔</button><div class="setting-row"><label>行情來源<select id="quote-source"><option value="mis" ${state.settings.quoteSource !== "shioaji" ? "selected" : ""}>證交所 MIS（快照，約 1–2 分鐘）</option><option value="shioaji" ${state.settings.quoteSource === "shioaji" ? "selected" : ""}>永豐 Shioaji（即時逐筆）</option></select></label><label>sidecar 連接埠<input id="sidecar-port" type="number" min="1024" max="65535" value="${state.settings.sidecarPort ?? 18765}"></label></div><div class="note">Shioaji 需先完成永豐 API 開通並在本機啟動 sidecar（見 sidecar/README）；sidecar 無回應或缺檔時自動退回 MIS，頁尾會註明。${state.sourceNote ? `<br>目前狀態：${esc(state.sourceNote)}` : ""}</div>${desktop ? `<div class="setting-row"><label class="setting-check"><input id="update-check" type="checkbox" ${state.settings.updateCheck !== false ? "checked" : ""}> 啟動時檢查新版本</label></div><div class="setting-row"><div><strong>版本 ${esc(appVersion)}</strong><small id="update-status">${esc(updateMessage || "只會連到 GitHub 詢問有沒有新版本")}</small></div><span class="update-actions"><button id="check-update" class="secondary" ${updateBusy ? "disabled" : ""}>檢查更新</button>${newer ? (newer.update ? `<button id="install-update" class="primary">更新並重新啟動</button>` : `<button id="open-release" class="secondary">前往下載頁</button>`) : ""}</span></div>` : ""}${desktop ? `<div class="setting-row"><div><strong>agent（MCP，選配）</strong><small id="mcp-status">${esc(mcpMessage || "複製後貼到 Claude、Codex、Gemini 或其他支援本機 MCP 的程式；基本監看不需要它")}</small></div><span class="update-actions"><button id="mcp-json" class="secondary">複製 JSON 設定</button><button id="mcp-claude" class="secondary">Claude Code 指令</button><button id="mcp-codex" class="secondary">Codex 指令</button><button id="mcp-gemini" class="secondary">Gemini 指令</button></span></div>` : ""}<div class="note">所有外觀預設無聲。灰階通知跟隨外觀。<br>${privacyShortcutLabel} 隱藏全部視窗，從系統匣恢復。<br>${state.privacyShortcutError ? esc(state.privacyShortcutError) + "<br>" : ""}資料：TWSE MIS；來源時間與取得時間分開顯示。<br>更新檢查只向 GitHub 詢問版本，不傳送任何使用資料；要更新時由你按下按鈕才會下載安裝。<br>首次觀測只建立基準；過期或缺少成交價時不觸發。<br>${desktop ? "agent：上方按鈕複製連接設定，說明見 README。" : "瀏覽器僅顯示合成預覽；桌面版才會實際監看與提供 MCP。"}</div></div>`;
   if (tab === "rules")
     content.innerHTML = `<div class="pane"><h1>只在你在意的時候</h1><p class="intro">首次觀測建立基準，之後跨過門檻才提醒。</p><form id="rule-form"><div class="form-grid"><label>股票代號<input name="symbol" required placeholder="2330" value="${esc(editing?.symbol ?? state.watchlist.find((c) => c !== "t00") ?? "2330")}"></label><label>觀測項目<select name="metric"><option value="price">成交價（元）</option><option value="changePercent" ${editing?.metric === "changePercent" ? "selected" : ""}>漲跌幅（成交價，%）</option><option value="mid" ${editing?.metric === "mid" ? "selected" : ""}>買賣中間價（委託價，元）</option><option value="midChangePercent" ${editing?.metric === "midChangePercent" ? "selected" : ""}>漲跌幅（買賣中間價，%）</option></select></label><label>方向<select name="direction"><option value="above">由下往上跨過</option><option value="below" ${editing?.direction === "below" ? "selected" : ""}>由上往下跨過</option></select></label><label>門檻<input name="threshold" type="number" step="any" required placeholder="例如 1000" value="${editing?.threshold ?? ""}"></label><label>通知<select name="channel">${[
       ["strip", "細條"],
@@ -559,8 +587,45 @@ function render() {
 function manage() {
   document.body.dataset.page = "manage";
   apply();
-  content.innerHTML = `<div class="pane"><h1>你的自選清單</h1><p class="intro">貼上多檔代號，以空白、逗號或換行分隔。最多 30 檔。</p><label>搜尋名稱或代號<input id="search" placeholder="例如：台積電、0050" autocomplete="off"></label><div id="results"></div><label>目前自選<textarea id="symbols" rows="5">${esc(state.watchlist.join(", "))}</textarea></label><button id="save-symbols" class="primary">儲存自選</button><button id="back-watch">返回</button><p class="note">有啟用中規則的標的，請先停用規則再移除。<br>加權：t00　櫃買：o00</p></div>`;
+  const groups = viewGroups(),
+    active = viewActive();
+  content.innerHTML = `<div class="pane"><h1>你的自選清單</h1><p class="intro">貼上多檔代號，以空白、逗號或換行分隔。每組最多 30 檔；監看涵蓋所有分組，切換分頁不影響提醒。</p><div class="group-manage"><span>分組</span>${groups.map((g, i) => `<button type="button" class="group-tab${i === active ? " active" : ""}" data-manage-group="${i}">${esc(g.name)}</button>`).join("")}<button type="button" id="group-rename" class="secondary">改名</button><button type="button" id="group-delete" class="secondary">刪除分組</button></div><label>搜尋名稱或代號<input id="search" placeholder="例如：台積電、0050" autocomplete="off"></label><div id="results"></div><label>目前自選（${esc(groups[active]!.name)}）<textarea id="symbols" rows="5">${esc(state.watchlist.join(", "))}</textarea></label><button id="save-symbols" class="primary">儲存自選</button><button id="back-watch">返回</button><p class="note">有啟用中規則的標的，請先停用規則再移除。<br>加權：t00　櫃買：o00</p></div>`;
   if (desktop) void getCurrentWindow().setSize(new LogicalSize(500, 460));
+  const regroup = (run: () => Promise<void>) =>
+    void (async () => {
+      await run();
+      manage();
+    })();
+  document
+    .querySelectorAll<HTMLButtonElement>("[data-manage-group]")
+    .forEach((b) =>
+      b.addEventListener("click", () =>
+        regroup(() =>
+          mutate("set_active_group", { index: Number(b.dataset.manageGroup) }),
+        ),
+      ),
+    );
+  document.querySelector("#group-rename")!.addEventListener("click", () => {
+    const current = groups[active]!.name;
+    const name = prompt("分組名稱", current);
+    if (name == null || !name.trim() || name.trim() === current) return;
+    regroup(() =>
+      mutate("rename_watch_group", { index: active, name: name.trim() }),
+    );
+  });
+  document.querySelector("#group-delete")!.addEventListener("click", () => {
+    if (groups.length <= 1) {
+      showError("至少保留一個分組");
+      return;
+    }
+    if (
+      !confirm(
+        `刪除分組「${groups[active]!.name}」？只在這個分組的自選會停止監看，其他分組不受影響。`,
+      )
+    )
+      return;
+    regroup(() => mutate("delete_watch_group", { index: active }));
+  });
   document.querySelector("#save-symbols")!.addEventListener("click", () => {
     tab = "watch";
     const symbols = document
@@ -655,6 +720,7 @@ function bind() {
     ["#mcp-json", "json"],
     ["#mcp-claude", "claude"],
     ["#mcp-codex", "codex"],
+    ["#mcp-gemini", "gemini"],
   ] as [string, McpKind][]) {
     document.querySelector(id)?.addEventListener("click", () => {
       const note = (text: string) => {
@@ -708,6 +774,28 @@ function bind() {
         showCodes: (e.target as HTMLInputElement).checked,
       }),
   );
+  document.querySelector("#hide-names")?.addEventListener(
+    "change",
+    (e) =>
+      void mutate("set_settings", {
+        hideNames: (e.target as HTMLInputElement).checked,
+      }),
+  );
+  document.querySelector("#show-change-points")?.addEventListener(
+    "change",
+    (e) =>
+      void mutate("set_settings", {
+        showChangePoints: (e.target as HTMLInputElement).checked,
+      }),
+  );
+  document.querySelectorAll<HTMLButtonElement>("[data-group]").forEach(
+    (b) =>
+      (b.onclick = () =>
+        void mutate("set_active_group", { index: Number(b.dataset.group) })),
+  );
+  document
+    .querySelector("[data-group-add]")
+    ?.addEventListener("click", () => void mutate("add_watch_group", {}));
   if (
     tab === "watch" &&
     state.settings.rowDisplay === "minimal" &&

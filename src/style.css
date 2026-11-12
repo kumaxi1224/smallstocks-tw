@@ -229,6 +229,44 @@ nav .gear {
   min-width: 54px;
   text-align: right;
 }
+.change-points {
+  margin-right: 6px;
+}
+.group-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 6px 8px 0;
+}
+.group-tab {
+  font-size: 11px;
+  padding: 2px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+}
+.group-tab:hover {
+  background: #ffffff0e;
+}
+.group-tab.active {
+  background: var(--panel);
+  color: var(--text);
+  border-color: var(--accent);
+}
+.group-tab.add {
+  padding: 2px 7px;
+}
+.group-manage {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 10px;
+}
+.group-manage > span {
+  color: var(--muted);
+  margin-right: 2px;
+}
 .up .change {
   color: var(--up);
 }

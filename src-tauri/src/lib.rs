@@ -3,6 +3,7 @@ mod core;
 mod daily;
 mod intraday;
 mod mcp;
+mod yahoo;
 use core::{now, Core};
 use serde_json::{json, Value};
 use std::{
@@ -114,6 +115,54 @@ fn fetch_sidecar(
                 .map_err(|e| format!("sidecar 行情格式錯誤：{e}"))
         })
         .and_then(|v| core::parse_sidecar(&v, now()))
+}
+/// One Taiwan fetch round under the configured source: the local Shioaji
+/// sidecar first when selected (MIS fills whatever it did not return), plain
+/// MIS otherwise. Ok carries the quotes served plus a note whenever a fallback
+/// happened, for the UI footer; Err means the round served nothing at all.
+fn fetch_tw(
+    client: &reqwest::blocking::Client,
+    sidecar_client: &reqwest::blocking::Client,
+    quote_source: &str,
+    sidecar_port: u16,
+    codes: &[String],
+) -> Result<(Vec<core::Quote>, Option<String>), String> {
+    if quote_source != "shioaji" {
+        return fetch_mis(client, codes).map(|q| (q, None));
+    }
+    match core::sidecar_token(&data_dir()) {
+        Some(token) => match fetch_sidecar(sidecar_client, sidecar_port, &token, codes) {
+            Ok(quotes) => {
+                let missing: Vec<String> = codes
+                    .iter()
+                    .filter(|c| !quotes.iter().any(|q| &q.symbol == *c))
+                    .cloned()
+                    .collect();
+                if missing.is_empty() {
+                    Ok((quotes, None))
+                } else {
+                    match fetch_mis(client, &missing) {
+                        Ok(mis) => Ok((
+                            core::fill_missing(quotes, mis),
+                            Some(format!("Shioaji 缺 {} 檔，已用 TWSE MIS 補", missing.len())),
+                        )),
+                        Err(e) => Ok((
+                            quotes,
+                            Some(format!("Shioaji 缺 {} 檔且 MIS 失敗：{e}", missing.len())),
+                        )),
+                    }
+                }
+            }
+            Err(e) => fetch_mis(client, codes)
+                .map(|q| (q, Some(format!("Shioaji sidecar 無回應（{e}），已改用 TWSE MIS")))),
+        },
+        None => fetch_mis(client, codes).map(|q| {
+            (
+                q,
+                Some("已選 Shioaji 但找不到 sidecar token，請先啟動 sidecar".into()),
+            )
+        }),
+    }
 }
 /// Quits the program (the same as the tray menu's quit), so it can be stopped from inside the app.
 #[tauri::command]
@@ -562,22 +611,38 @@ pub fn run() {
                 let mut tick = 0;
                 loop {
                     std::thread::sleep(Duration::from_millis(500));
-                    let (codes, is_demo, revision, quote_source, sidecar_port) = {
+                    let (tw_codes, yahoo_codes, is_demo, revision, quote_source, sidecar_port) = {
                         let mut s = poll_state.lock().unwrap_or_else(PoisonError::into_inner);
                         let at = now();
-                        if s.saved.settings.paused
-                            || at < s.next_poll
-                            || s.saved.watchlist.is_empty()
-                        {
+                        // Polling covers the union of every watch group, not just the active tab.
+                        let all_codes = s.saved.all_codes();
+                        if s.saved.settings.paused || at < s.next_poll || all_codes.is_empty() {
                             continue;
                         }
-                        if !s.demo && !s.polling_window(at) && s.last_fetch.is_some() {
+                        let tw_codes: Vec<String> = all_codes
+                            .iter()
+                            .filter(|c| core::is_tw_symbol(c))
+                            .cloned()
+                            .collect();
+                        let yahoo_codes: Vec<String> = all_codes
+                            .iter()
+                            .filter(|c| !core::is_tw_symbol(c))
+                            .cloned()
+                            .collect();
+                        // The TWSE polling window gates only the Taiwan fetch. Yahoo
+                        // symbols trade on US hours (Taipei night), so they keep
+                        // polling whenever any are watched; with none watched the
+                        // loop rests outside the window exactly as before. A cold
+                        // start (nothing fetched yet) still fills every list once.
+                        let tw_due = s.demo || s.polling_window(at) || s.last_fetch.is_none();
+                        if !tw_due && yahoo_codes.is_empty() {
                             s.next_poll = at + 60_000;
                             continue;
                         }
                         s.next_poll = at + s.saved.settings.refresh_seconds as i64 * 1000;
                         (
-                            s.saved.watchlist.clone(),
+                            if tw_due { tw_codes } else { Vec::new() },
+                            yahoo_codes,
                             s.demo,
                             s.config_revision,
                             s.saved.settings.quote_source.clone(),
@@ -587,61 +652,47 @@ pub fn run() {
                     let mut note: Option<String> = None;
                     let result = if is_demo {
                         tick += 1;
+                        let mut codes = tw_codes.clone();
+                        codes.extend(yahoo_codes.iter().cloned());
                         Ok(core::demo_quotes(&codes, tick))
-                    } else if quote_source == "shioaji" {
-                        match core::sidecar_token(&data_dir()) {
-                            Some(token) => match fetch_sidecar(
+                    } else {
+                        let mut quotes: Vec<core::Quote> = Vec::new();
+                        let mut errors: Vec<String> = Vec::new();
+                        if !tw_codes.is_empty() {
+                            match fetch_tw(
+                                &client,
                                 &sidecar_client,
+                                &quote_source,
                                 sidecar_port,
-                                &token,
-                                &codes,
+                                &tw_codes,
                             ) {
-                                Ok(quotes) => {
-                                    let missing: Vec<String> = codes
-                                        .iter()
-                                        .filter(|c| {
-                                            !quotes.iter().any(|q| &q.symbol == *c)
-                                        })
-                                        .cloned()
-                                        .collect();
-                                    if missing.is_empty() {
-                                        Ok(quotes)
-                                    } else {
-                                        match fetch_mis(&client, &missing) {
-                                            Ok(mis) => {
-                                                note = Some(format!(
-                                                    "Shioaji 缺 {} 檔，已用 TWSE MIS 補",
-                                                    missing.len()
-                                                ));
-                                                Ok(core::fill_missing(quotes, mis))
-                                            }
-                                            Err(e) => {
-                                                note = Some(format!(
-                                                    "Shioaji 缺 {} 檔且 MIS 失敗：{e}",
-                                                    missing.len()
-                                                ));
-                                                Ok(quotes)
-                                            }
-                                        }
-                                    }
+                                Ok((served, n)) => {
+                                    quotes.extend(served);
+                                    note = n;
                                 }
-                                Err(e) => {
-                                    note = Some(format!(
-                                        "Shioaji sidecar 無回應（{e}），已改用 TWSE MIS"
-                                    ));
-                                    fetch_mis(&client, &codes)
-                                }
-                            },
-                            None => {
-                                note = Some(
-                                    "已選 Shioaji 但找不到 sidecar token，請先啟動 sidecar"
-                                        .into(),
-                                );
-                                fetch_mis(&client, &codes)
+                                Err(e) => errors.push(e),
                             }
                         }
-                    } else {
-                        fetch_mis(&client, &codes)
+                        if !yahoo_codes.is_empty() {
+                            match yahoo::fetch(&client, &yahoo_codes) {
+                                Ok(served) => quotes.extend(served),
+                                Err(e) => errors.push(e),
+                            }
+                        }
+                        if quotes.is_empty() && !errors.is_empty() {
+                            Err(errors.join("；"))
+                        } else {
+                            // One source failing while the other serves is a note,
+                            // not an outage: the served quotes still ingest.
+                            if !errors.is_empty() {
+                                let extra = format!("部分行情來源失敗：{}", errors.join("；"));
+                                note = Some(match note {
+                                    Some(n) => format!("{n}；{extra}"),
+                                    None => extra,
+                                });
+                            }
+                            Ok(quotes)
+                        }
                     };
                     let mut s = poll_state.lock().unwrap_or_else(PoisonError::into_inner);
                     if s.config_revision != revision || s.saved.settings.paused {
@@ -700,7 +751,7 @@ pub fn run() {
                     s.intraday_pending.remove(&code);
                     match result {
                         Ok(series) => {
-                            if s.saved.watchlist.contains(&code) {
+                            if s.saved.watches(&code) {
                                 s.saved.intraday_cache.insert(code.clone(), series);
                                 s.intraday_errors.remove(&code);
                                 if let Err(e) = s.persist() {

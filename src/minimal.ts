@@ -1,7 +1,7 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { stockDetail, detailLabel, detailMarkup } from "./stock-view.ts";
-import { esc } from "./model.ts";
+import { esc, displaySymbol } from "./model.ts";
 import type { Snapshot } from "./model.ts";
 import { directionMark } from "./direction-mark.ts";
 let activeRoot: HTMLElement | null = null,
@@ -14,11 +14,12 @@ let activeRoot: HTMLElement | null = null,
   ignoreFocusLossUntil = 0;
 let browserTip: HTMLElement | null = null;
 export function minimalMarkup(s: Snapshot): string {
-  return `<div class="minimal-list" data-codes="${Boolean(s.settings.showCodes)}" aria-label="極簡自選清單">${
+  return `<div class="minimal-list" data-codes="${Boolean(s.settings.showCodes)}" data-names="${Boolean(s.settings.hideNames)}" aria-label="極簡自選清單">${
     s.watchlist
       .map((c) => {
         const d = stockDetail(s, c);
-        return `<button type="button" class="minimal-stock ${d.direction}${d.basis === "book" ? " book" : ""}" data-mini-stock="${esc(c)}" aria-label="${esc(detailLabel(d))}"><span class="minimal-mark" data-piece="${s.settings.appearance}:${d.direction}" aria-hidden="true">${directionMark(d.direction, d.mark, s.settings.appearance)}</span><span class="minimal-name">${esc(d.name)}</span>${s.settings.showCodes && d.name !== c ? `<span class="minimal-code">${esc(c)}</span>` : ""}</button>`;
+        const label = s.settings.hideNames ? displaySymbol(c) : d.name;
+        return `<button type="button" class="minimal-stock ${d.direction}${d.basis === "book" ? " book" : ""}" data-mini-stock="${esc(c)}" aria-label="${esc(detailLabel(d))}"><span class="minimal-mark" data-piece="${s.settings.appearance}:${d.direction}" aria-hidden="true">${directionMark(d.direction, d.mark, s.settings.appearance)}</span><span class="minimal-name">${esc(label)}</span>${!s.settings.hideNames && s.settings.showCodes && d.name !== d.symbol ? `<span class="minimal-code">${esc(d.symbol)}</span>` : ""}</button>`;
       })
       .join(" ") || '<span class="minimal-empty">尚無自選</span>'
   }</div>`;
@@ -133,13 +134,15 @@ export function updateMinimal(root: HTMLElement, s: Snapshot) {
   const structure =
     buttons.map((b) => b.dataset.miniStock).join("|") ===
       s.watchlist.join("|") &&
-    list.dataset.codes === String(Boolean(s.settings.showCodes));
+    list.dataset.codes === String(Boolean(s.settings.showCodes)) &&
+    list.dataset.names === String(Boolean(s.settings.hideNames));
   if (!structure) {
     hideDetail();
     const wrapper = document.createElement("div");
     wrapper.innerHTML = minimalMarkup(s);
     list.innerHTML = wrapper.firstElementChild!.innerHTML;
     list.dataset.codes = String(Boolean(s.settings.showCodes));
+    list.dataset.names = String(Boolean(s.settings.hideNames));
   }
   for (const b of list.querySelectorAll<HTMLButtonElement>(
     "[data-mini-stock]",
@@ -157,7 +160,9 @@ export function updateMinimal(root: HTMLElement, s: Snapshot) {
       );
       mark.dataset.piece = key;
     }
-    b.querySelector(".minimal-name")!.textContent = d.name;
+    b.querySelector(".minimal-name")!.textContent = s.settings.hideNames
+      ? b.dataset.miniStock!
+      : d.name;
     const code = b.querySelector(".minimal-code");
     if (code) code.textContent = d.symbol;
   }

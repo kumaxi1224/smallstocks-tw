@@ -21,10 +21,101 @@ pub fn trading(ms: i64) -> bool {
     let m = t.hour() * 60 + t.minute();
     t.weekday().number_from_monday() <= 5 && (540..810).contains(&m)
 }
+/// The nth Sunday of a month, for the US daylight-saving boundaries below.
+fn nth_sunday(year: i32, month: u32, n: u32) -> chrono::NaiveDate {
+    let first = chrono::NaiveDate::from_ymd_opt(year, month, 1).unwrap();
+    let to_sunday = (7 - first.weekday().num_days_from_sunday()) % 7;
+    first + chrono::Duration::days(to_sunday as i64 + 7 * (n as i64 - 1))
+}
+/// US Eastern UTC offset in seconds at an instant: EDT (UTC−4) from the second
+/// Sunday of March 07:00 UTC until the first Sunday of November 06:00 UTC,
+/// EST (UTC−5) otherwise (the post-2007 US rule).
+fn eastern_offset_seconds(at: i64) -> i64 {
+    let year = Utc.timestamp_millis_opt(at).unwrap().year();
+    let edt_start = nth_sunday(year, 3, 2)
+        .and_hms_opt(7, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
+    let edt_end = nth_sunday(year, 11, 1)
+        .and_hms_opt(6, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
+    if (edt_start..edt_end).contains(&at) {
+        -4 * 3600
+    } else {
+        -5 * 3600
+    }
+}
+pub fn eastern(at: i64) -> chrono::DateTime<FixedOffset> {
+    FixedOffset::east_opt(eastern_offset_seconds(at) as i32)
+        .unwrap()
+        .timestamp_millis_opt(at)
+        .single()
+        .unwrap()
+}
+/// Whether Yahoo's regularMarketTime can be advancing: a US weekday between the
+/// 04:00 pre-market open and the 20:00 after-hours close, Eastern. There is no
+/// US holiday calendar here; on a holiday the source timestamps simply go stale
+/// and the freshness rule keeps alerts silent, the same failure shape as a
+/// Taiwan closure the official calendar has not published yet.
+pub fn us_market_open(at: i64) -> bool {
+    let t = eastern(at);
+    let m = t.hour() * 60 + t.minute();
+    t.weekday().number_from_monday() <= 5 && (240..1200).contains(&m)
+}
 fn num(v: &Value) -> Option<f64> {
     let n = v.as_f64().or_else(|| v.as_str()?.parse().ok())?;
     (n.is_finite() && n > 0.).then_some(n)
 }
+/// Spreadsheet shorthands for the indices of the daily report, folded to the
+/// Yahoo symbols the quote router understands. Bare spellings (IXIC, GSPC, …)
+/// are included so a code copied back out of the app — which displays indices
+/// without the ^ — round-trips to the same canonical symbol.
+fn index_alias(s: &str) -> Option<&'static str> {
+    Some(match s {
+        "IX0001" | "TWII" | "^TWII" => "^TWII",
+        "NI225" | "N225" | "^N225" => "^N225",
+        "KOSPI" | "KS11" | "^KS11" => "^KS11",
+        ".IXIC" | "IXIC" | "^IXIC" => "^IXIC",
+        ".INX" | "INX" | "GSPC" | "^GSPC" => "^GSPC",
+        ".DJI" | "DJI" | "^DJI" => "^DJI",
+        "SOX" | "^SOX" => "^SOX",
+        "RUT" | "^RUT" => "^RUT",
+        _ => return None,
+    })
+}
+/// Built-in display names for those same indices. Yahoo's own longName for them
+/// is truncated or padded ("TSEC CAPITALIZATION WEIGHTED ST…"), so this table
+/// wins wherever a Yahoo quote is parsed for one of them.
+pub fn index_name(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "^TWII" => "加權指數",
+        "^N225" => "Nikkei 225",
+        "^KS11" => "KOSPI",
+        "^IXIC" => "Nasdaq Composite",
+        "^SOX" => "PHLX Semiconductor Sector",
+        "^DJI" => "Dow Jones Industrial Average",
+        "^GSPC" => "S&P 500",
+        "^RUT" => "Russell 2000 Index",
+        _ => return None,
+    })
+}
+/// The quote route of a canonical symbol: Taiwan codes (they contain a digit
+/// and carry no ^) come from TWSE MIS / the Shioaji sidecar; everything else
+/// (US tickers, ^ indices) comes from Yahoo. t00/o00 are Taiwan index codes.
+pub fn is_tw_symbol(code: &str) -> bool {
+    !code.starts_with('^') && code.bytes().any(|b| b.is_ascii_digit())
+}
+/// How a stored symbol is written for the user: indices lose their ^ prefix.
+pub fn display_symbol(code: &str) -> &str {
+    code.strip_prefix('^').unwrap_or(code)
+}
+/// Canonical form of a user-typed code, shared by the UI and MCP through
+/// execute. Taiwan codes keep their historic shapes (2330, 00685L, t00, o00);
+/// index shorthands fold to Yahoo symbols (.IXIC → ^IXIC, IX0001 → ^TWII, …);
+/// US tickers pass through uppercased, class-share dot included (VOO, BRK.B).
 pub fn symbol(s: &str) -> Option<String> {
     let s = s.trim().to_uppercase();
     if matches!(s.as_str(), "大盤" | "加權" | "加權指數" | "T00") {
@@ -33,12 +124,35 @@ pub fn symbol(s: &str) -> Option<String> {
     if matches!(s.as_str(), "櫃買" | "櫃買指數" | "O00") {
         return Some("o00".into());
     }
-    let s = s.trim_end_matches(".TWO").trim_end_matches(".TW");
-    let digits = s.chars().take_while(|c| c.is_ascii_digit()).count();
-    ((4..=6).contains(&digits)
-        && (s.len() == digits
-            || s.len() == digits + 1 && s.as_bytes()[digits].is_ascii_uppercase()))
-    .then(|| s.to_owned())
+    if let Some(index) = index_alias(&s) {
+        return Some(index.into());
+    }
+    // An unknown ^ symbol the user pasted in Yahoo's own spelling passes
+    // through, so an index this table does not know still works.
+    if let Some(body) = s.strip_prefix('^') {
+        let valid = (1..=12).contains(&body.len())
+            && body
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
+        return valid.then(|| s.clone());
+    }
+    let tw = s.trim_end_matches(".TWO").trim_end_matches(".TW");
+    let digits = tw.chars().take_while(|c| c.is_ascii_digit()).count();
+    if (4..=6).contains(&digits)
+        && (tw.len() == digits
+            || tw.len() == digits + 1 && tw.as_bytes()[digits].is_ascii_uppercase())
+    {
+        return Some(tw.to_owned());
+    }
+    // A US ticker: letters only, with at most one class-share suffix (BRK.B).
+    let (head, tail) = match s.split_once('.') {
+        Some((h, t)) => (h, Some(t)),
+        None => (s.as_str(), None),
+    };
+    let valid = (1..=6).contains(&head.len())
+        && head.bytes().all(|b| b.is_ascii_uppercase())
+        && tail.is_none_or(|t| t.len() == 1 && t.bytes().all(|b| b.is_ascii_uppercase()));
+    valid.then(|| s.clone())
 }
 pub fn mis_url(codes: &[String]) -> String {
     let channels: Vec<String> = codes
@@ -242,6 +356,12 @@ pub struct Settings {
     pub always_on_top: bool,
     #[serde(default)]
     pub show_codes: bool,
+    /// Hide stock names in list rows; only the code is shown.
+    #[serde(default)]
+    pub hide_names: bool,
+    /// In numbers mode, show the point change next to the price as well as the percent.
+    #[serde(default = "default_show_change_points")]
+    pub show_change_points: bool,
     /// Ask GitHub once per launch whether a newer version exists. On by default, switchable.
     #[serde(default = "default_update_check")]
     pub update_check: bool,
@@ -270,6 +390,9 @@ fn default_sidecar_port() -> u16 {
 fn default_always_on_top() -> bool {
     true
 }
+fn default_show_change_points() -> bool {
+    true
+}
 fn default_update_check() -> bool {
     true
 }
@@ -278,6 +401,8 @@ impl Default for Settings {
         Self {
             always_on_top: true,
             show_codes: false,
+            hide_names: false,
+            show_change_points: true,
             update_check: true,
             row_display: default_row_display(),
             appearance: "small".into(),
@@ -331,6 +456,17 @@ pub struct Event {
     #[serde(default)]
     pub source: String,
 }
+/// One named watchlist group （自選1、自選2…）. Monitoring covers the union of all groups;
+/// the flat `watchlist` on Saved stays as a mirror of the active group's codes.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchGroup {
+    pub name: String,
+    #[serde(default)]
+    pub codes: Vec<String>,
+}
+pub const MAX_WATCH_GROUPS: usize = 10;
+pub const MAX_GROUP_SYMBOLS: usize = 30;
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Saved {
@@ -345,12 +481,87 @@ pub struct Saved {
     pub calendars: HashMap<String, calendar::Calendar>,
     #[serde(default)]
     pub watchlist: Vec<String>,
+    /// Named groups; a pre-groups save has none and is migrated on load (see normalize_groups).
+    #[serde(default)]
+    pub groups: Vec<WatchGroup>,
+    #[serde(default)]
+    pub active_group: usize,
     #[serde(default)]
     pub settings: Settings,
     #[serde(default)]
     pub rules: Vec<Rule>,
     #[serde(default)]
     pub events: Vec<Event>,
+}
+impl Saved {
+    /// Folds a pre-groups save (one flat watchlist) into a single group named 自選1, and keeps
+    /// `watchlist` mirroring the active group's codes for every reader that predates groups.
+    fn normalize_groups(&mut self) {
+        if self.groups.is_empty() {
+            let mut codes: Vec<String> = Vec::new();
+            for c in self.watchlist.drain(..) {
+                if !codes.contains(&c) {
+                    codes.push(c);
+                }
+            }
+            self.groups.push(WatchGroup {
+                name: "自選1".into(),
+                codes,
+            });
+        }
+        if self.active_group >= self.groups.len() {
+            self.active_group = self.groups.len() - 1;
+        }
+        self.sync_watchlist();
+    }
+    fn sync_watchlist(&mut self) {
+        self.watchlist = self
+            .groups
+            .get(self.active_group)
+            .map(|g| g.codes.clone())
+            .unwrap_or_default();
+    }
+    /// Every watched code across all groups, in group order, duplicates removed:
+    /// the set polling fetches and ingest judges rules against.
+    pub fn all_codes(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for g in &self.groups {
+            for c in &g.codes {
+                if !out.contains(c) {
+                    out.push(c.clone());
+                }
+            }
+        }
+        out
+    }
+    pub fn watches(&self, code: &str) -> bool {
+        self.groups.iter().any(|g| g.codes.iter().any(|c| c == code))
+    }
+    fn default_group_name(&self) -> String {
+        (1..)
+            .map(|n| format!("自選{n}"))
+            .find(|n| self.groups.iter().all(|g| &g.name != n))
+            .unwrap()
+    }
+}
+/// The `index` argument of the group commands, bounds-checked against the group count.
+fn group_index(args: &Value, count: usize) -> Result<usize, String> {
+    let i = args["index"].as_u64().ok_or("需要分組編號")? as usize;
+    if i >= count {
+        return Err("找不到分組".into());
+    }
+    Ok(i)
+}
+/// A user-supplied group name: trimmed, non-empty, at most 20 characters.
+fn group_name(args: &Value) -> Result<String, String> {
+    let name = args["name"].as_str().ok_or("需要分組名稱")?.trim();
+    if name.is_empty() {
+        return Err("分組名稱不可空白".into());
+    }
+    if name.chars().count() > 20 {
+        return Err("分組名稱最多 20 字".into());
+    }
+    Ok(name.to_string())
 }
 #[derive(Clone)]
 pub struct Core {
@@ -389,6 +600,7 @@ impl Core {
                 ..Default::default()
             }
         };
+        saved.normalize_groups();
         for r in &mut saved.rules {
             r.last_value = None;
             r.last_at = None;
@@ -514,7 +726,7 @@ impl Core {
             .iter()
             .map(|c| (c.clone(), self.intraday_view(c)))
             .collect();
-        json!({"watchlist":self.saved.watchlist,"settings":self.saved.settings,"privacyShortcutError":self.privacy_shortcut_error,"rules":self.saved.rules,"events":self.saved.events,"quotes":self.quotes,"demo":self.demo,"error":self.error,"sourceNote":self.source_note,"lastFetch":self.last_fetch,"nextPoll":self.next_poll,"marketOpen":self.market_open(now()),"marketClosedReason":self.closed_reason(now()),"calendar":self.calendar_view(),"revision":self.revision,"now":now(),"dailySummaries":summaries,"intraday":intraday})
+        json!({"watchlist":self.saved.watchlist,"groups":self.saved.groups,"activeGroup":self.saved.active_group,"settings":self.saved.settings,"privacyShortcutError":self.privacy_shortcut_error,"rules":self.saved.rules,"events":self.saved.events,"quotes":self.quotes,"demo":self.demo,"error":self.error,"sourceNote":self.source_note,"lastFetch":self.last_fetch,"nextPoll":self.next_poll,"marketOpen":self.market_open(now()),"marketClosedReason":self.closed_reason(now()),"calendar":self.calendar_view(),"revision":self.revision,"now":now(),"dailySummaries":summaries,"intraday":intraday})
     }
     pub fn queue_intraday(&mut self, code: &str) {
         let at = now();
@@ -649,17 +861,23 @@ impl Core {
     }
     pub fn execute(&mut self, tool: &str, args: Value) -> Result<Value, String> {
         if tool == "get_status" {
+            // The intraday/daily prefetch queues feed Taiwan-only modules; Yahoo
+            // symbols never enter them (their minutes and closes are not TWSE data).
             if self.saved.settings.row_display == "trend" && (self.market_open(now()) || self.demo)
             {
                 for c in self.saved.watchlist.clone() {
-                    self.queue_intraday(&c)
+                    if is_tw_symbol(&c) {
+                        self.queue_intraday(&c)
+                    }
                 }
             }
             if !self.market_open(now()) || self.demo {
                 let months = daily::months(now());
                 for c in self.saved.watchlist.clone() {
-                    for m in &months {
-                        self.queue_daily(&c, m)
+                    if is_tw_symbol(&c) {
+                        for m in &months {
+                            self.queue_daily(&c, m)
+                        }
                     }
                 }
             }
@@ -670,7 +888,10 @@ impl Core {
                 .as_str()
                 .and_then(symbol)
                 .ok_or("需要台股代號")?;
-            if !self.saved.watchlist.contains(&code) {
+            if !is_tw_symbol(&code) {
+                return Err("分鐘線僅支援台股代號".into());
+            }
+            if !self.saved.watches(&code) {
                 return Err("請先將標的加入自選，再讀取分鐘線".into());
             }
             self.queue_intraday(&code);
@@ -681,6 +902,9 @@ impl Core {
                 .as_str()
                 .and_then(symbol)
                 .ok_or("需要台股代號")?;
+            if !is_tw_symbol(&code) {
+                return Err("日資料僅支援台股代號".into());
+            }
             let month = args["month"].as_str().ok_or("需要 YYYY-MM 月份")?;
             if !daily::valid_month(month) {
                 return Err("月份需介於 2000-01 與本月之間".into());
@@ -695,35 +919,113 @@ impl Core {
             return Ok(json!(self.saved.rules));
         }
         let mut next = self.clone();
+        next.saved.normalize_groups();
         match tool {
             "set_watchlist" => {
                 let raw = args["symbols"].as_array().ok_or("需要 symbols 陣列")?;
-                if raw.len() > 30 {
+                if raw.len() > MAX_GROUP_SYMBOLS {
                     return Err("首版最多監看 30 檔".into());
                 }
                 let mut codes = Vec::new();
                 for s in raw {
-                    let c = s.as_str().and_then(symbol).ok_or("請使用有效台股代號")?;
+                    let c = s.as_str().and_then(symbol).ok_or("請使用有效代號")?;
                     if !codes.contains(&c) {
                         codes.push(c)
                     }
                 }
+                let active = next.saved.active_group;
+                next.saved.groups[active].codes = codes;
+                // A symbol may only leave the monitoring union when no enabled rule needs it;
+                // staying in another group is enough.
+                let watched = next.saved.all_codes();
                 if next
                     .saved
                     .rules
                     .iter()
-                    .any(|r| r.enabled && !codes.contains(&r.symbol))
+                    .any(|r| r.enabled && !watched.contains(&r.symbol))
                 {
                     return Err("請先停用或刪除該股票的規則，再移除自選".into());
                 }
-                next.saved.watchlist = codes;
-                let watched = next.saved.watchlist.clone();
-                next.saved.intraday_cache.retain(|c, _| watched.contains(c));
-                next.saved.local_intraday.retain(|c, _| watched.contains(c));
+                next.saved.sync_watchlist();
+                next.saved
+                    .intraday_cache
+                    .retain(|c, _| watched.contains(c));
+                next.saved
+                    .local_intraday
+                    .retain(|c, _| watched.contains(c));
                 next.last_fetch = None;
-                let watched = next.saved.watchlist.clone();
                 next.quotes.retain(|c, _| watched.contains(c));
                 next.next_poll = 0;
+            }
+            "add_watch_group" => {
+                if next.saved.groups.len() >= MAX_WATCH_GROUPS {
+                    return Err("分組最多 10 個".into());
+                }
+                let name = if args.get("name").is_some() {
+                    group_name(&args)?
+                } else {
+                    next.saved.default_group_name()
+                };
+                if next.saved.groups.iter().any(|g| g.name == name) {
+                    return Err("分組名稱已存在".into());
+                }
+                next.saved.groups.push(WatchGroup {
+                    name,
+                    codes: Vec::new(),
+                });
+                next.saved.active_group = next.saved.groups.len() - 1;
+                next.saved.sync_watchlist();
+            }
+            "rename_watch_group" => {
+                let idx = group_index(&args, next.saved.groups.len())?;
+                let name = group_name(&args)?;
+                if next
+                    .saved
+                    .groups
+                    .iter()
+                    .enumerate()
+                    .any(|(i, g)| i != idx && g.name == name)
+                {
+                    return Err("分組名稱已存在".into());
+                }
+                next.saved.groups[idx].name = name;
+            }
+            "delete_watch_group" => {
+                let idx = group_index(&args, next.saved.groups.len())?;
+                if next.saved.groups.len() <= 1 {
+                    return Err("至少保留一個分組".into());
+                }
+                next.saved.groups.remove(idx);
+                let watched = next.saved.all_codes();
+                if next
+                    .saved
+                    .rules
+                    .iter()
+                    .any(|r| r.enabled && !watched.contains(&r.symbol))
+                {
+                    return Err("請先停用或刪除該股票的規則，再刪除分組".into());
+                }
+                if next.saved.active_group > idx {
+                    next.saved.active_group -= 1;
+                }
+                if next.saved.active_group >= next.saved.groups.len() {
+                    next.saved.active_group = next.saved.groups.len() - 1;
+                }
+                next.saved.sync_watchlist();
+                next.saved
+                    .intraday_cache
+                    .retain(|c, _| watched.contains(c));
+                next.saved
+                    .local_intraday
+                    .retain(|c, _| watched.contains(c));
+                next.last_fetch = None;
+                next.quotes.retain(|c, _| watched.contains(c));
+                next.next_poll = 0;
+            }
+            "set_active_group" => {
+                let idx = group_index(&args, next.saved.groups.len())?;
+                next.saved.active_group = idx;
+                next.saved.sync_watchlist();
             }
             "set_settings" => {
                 if let Some(v) = args.get("alwaysOnTop") {
@@ -741,6 +1043,13 @@ impl Core {
                 }
                 if let Some(v) = args.get("showCodes") {
                     next.saved.settings.show_codes = v.as_bool().ok_or("代號顯示需為布林值")?;
+                }
+                if let Some(v) = args.get("hideNames") {
+                    next.saved.settings.hide_names = v.as_bool().ok_or("隱藏名稱需為布林值")?;
+                }
+                if let Some(v) = args.get("showChangePoints") {
+                    next.saved.settings.show_change_points =
+                        v.as_bool().ok_or("漲跌點數顯示需為布林值")?;
                 }
                 if let Some(a) = args.get("appearance") {
                     let a = a.as_str().ok_or("外觀格式錯誤")?;
@@ -811,11 +1120,13 @@ impl Core {
                         return Err("找不到規則".into());
                     }
                 }
-                if !next.saved.watchlist.contains(&code) {
-                    if next.saved.watchlist.len() >= 30 {
+                if !next.saved.watches(&code) {
+                    let active = next.saved.active_group;
+                    if next.saved.groups[active].codes.len() >= MAX_GROUP_SYMBOLS {
                         return Err("自選清單已滿".into());
                     };
-                    next.saved.watchlist.push(code.clone());
+                    next.saved.groups[active].codes.push(code.clone());
+                    next.saved.sync_watchlist();
                     next.last_fetch = None;
                 }
                 let id = supplied
@@ -884,7 +1195,7 @@ impl Core {
         let open = next.market_open(at);
         let mut emitted = Vec::new();
         for q in quotes {
-            if !next.saved.watchlist.contains(&q.symbol) {
+            if !next.saved.watches(&q.symbol) {
                 continue;
             }
             if next
@@ -894,14 +1205,25 @@ impl Core {
             {
                 continue;
             }
-            next.record_intraday(&q, at);
+            // Local intraday samples are this machine's MIS observations only;
+            // Yahoo points are never spliced into that series.
+            if is_tw_symbol(&q.symbol) {
+                next.record_intraday(&q, at);
+            }
+            // Each symbol is judged against its own market's session: Taiwan
+            // symbols against the TWSE session, Yahoo symbols against US hours.
+            let quote_open = if is_tw_symbol(&q.symbol) {
+                open
+            } else {
+                us_market_open(at)
+            };
             for rule in next
                 .saved
                 .rules
                 .iter_mut()
                 .filter(|r| r.symbol == q.symbol && r.enabled)
             {
-                if let Some(e) = evaluate(rule, &q, at, self.demo, open) {
+                if let Some(e) = evaluate(rule, &q, at, self.demo, quote_open) {
                     next.saved.events.insert(0, e.clone());
                     emitted.push(e)
                 }
@@ -1015,7 +1337,14 @@ pub fn evaluate(r: &mut Rule, q: &Quote, at: i64, demo: bool, open: bool) -> Opt
         (
             format!(
                 "{} {} · {}期間內曾{} {:.2}{}（門檻 {:.2}；兩次更新之間的{}，非即時價）",
-                q.symbol, q.name, metric, direction, extreme, unit, r.threshold, side
+                display_symbol(&q.symbol),
+                q.name,
+                metric,
+                direction,
+                extreme,
+                unit,
+                r.threshold,
+                side
             ),
             extreme,
         )
@@ -1023,7 +1352,13 @@ pub fn evaluate(r: &mut Rule, q: &Quote, at: i64, demo: bool, open: bool) -> Opt
         (
             format!(
                 "{} {} · {}{} {:.2}{}（門檻 {:.2}）",
-                q.symbol, q.name, metric, direction, value, unit, r.threshold
+                display_symbol(&q.symbol),
+                q.name,
+                metric,
+                direction,
+                value,
+                unit,
+                r.threshold
             ),
             value,
         )
@@ -1059,12 +1394,11 @@ pub fn demo_quotes(codes: &[String], tick: u64) -> Vec<Quote> {
             Quote {
                 symbol: c.clone(),
                 name: match c.as_str() {
-                    "2330" => "台積電",
-                    "0050" => "元大台灣50",
-                    "t00" => "加權指數",
-                    _ => "模擬標的",
-                }
-                .into(),
+                    "2330" => "台積電".into(),
+                    "0050" => "元大台灣50".into(),
+                    "t00" => "加權指數".into(),
+                    other => index_name(other).unwrap_or("模擬標的").into(),
+                },
                 price: Some((p * 100.).round() / 100.),
                 previous: Some(base),
                 bid: Some(p - 0.5),
@@ -1719,5 +2053,350 @@ mod tests {
         let monday = t + 3 * 86400000;
         c.record_intraday(&q(Some(110.), monday), monday);
         assert_eq!(c.saved.local_intraday["2330"].points.len(), 1);
+    }
+    #[test]
+    fn saved_flat_watchlist_migrates_into_a_first_group_on_load() {
+        let dir =
+            std::env::temp_dir().join(format!("smallstocks-migrate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        // A pre-groups save file: a flat watchlist and no groups key at all.
+        std::fs::write(
+            &path,
+            r#"{"watchlist":["2330","0050","2330"],"settings":{"appearance":"small","paused":false,"refreshSeconds":15}}"#,
+        )
+        .unwrap();
+        let c = Core::load(path.clone(), true).unwrap();
+        assert_eq!(c.saved.groups.len(), 1);
+        assert_eq!(c.saved.groups[0].name, "自選1");
+        assert_eq!(
+            c.saved.groups[0].codes,
+            vec!["2330", "0050"],
+            "duplicates fold away"
+        );
+        assert_eq!(c.saved.active_group, 0);
+        assert_eq!(
+            c.saved.watchlist,
+            vec!["2330", "0050"],
+            "watchlist mirrors the active group"
+        );
+        let snap = c.snapshot();
+        assert_eq!(snap["groups"][0]["name"], "自選1");
+        assert_eq!(snap["groups"][0]["codes"][1], "0050");
+        assert_eq!(snap["activeGroup"], 0);
+        assert_eq!(snap["watchlist"][0], "2330");
+        // Saving keeps the groups, so a second load does not migrate again or lose them.
+        c.persist().unwrap();
+        let reloaded = Core::load(path, true).unwrap();
+        assert_eq!(reloaded.saved.groups.len(), 1);
+        assert_eq!(reloaded.saved.groups[0].codes, vec!["2330", "0050"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn watch_group_commands_add_switch_rename_delete_and_cap() {
+        let dir =
+            std::env::temp_dir().join(format!("smallstocks-groups-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = Core::load(dir.join("state.json"), true).unwrap();
+        assert_eq!(c.saved.groups.len(), 1);
+        assert_eq!(c.saved.groups[0].name, "自選1");
+        c.execute("add_watch_group", json!({})).unwrap();
+        assert_eq!(c.saved.groups.len(), 2);
+        assert_eq!(c.saved.groups[1].name, "自選2");
+        assert_eq!(c.saved.active_group, 1, "a new group becomes active");
+        assert!(
+            c.saved.watchlist.is_empty(),
+            "the mirror follows the active group"
+        );
+        c.execute("set_watchlist", json!({"symbols":["6488"]})).unwrap();
+        assert_eq!(c.saved.groups[1].codes, vec!["6488"]);
+        assert_eq!(
+            c.saved.groups[0].codes,
+            vec!["t00", "2330", "0050"],
+            "set_watchlist edits only the active group"
+        );
+        c.execute("rename_watch_group", json!({"index":1,"name":"半導體"}))
+            .unwrap();
+        assert_eq!(c.saved.groups[1].name, "半導體");
+        assert!(
+            c.execute("rename_watch_group", json!({"index":1,"name":"自選1"}))
+                .is_err(),
+            "names stay unique"
+        );
+        assert!(c
+            .execute("rename_watch_group", json!({"index":1,"name":"  "}))
+            .is_err());
+        c.execute("set_active_group", json!({"index":0})).unwrap();
+        assert_eq!(c.saved.watchlist, vec!["t00", "2330", "0050"]);
+        assert!(c.execute("set_active_group", json!({"index":9})).is_err());
+        // Ten groups in total at most.
+        for _ in 0..8 {
+            c.execute("add_watch_group", json!({})).unwrap();
+        }
+        assert_eq!(c.saved.groups.len(), 10);
+        assert!(c.execute("add_watch_group", json!({})).is_err());
+        // The per-group cap keeps the existing message.
+        let many: Vec<String> = (0..31).map(|i| format!("1{i:03}")).collect();
+        let err = c.execute("set_watchlist", json!({"symbols": many})).unwrap_err();
+        assert!(err.contains("30"), "unexpected error: {err}");
+        // Deleting groups walks the active index back; the last group cannot go.
+        while c.saved.groups.len() > 1 {
+            let idx = c.saved.active_group;
+            c.execute("delete_watch_group", json!({"index": idx})).unwrap();
+        }
+        assert!(
+            c.execute("delete_watch_group", json!({"index":0})).is_err(),
+            "at least one group remains"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn monitoring_covers_the_union_of_all_groups() {
+        let dir =
+            std::env::temp_dir().join(format!("smallstocks-union-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = Core::load(dir.join("state.json"), true).unwrap();
+        let t = ts();
+        // 6488 lives in a second group that is not the visible tab; 2330 stays in 自選1.
+        c.execute("add_watch_group", json!({"name":"觀察"})).unwrap();
+        c.execute("set_watchlist", json!({"symbols":["6488"]})).unwrap();
+        c.execute("set_active_group", json!({"index":0})).unwrap();
+        assert_eq!(c.saved.all_codes(), vec!["t00", "2330", "0050", "6488"]);
+        let mut other = q(Some(50.), t);
+        other.symbol = "6488".into();
+        c.ingest(vec![other], t);
+        assert_eq!(
+            c.quotes["6488"].price,
+            Some(50.),
+            "quotes land for non-active groups too"
+        );
+        c.saved.rules.push(rule());
+        c.ingest(vec![q(Some(100.), t)], t);
+        let events = c.ingest(vec![q(Some(106.), t + 5000)], t + 5000);
+        assert_eq!(events.len(), 1, "rules fire regardless of the visible tab");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn a_symbol_with_an_enabled_rule_can_move_between_groups_but_not_vanish() {
+        let dir = std::env::temp_dir().join(format!("smallstocks-move-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = Core::load(dir.join("state.json"), true).unwrap();
+        c.execute(
+            "upsert_rule",
+            json!({"symbol":"2330","metric":"price","direction":"above","threshold":105}),
+        )
+        .unwrap();
+        c.execute("add_watch_group", json!({})).unwrap();
+        c.execute("set_watchlist", json!({"symbols":["2330"]})).unwrap();
+        c.execute("set_active_group", json!({"index":0})).unwrap();
+        // 2330 leaves 自選1 here, but it is still watched through the second group.
+        c.execute("set_watchlist", json!({"symbols":["0050"]})).unwrap();
+        assert!(c.saved.watches("2330"));
+        // Deleting that second group would drop it from the union entirely.
+        assert!(c.execute("delete_watch_group", json!({"index":1})).is_err());
+        assert_eq!(c.saved.groups.len(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn display_flags_default_and_persist() {
+        // Settings saved before the flags existed: names shown, point change shown.
+        let old: Settings = serde_json::from_value(json!({
+            "appearance":"small", "paused":false, "refreshSeconds":15
+        }))
+        .unwrap();
+        assert!(!old.hide_names);
+        assert!(old.show_change_points);
+        let dir =
+            std::env::temp_dir().join(format!("smallstocks-display-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let mut c = Core::load(path.clone(), true).unwrap();
+        assert!(!c.saved.settings.hide_names);
+        assert!(c.saved.settings.show_change_points);
+        c.execute(
+            "set_settings",
+            json!({"hideNames":true,"showChangePoints":false}),
+        )
+        .unwrap();
+        let reloaded = Core::load(path, true).unwrap();
+        assert!(reloaded.saved.settings.hide_names);
+        assert!(!reloaded.saved.settings.show_change_points);
+        assert!(c.execute("set_settings", json!({"hideNames":"yes"})).is_err());
+        assert!(c.saved.settings.hide_names, "a failed change changes nothing");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn index_aliases_us_tickers_and_canonical_forms_normalize() {
+        // The spreadsheet shorthands of the daily report fold to Yahoo symbols.
+        assert_eq!(symbol(".IXIC"), Some("^IXIC".into()));
+        assert_eq!(symbol("IXIC"), Some("^IXIC".into()));
+        assert_eq!(symbol("^IXIC"), Some("^IXIC".into()));
+        assert_eq!(symbol(".INX"), Some("^GSPC".into()));
+        assert_eq!(symbol("GSPC"), Some("^GSPC".into()));
+        assert_eq!(symbol(".DJI"), Some("^DJI".into()));
+        assert_eq!(symbol("SOX"), Some("^SOX".into()));
+        assert_eq!(symbol("RUT"), Some("^RUT".into()));
+        assert_eq!(symbol("NI225"), Some("^N225".into()));
+        assert_eq!(symbol("KOSPI"), Some("^KS11".into()));
+        assert_eq!(symbol("IX0001"), Some("^TWII".into()));
+        // An index this table does not know still passes in Yahoo's spelling.
+        assert_eq!(symbol("^VIX"), Some("^VIX".into()));
+        // US tickers pass through uppercased, class-share dot included.
+        assert_eq!(symbol("VOO"), Some("VOO".into()));
+        assert_eq!(symbol("nvda"), Some("NVDA".into()));
+        assert_eq!(symbol("BRK.B"), Some("BRK.B".into()));
+        assert_eq!(symbol("brk.b"), Some("BRK.B".into()));
+        // Taiwan shapes are exactly what they were before Yahoo existed.
+        assert_eq!(symbol("2330"), Some("2330".into()));
+        assert_eq!(symbol("00685L"), Some("00685L".into()));
+        assert_eq!(symbol("0050.TW"), Some("0050".into()));
+        assert_eq!(symbol("t00"), Some("t00".into()));
+        // Junk stays junk.
+        assert_eq!(symbol(""), None);
+        assert_eq!(symbol("HELLO WORLD"), None);
+        assert_eq!(symbol("BRK.BF"), None);
+        assert_eq!(symbol("TOOLONG7"), None);
+        assert_eq!(index_name("^SOX"), Some("PHLX Semiconductor Sector"));
+        assert_eq!(index_name("^TWII"), Some("加權指數"));
+        assert_eq!(index_name("VOO"), None);
+        assert_eq!(display_symbol("^IXIC"), "IXIC");
+        assert_eq!(display_symbol("2330"), "2330");
+    }
+    #[test]
+    fn routes_split_taiwan_from_yahoo() {
+        for tw in ["2330", "00685L", "t00", "o00", "6488"] {
+            assert!(is_tw_symbol(tw), "{tw} is a Taiwan code");
+        }
+        for y in ["VOO", "NVDA", "BRK.B", "^IXIC", "^TWII", "^N225"] {
+            assert!(!is_tw_symbol(y), "{y} is Yahoo-routed");
+        }
+    }
+    #[test]
+    fn us_market_open_follows_eastern_hours_and_dst() {
+        let et = |y: i32, mo: u32, d: u32, h: u32, mi: u32, off: i32| {
+            FixedOffset::west_opt(off * 3600)
+                .unwrap()
+                .with_ymd_and_hms(y, mo, d, h, mi, 0)
+                .unwrap()
+                .timestamp_millis()
+        };
+        // Winter (EST, UTC−5): the 04:00–20:00 window in Eastern terms.
+        assert!(us_market_open(et(2026, 1, 15, 10, 0, 5)));
+        assert!(!us_market_open(et(2026, 1, 15, 3, 30, 5)));
+        assert!(us_market_open(et(2026, 1, 15, 19, 59, 5)));
+        assert!(!us_market_open(et(2026, 1, 15, 20, 0, 5)));
+        // Summer (EDT, UTC−4): 04:30 EDT is inside, 03:30 EDT is not; a fixed
+        // −5 offset would read both an hour earlier and fail the first.
+        assert!(us_market_open(et(2026, 7, 15, 4, 30, 4)));
+        assert!(!us_market_open(et(2026, 7, 15, 3, 30, 4)));
+        // A Saturday never opens.
+        assert!(!us_market_open(et(2026, 11, 14, 12, 0, 5)));
+    }
+    #[test]
+    fn yahoo_quotes_fire_rules_when_fresh_and_stay_silent_when_stale() {
+        let dir =
+            std::env::temp_dir().join(format!("smallstocks-yahoo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Not demo: the real session gates apply. Taipei is closed at this
+        // instant; the US session (10:00 EST) is not.
+        let mut c = Core::load(dir.join("state.json"), false).unwrap();
+        let t = FixedOffset::west_opt(5 * 3600)
+            .unwrap()
+            .with_ymd_and_hms(2026, 11, 12, 10, 0, 0)
+            .unwrap()
+            .timestamp_millis();
+        assert!(!c.market_open(t), "Taipei is closed during US hours");
+        assert!(us_market_open(t));
+        let yq = |symbol: &str, price: f64, at: i64| Quote {
+            symbol: symbol.into(),
+            name: "測試".into(),
+            price: Some(price),
+            bid: None,
+            ask: None,
+            previous: Some(100.),
+            change_percent: Some(price - 100.),
+            mid: None,
+            mid_change_percent: None,
+            trade_at: None,
+            day_high: None,
+            day_low: None,
+            source_at: at,
+            received_at: at,
+            date: local(at).format("%Y%m%d").to_string(),
+            source: "Yahoo".into(),
+        };
+        c.execute("set_watchlist", json!({"symbols":["VOO",".IXIC"]}))
+            .unwrap();
+        assert_eq!(c.saved.all_codes(), vec!["VOO", "^IXIC"]);
+        c.execute(
+            "upsert_rule",
+            json!({"symbol":"VOO","metric":"price","direction":"above","threshold":105,"repeat":"daily","channel":"strip"}),
+        )
+        .unwrap();
+        c.execute(
+            "upsert_rule",
+            json!({"symbol":"^IXIC","metric":"changePercent","direction":"above","threshold":1,"repeat":"daily","channel":"strip"}),
+        )
+        .unwrap();
+        // First fresh observations only establish baselines.
+        assert!(c
+            .ingest(vec![yq("VOO", 100., t), yq("^IXIC", 100.5, t)], t)
+            .is_empty());
+        // Crossings on fresh quotes fire, credited to Yahoo, displayed without ^.
+        let events = c.ingest(
+            vec![yq("VOO", 106., t + 5000), yq("^IXIC", 101.6, t + 5000)],
+            t + 5000,
+        );
+        assert_eq!(events.len(), 2);
+        let voo = events.iter().find(|e| e.symbol == "VOO").unwrap();
+        assert_eq!(voo.source, "Yahoo");
+        let ix = events.iter().find(|e| e.symbol == "^IXIC").unwrap();
+        assert!(ix.text.contains("IXIC"), "display form drops the ^: {}", ix.text);
+        assert!(!ix.text.contains("^IXIC"));
+        // A stale quote (200 s old) never fires, even across the threshold.
+        let mut stale_rule = rule();
+        stale_rule.symbol = "VOO".into();
+        assert!(evaluate(
+            &mut stale_rule,
+            &yq("VOO", 100., t),
+            t,
+            false,
+            us_market_open(t)
+        )
+        .is_none());
+        assert!(evaluate(
+            &mut stale_rule,
+            &yq("VOO", 106., t - 200_000),
+            t,
+            false,
+            us_market_open(t)
+        )
+        .is_none());
+        // Outside US hours (01:00 EST) a fresh Yahoo quote stays silent too.
+        let night = FixedOffset::west_opt(5 * 3600)
+            .unwrap()
+            .with_ymd_and_hms(2026, 11, 12, 1, 0, 0)
+            .unwrap()
+            .timestamp_millis();
+        assert!(!us_market_open(night));
+        let mut night_rule = rule();
+        night_rule.symbol = "VOO".into();
+        assert!(evaluate(
+            &mut night_rule,
+            &yq("VOO", 100., night),
+            night,
+            false,
+            us_market_open(night)
+        )
+        .is_none());
+        assert!(evaluate(
+            &mut night_rule,
+            &yq("VOO", 106., night + 5000),
+            night + 5000,
+            false,
+            us_market_open(night)
+        )
+        .is_none());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

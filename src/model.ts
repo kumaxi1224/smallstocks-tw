@@ -60,10 +60,17 @@ export interface StockEvent {
   threshold: number;
   source?: string;
 }
+export interface WatchGroup {
+  name: string;
+  codes: string[];
+}
 export interface Snapshot {
   intraday: Record<string, IntradayView>;
   dailySummaries: Record<string, DailyView>;
   watchlist: string[];
+  /** Watch groups; `watchlist` above is the active group's codes. */
+  groups?: WatchGroup[];
+  activeGroup?: number;
   settings: {
     alwaysOnTop?: boolean;
     appearance: Appearance;
@@ -71,6 +78,8 @@ export interface Snapshot {
     refreshSeconds: number;
     rowDisplay?: "numbers" | "trend" | "minimal";
     showCodes?: boolean;
+    hideNames?: boolean;
+    showChangePoints?: boolean;
     updateCheck?: boolean;
     quoteSource?: "mis" | "shioaji";
     sidecarPort?: number;
@@ -121,6 +130,9 @@ export const number = (n: number | null | undefined) =>
     : new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 }).format(n);
 export const change = (n: number | null | undefined) =>
   n == null ? "—" : `${n > 0 ? "+" : ""}${n.toFixed(2)}%`;
+/** A signed point change, e.g. +12.5 / -3.25, trimmed the same way as `number`. */
+export const points = (n: number | null | undefined) =>
+  n == null ? "—" : `${n > 0 ? "+" : ""}${number(n)}`;
 export const time = (n: number | null | undefined) =>
   n
     ? new Date(n).toLocaleTimeString("zh-TW", {
@@ -133,6 +145,15 @@ export const time = (n: number | null | undefined) =>
     : "尚未取得";
 // Stock snapshots arrive about every one to two minutes; the core uses the same three minutes.
 export const FRESH_MS = 180_000;
+/**
+ * Yahoo-routed symbols mirror the core's route rule: a ^ prefix, or no digit
+ * at all (US tickers). Taiwan codes always contain a digit. Yahoo symbols
+ * have no TWSE close-day machinery: their rows always render from the live
+ * quote, whatever the Taiwan session is doing.
+ */
+export const isYahooSymbol = (c: string) => c.startsWith("^") || !/\d/.test(c);
+/** How a stored symbol is written for the user: indices lose their ^ prefix. */
+export const displaySymbol = (c: string) => c.replace(/^\^/, "");
 export const stale = (q: Quote | undefined, now: number) =>
   !q || now - q.sourceAt > FRESH_MS || q.sourceAt > now + 5000;
 /**
@@ -181,6 +202,8 @@ export interface CloseDay {
   date: string;
   close: number;
   changePercent: number | null;
+  /** Point change of the close, when the source gives one. */
+  changePoints: number | null;
   kind: "official" | "final" | "previous";
 }
 const taipeiDay = (ms: number) =>
@@ -205,6 +228,7 @@ export function closeDay(
         date: d.date,
         close: d.close,
         changePercent: d.changePercent,
+        changePoints: d.change,
         kind: "official",
       };
     if (sameDay && settled && s.now >= closeAt)
@@ -212,6 +236,7 @@ export function closeDay(
         date: today,
         close: q.price,
         changePercent: q.changePercent,
+        changePoints: q.previous != null ? q.price - q.previous : null,
         kind: "final",
       };
   }
@@ -220,6 +245,7 @@ export function closeDay(
         date: d.date,
         close: d.close,
         changePercent: d.changePercent,
+        changePoints: d.change,
         kind: s.now && d.date === taipeiDay(s.now) ? "official" : "previous",
       }
     : undefined;
@@ -234,7 +260,7 @@ export function latestCloseDate(
   return dates.sort().at(-1) ?? null;
 }
 export const ruleText = (r: Rule) =>
-  `${r.symbol} · ${METRIC_LABEL[r.metric] ?? r.metric}${r.direction === "above" ? "升至" : "降至"} ${number(r.threshold)}${r.metric === "price" || r.metric === "mid" ? " 元" : "%"}`;
+  `${displaySymbol(r.symbol)} · ${METRIC_LABEL[r.metric] ?? r.metric}${r.direction === "above" ? "升至" : "降至"} ${number(r.threshold)}${r.metric === "price" || r.metric === "mid" ? " 元" : "%"}`;
 const METRIC_LABEL: Record<string, string> = {
   price: "成交價",
   changePercent: "漲跌幅",
@@ -246,13 +272,20 @@ export function terminalRows(s: Snapshot): string {
   return s.watchlist
     .map((c) => {
       const q = s.quotes[c];
-      const d = !s.marketOpen && !s.demo ? closeDay(s, c) : undefined;
-      const name = [...(q?.name ?? "等待資料")].slice(0, 8).join("");
+      const d =
+        !s.marketOpen && !s.demo && !isYahooSymbol(c)
+          ? closeDay(s, c)
+          : undefined;
+      const name = [
+        ...(s.settings.hideNames
+          ? displaySymbol(c)
+          : (q?.name ?? "等待資料")),
+      ].slice(0, 8).join("");
       const cells = [...name].reduce(
         (n, c) => n + (/[^\u0000-\u00ff]/.test(c) ? 2 : 1),
         0,
       );
-      return `${c.padEnd(8)}${name}${" ".repeat(Math.max(0, 16 - cells))} ${number(d?.close ?? livePrice(q).price).padStart(10)} ${change(d ? d.changePercent : livePrice(q).pct).padStart(9)}  ${d ? "CLOSE " + d.date : stale(q, s.now) ? "STALE" : livePrice(q).basis === "book" ? "BOOK" : livePrice(q).basis === "none" ? "NO PRICE" : "OK"}`;
+      return `${displaySymbol(c).padEnd(8)}${name}${" ".repeat(Math.max(0, 16 - cells))} ${number(d?.close ?? livePrice(q).price).padStart(10)} ${change(d ? d.changePercent : livePrice(q).pct).padStart(9)}  ${d ? "CLOSE " + d.date : stale(q, s.now) ? "STALE" : livePrice(q).basis === "book" ? "BOOK" : livePrice(q).basis === "none" ? "NO PRICE" : "OK"}`;
     })
     .join("\n");
 }

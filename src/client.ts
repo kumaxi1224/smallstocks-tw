@@ -3,6 +3,8 @@ import type { Snapshot, DailyView } from "./model.ts";
 export const desktop = isTauri();
 let preview: Snapshot = {
   watchlist: ["t00", "2330", "0050"],
+  groups: [{ name: "自選1", codes: ["t00", "2330", "0050"] }],
+  activeGroup: 0,
   dailySummaries: {},
   intraday: {},
   settings: {
@@ -10,6 +12,8 @@ let preview: Snapshot = {
     paused: false,
     refreshSeconds: 15,
     alwaysOnTop: true,
+    hideNames: false,
+    showChangePoints: true,
     quoteSource: "mis",
     sidecarPort: 18765,
   },
@@ -38,8 +42,34 @@ export async function request(
   args: Record<string, unknown> = {},
 ): Promise<Snapshot> {
   if (desktop) return invoke<Snapshot>("core_request", { tool, args });
+  preview.groups ??= [{ name: "自選1", codes: [...preview.watchlist] }];
+  preview.activeGroup ??= 0;
   if (tool === "set_settings") Object.assign(preview.settings, args);
-  if (tool === "set_watchlist") preview.watchlist = args.symbols as string[];
+  if (tool === "set_watchlist") {
+    preview.watchlist = args.symbols as string[];
+    preview.groups[preview.activeGroup]!.codes = preview.watchlist;
+  }
+  if (tool === "add_watch_group") {
+    const name =
+      (args.name as string) || `自選${preview.groups.length + 1}`;
+    preview.groups.push({ name, codes: [] });
+    preview.activeGroup = preview.groups.length - 1;
+    preview.watchlist = [];
+  }
+  if (tool === "rename_watch_group")
+    preview.groups[args.index as number]!.name = args.name as string;
+  if (tool === "delete_watch_group") {
+    preview.groups.splice(args.index as number, 1);
+    preview.activeGroup = Math.min(
+      preview.activeGroup,
+      preview.groups.length - 1,
+    );
+    preview.watchlist = preview.groups[preview.activeGroup]!.codes;
+  }
+  if (tool === "set_active_group") {
+    preview.activeGroup = args.index as number;
+    preview.watchlist = preview.groups[preview.activeGroup]!.codes;
+  }
   if (tool === "upsert_rule") {
     const id = (args.id as string) ?? crypto.randomUUID();
     preview.rules = preview.rules.filter((r) => r.id !== id);

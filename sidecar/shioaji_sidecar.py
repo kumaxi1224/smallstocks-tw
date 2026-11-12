@@ -195,12 +195,17 @@ class ShioajiFeed:
                 if contract is None:
                     continue
                 self.cache.set_name(code, getattr(contract, "name", "") or "")
-                self.api.quote.subscribe(
-                    contract, quote_type=QuoteType.Tick,
-                    version=QuoteVersion.v1)
-                self.api.quote.subscribe(
-                    contract, quote_type=QuoteType.BidAsk,
-                    version=QuoteVersion.v1)
+                # A code whose subscription fails must not break the whole
+                # batch: skip it (it is retried on the next request).
+                try:
+                    self.api.quote.subscribe(
+                        contract, quote_type=QuoteType.Tick,
+                        version=QuoteVersion.v1)
+                    self.api.quote.subscribe(
+                        contract, quote_type=QuoteType.BidAsk,
+                        version=QuoteVersion.v1)
+                except Exception:
+                    continue
                 self._subscribed.add(code)
 
 

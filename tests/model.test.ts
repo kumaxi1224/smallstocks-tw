@@ -138,8 +138,40 @@ describe("what a closed session shows", () => {
       "previous",
     );
   });
+  it("carries the close's point change when the source gives one", () => {
+    const officialDay = {
+      date: "2026-11-09",
+      close: 2236,
+      changePercent: 4.7,
+      change: 100,
+    };
+    const days: {
+      date: string;
+      close: number;
+      changePercent: number;
+      change?: number | null;
+    }[] = [friday, officialDay];
+    const official = snapshot(
+      "15:30:00",
+      { tradeAt: at("13:30:00"), sourceAt: at("13:30:00") },
+      days,
+    );
+    expect(closeDay(official, "2330")).toMatchObject({
+      kind: "official",
+      changePoints: 100,
+    });
+    const fin = snapshot("13:36:00", {
+      tradeAt: at("13:30:00"),
+      sourceAt: at("13:30:00"),
+      previous: 2135,
+    });
+    expect(closeDay(fin, "2330")).toMatchObject({
+      kind: "final",
+      changePoints: 100,
+    });
+  });
 });
-import { aging, ageSeconds, oldestDataAt } from "../src/model.ts";
+import { aging, ageSeconds, oldestDataAt, points } from "../src/model.ts";
 describe("how old the data is", () => {
   const quote = (ageMs: number, now = 1_000_000) =>
     ({ sourceAt: now - ageMs }) as Quote;
@@ -159,5 +191,60 @@ describe("how old the data is", () => {
     } as unknown as Parameters<typeof oldestDataAt>[0];
     expect(oldestDataAt(s)).toBe(300);
     expect(oldestDataAt({ watchlist: ["x"], quotes: {} })).toBeNull();
+  });
+  it("formats a signed point change, trimmed like the price", () => {
+    expect(points(12.5)).toBe("+12.5");
+    expect(points(-3.25)).toBe("-3.25");
+    expect(points(0)).toBe("0");
+    expect(points(null)).toBe("—");
+    expect(points(undefined)).toBe("—");
+  });
+});
+import { displaySymbol, isYahooSymbol, terminalRows } from "../src/model.ts";
+describe("Yahoo symbols", () => {
+  it("routes by the core's rule: a ^ prefix, or no digit at all", () => {
+    expect(isYahooSymbol("^IXIC")).toBe(true);
+    expect(isYahooSymbol("^TWII")).toBe(true);
+    expect(isYahooSymbol("VOO")).toBe(true);
+    expect(isYahooSymbol("BRK.B")).toBe(true);
+    expect(isYahooSymbol("2330")).toBe(false);
+    expect(isYahooSymbol("00685L")).toBe(false);
+    expect(isYahooSymbol("t00")).toBe(false);
+  });
+  it("displays indices without the ^ and leaves other codes alone", () => {
+    expect(displaySymbol("^IXIC")).toBe("IXIC");
+    expect(displaySymbol("^GSPC")).toBe("GSPC");
+    expect(displaySymbol("VOO")).toBe("VOO");
+    expect(displaySymbol("2330")).toBe("2330");
+  });
+  it("renders a Yahoo row from its live quote while Taiwan is closed", () => {
+    const now = Date.parse("2026-11-12T23:00:00+08:00");
+    const s = {
+      now,
+      marketOpen: false,
+      demo: false,
+      watchlist: ["^IXIC"],
+      dailySummaries: {},
+      settings: { hideNames: false },
+      quotes: {
+        "^IXIC": {
+          symbol: "^IXIC",
+          name: "Nasdaq Composite",
+          price: 25466.19,
+          previous: 25065.88,
+          changePercent: 1.6,
+          sourceAt: now - 30_000,
+          receivedAt: now,
+          date: "20261112",
+          source: "Yahoo",
+        },
+      },
+    } as unknown as Snapshot;
+    const row = terminalRows(s);
+    expect(row).toContain("IXIC");
+    expect(row).not.toContain("^IXIC");
+    expect(row).toContain("25,466.19");
+    expect(row).toContain("OK");
+    expect(row).not.toContain("CLOSE");
   });
 });
