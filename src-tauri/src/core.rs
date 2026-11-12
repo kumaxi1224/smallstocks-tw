@@ -100,6 +100,7 @@ pub fn index_name(code: &str) -> Option<&'static str> {
         "^DJI" => "Dow Jones Industrial Average",
         "^GSPC" => "S&P 500",
         "^RUT" => "Russell 2000 Index",
+        "TXF" => "臺指期貨",
         "BZ=F" => "布蘭特原油",
         "CL=F" => "西德州原油",
         "GC=F" => "黃金",
@@ -116,6 +117,29 @@ pub fn is_tw_symbol(code: &str) -> bool {
         && !code.starts_with('^')
         && code.bytes().any(|b| b.is_ascii_digit())
 }
+/// TAIFEX futures family codes, served by the exchange's own MIS (taifex.rs)
+/// rather than TWSE MIS or Yahoo — Yahoo carries no Taiwan futures at all.
+/// Letters only, so is_tw_symbol never claims them; the poll routes them to
+/// the TAIFEX adapter before the Yahoo bucket. Only TXF is served for now:
+/// the mini contract's MIS symbol resolution is unverified, so MTX stays a
+/// plain (Yahoo-bound, unserved) ticker until it is.
+pub fn is_taifex_symbol(code: &str) -> bool {
+    matches!(code, "TXF")
+}
+/// Whether a TAIFEX session is running at `at` (Taipei): the regular session
+/// 08:45–13:45 and the after-hours session 15:00–05:00, Monday to Friday,
+/// the night session running into Saturday 05:00. Like the US calendar above
+/// there is no holiday table here; on a holiday the source timestamps simply
+/// go stale and the freshness rule keeps alerts silent.
+pub fn taifex_market_open(at: i64) -> bool {
+    let t = local(at);
+    let m = t.hour() * 60 + t.minute();
+    let weekday = t.weekday().number_from_monday();
+    let regular = weekday <= 5 && (525..=825).contains(&m);
+    let evening = weekday <= 5 && m >= 900;
+    let early = (2..=6).contains(&weekday) && m < 300;
+    regular || evening || early
+}
 /// How a stored symbol is written for the user: indices lose their ^ prefix.
 pub fn display_symbol(code: &str) -> &str {
     code.strip_prefix('^').unwrap_or(code)
@@ -123,7 +147,8 @@ pub fn display_symbol(code: &str) -> &str {
 /// Canonical form of a user-typed code, shared by the UI and MCP through
 /// execute. Taiwan codes keep their historic shapes (2330, 00685L, t00, o00);
 /// index shorthands fold to Yahoo symbols (.IXIC → ^IXIC, IX0001 → ^TWII, …);
-/// US tickers pass through uppercased, class-share dot included (VOO, BRK.B);
+/// TAIFEX family codes keep their spelling (TXF); US tickers pass through
+/// uppercased, class-share dot included (VOO, BRK.B);
 /// Yahoo futures and FX codes keep their =F / =X suffix (BZ=F, TWD=X).
 pub fn symbol(s: &str) -> Option<String> {
     let s = s.trim().to_uppercase();
@@ -132,6 +157,11 @@ pub fn symbol(s: &str) -> Option<String> {
     }
     if matches!(s.as_str(), "櫃買" | "櫃買指數" | "O00") {
         return Some("o00".into());
+    }
+    // A TAIFEX family code (TXF) is its own route, not a US ticker, even
+    // though its letters-only shape would pass the ticker check below.
+    if is_taifex_symbol(&s) {
+        return Some(s);
     }
     if let Some(index) = index_alias(&s) {
         return Some(index.into());
@@ -368,6 +398,86 @@ pub fn fill_missing(primary: Vec<Quote>, fallback: Vec<Quote>) -> Vec<Quote> {
     out
 }
 
+/// How many state backups are kept in the backup folder; older ones are
+/// pruned after each write.
+pub const BACKUP_KEEP: usize = 14;
+/// Backup files in `dir` (state-backup-*.json), oldest first — the
+/// timestamped names sort chronologically.
+fn backup_files(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("state-backup-") && n.ends_with(".json"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    files
+}
+/// The Bot API endpoint for a token. The result embeds the token: hand it
+/// only to the HTTP client — never log it, store it in an error, or show
+/// it in the UI.
+fn telegram_endpoint(token: &str) -> String {
+    format!("https://api.telegram.org/bot{token}/sendMessage")
+}
+/// Guard + payload for one Telegram send, shared by the settings-page test
+/// command and the alert path in lib.rs. Errors name only what is missing —
+/// never the token.
+fn telegram_request(settings: &Settings, text: &str) -> Result<(String, Value), String> {
+    let token = settings.telegram_bot_token.trim();
+    if token.is_empty() {
+        return Err("尚未設定 bot token".into());
+    }
+    let chat_id = settings.telegram_chat_id.trim();
+    if chat_id.is_empty() {
+        return Err("尚未設定 chat id".into());
+    }
+    Ok((
+        telegram_endpoint(token),
+        json!({"chat_id": chat_id, "text": text}),
+    ))
+}
+/// POSTs one Telegram message with a blocking client (10s timeout, no
+/// retry). Failure is reported by status class only: the request URL
+/// carries the token, and reqwest's own error text can embed it, so the
+/// underlying error is never formatted into the result.
+pub fn telegram_send_blocking(settings: &Settings, text: &str) -> Result<(), String> {
+    let (url, body) = telegram_request(settings, text)?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|_| "無法建立連線".to_string())?;
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .map_err(|_| "Telegram 連線失敗".to_string())?;
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("Telegram 回應 HTTP {}", resp.status().as_u16()))
+    }
+}
+/// The Telegram sends mirroring a batch of rule events: one (endpoint,
+/// payload) per strip/card event, when the push is enabled and configured.
+/// The endpoint embeds the token — callers must treat it as a secret and
+/// stay silent on failure.
+pub fn telegram_alerts(settings: &Settings, events: &[Event]) -> Vec<(String, Value)> {
+    if !settings.telegram_enabled {
+        return Vec::new();
+    }
+    events
+        .iter()
+        .filter(|e| matches!(e.channel.as_str(), "strip" | "card"))
+        .filter_map(|e| telegram_request(settings, &format!("🔔 {}", e.text)).ok())
+        .collect()
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
@@ -381,9 +491,6 @@ pub struct Settings {
     /// In numbers mode, show the point change next to the price as well as the percent.
     #[serde(default = "default_show_change_points")]
     pub show_change_points: bool,
-    /// Ask GitHub once per launch whether a newer version exists. On by default, switchable.
-    #[serde(default = "default_update_check")]
-    pub update_check: bool,
     #[serde(default = "default_row_display")]
     pub row_display: String,
     pub appearance: String,
@@ -399,6 +506,29 @@ pub struct Settings {
     /// Only the background fades; text and numbers stay fully opaque.
     #[serde(default = "default_window_opacity")]
     pub window_opacity: f64,
+    /// Telegram alert push: when a rule event would pop a local notice, also
+    /// send it to the configured chat through the configured bot. The token
+    /// is a secret: it lives only in state.json, is set only from the
+    /// settings page (never through MCP), and never enters a snapshot —
+    /// snapshots carry `telegramTokenSet` instead (see `settings_view`).
+    #[serde(default)]
+    pub telegram_enabled: bool,
+    #[serde(default)]
+    pub telegram_chat_id: String,
+    #[serde(default)]
+    pub telegram_bot_token: String,
+    /// Automatic state.json backups into a user-chosen folder (typically a
+    /// cloud-synced one); see `maybe_backup`.
+    #[serde(default)]
+    pub backup_enabled: bool,
+    #[serde(default)]
+    pub backup_dir: String,
+    /// Show the auxiliary PTT chat window (a plain webview on the public
+    /// t.me/s preview feed, no app capabilities). lib.rs creates/destroys
+    /// the window to match; closing the window by hand writes this back
+    /// to false, so the setting always says whether the window is up.
+    #[serde(default)]
+    pub chat_window: bool,
 }
 fn default_row_display() -> String {
     "numbers".into()
@@ -414,9 +544,6 @@ fn default_always_on_top() -> bool {
     true
 }
 fn default_show_change_points() -> bool {
-    true
-}
-fn default_update_check() -> bool {
     true
 }
 pub const MIN_WINDOW_OPACITY: f64 = 0.4;
@@ -439,7 +566,6 @@ impl Default for Settings {
             show_codes: false,
             hide_names: false,
             show_change_points: true,
-            update_check: true,
             row_display: default_row_display(),
             appearance: "small".into(),
             paused: false,
@@ -447,6 +573,12 @@ impl Default for Settings {
             quote_source: default_quote_source(),
             sidecar_port: DEFAULT_SIDECAR_PORT,
             window_opacity: 1.0,
+            telegram_enabled: false,
+            telegram_chat_id: String::new(),
+            telegram_bot_token: String::new(),
+            backup_enabled: false,
+            backup_dir: String::new(),
+            chat_window: false,
         }
     }
 }
@@ -525,6 +657,26 @@ pub struct Position {
     #[serde(default)]
     pub lots: Vec<Lot>,
 }
+/// One month's portfolio snapshot for the positions page's monthly tab:
+/// the combined total (TWD equivalent) the app computed the first time it
+/// ran that month with complete quotes, with the TWD/USD legs and the
+/// conversion rate kept beside it so the figure stays auditable.
+/// First write wins — a month is never overwritten once recorded.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct MonthlySnapshot {
+    /// "YYYY-MM".
+    pub month: String,
+    pub total_twd: f64,
+    pub twd_value: f64,
+    #[serde(default)]
+    pub usd_value: Option<f64>,
+    #[serde(default)]
+    pub rate: Option<f64>,
+    /// The Taipei date the total was actually captured, "YYYY-MM-DD"
+    /// (the 1st itself may be a weekend or a day the app never ran).
+    pub recorded_on: String,
+}
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Saved {
@@ -547,6 +699,16 @@ pub struct Saved {
     /// Held positions with their purchase lots; empty on pre-positions saves.
     #[serde(default)]
     pub positions: Vec<Position>,
+    /// Monthly portfolio snapshots (see MonthlySnapshot); empty on
+    /// pre-monthly saves.
+    #[serde(default)]
+    pub monthly_snapshots: Vec<MonthlySnapshot>,
+    /// Display names learned from live quotes (any source), keyed by canonical
+    /// code. Quotes live only in memory, so without this cache a restart — or
+    /// the close-day view, whose daily series carry no name — loses every name
+    /// the intraday feed once provided. Empty on pre-cache saves.
+    #[serde(default)]
+    pub names: HashMap<String, String>,
     #[serde(default)]
     pub settings: Settings,
     #[serde(default)]
@@ -633,6 +795,20 @@ fn group_name(args: &Value) -> Result<String, String> {
     Ok(name.to_string())
 }
 /// A lot date the user typed: strict YYYY-MM-DD shape and a real calendar day.
+/// A "YYYY-MM" month key in shape only — unlike daily::valid_month this
+/// applies no range check, because a snapshot's month is whatever month
+/// the caller says the total belongs to (the import path takes files at
+/// their word the same way). The month must still be a real calendar
+/// month, verified by parsing the 1st.
+fn valid_month_key(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 7
+        && b[4] == b'-'
+        && b.iter()
+            .enumerate()
+            .all(|(i, c)| i == 4 || c.is_ascii_digit())
+        && chrono::NaiveDate::parse_from_str(&format!("{s}-01"), "%Y-%m-%d").is_ok()
+}
 fn valid_lot_date(s: &str) -> bool {
     let b = s.as_bytes();
     b.len() == 10
@@ -713,6 +889,12 @@ pub struct Core {
     /// Non-fatal note about the live-quote source (e.g. sidecar fell back to MIS),
     /// shown in the UI footer; None when the configured source served everything.
     pub source_note: Option<String>,
+    /// Outcome of the most recent state backup, for the settings page:
+    /// (Taipei timestamp, full path written) on success.
+    pub last_backup_at: Option<(String, String)>,
+    /// Why the most recent backup attempt failed, when it did. Backup paths
+    /// are user-chosen folders, never secrets.
+    pub last_backup_error: Option<String>,
 }
 impl Core {
     pub fn load(path: PathBuf, demo: bool) -> Result<Self, String> {
@@ -755,16 +937,113 @@ impl Core {
             notices_hidden: false,
             privacy_shortcut_error: None,
             source_note: None,
+            last_backup_at: None,
+            last_backup_error: None,
         })
     }
-    pub fn persist(&self) -> Result<(), String> {
+    pub fn persist(&mut self) -> Result<(), String> {
         let temp = self.path.with_extension("tmp");
         std::fs::write(
             &temp,
             serde_json::to_vec_pretty(&self.saved).map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;
-        std::fs::rename(temp, &self.path).map_err(|e| e.to_string())
+        std::fs::rename(temp, &self.path).map_err(|e| e.to_string())?;
+        // A successful save is the automatic-backup trigger point; the
+        // backup rides along silently and never fails the save itself.
+        self.maybe_backup(false);
+        Ok(())
+    }
+    /// Automatic state backup, called after every successful persist and
+    /// once at startup. Acts only when backups are enabled, a folder is
+    /// configured and exists, and state.json is on disk. Unless `force`,
+    /// the write is skipped when the newest backup in the folder is already
+    /// from today (Asia/Taipei) — the timestamped file names make that a
+    /// name check, so the per-save trigger costs one directory scan.
+    /// Failures are recorded in `last_backup_error` for the settings page
+    /// and otherwise swallowed.
+    pub fn maybe_backup(&mut self, force: bool) {
+        let settings = &self.saved.settings;
+        if !settings.backup_enabled || settings.backup_dir.trim().is_empty() {
+            return;
+        }
+        let dir = PathBuf::from(settings.backup_dir.trim());
+        if !dir.is_dir() || !self.path.exists() {
+            return;
+        }
+        if !force {
+            let today = format!("state-backup-{}", local(now()).format("%Y%m%d"));
+            if backup_files(&dir)
+                .last()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(&today))
+            {
+                return;
+            }
+        }
+        match self.write_backup_file(&dir) {
+            Ok(path) => {
+                self.last_backup_at = Some((
+                    local(now()).format("%Y-%m-%d %H:%M:%S").to_string(),
+                    path,
+                ));
+                self.last_backup_error = None;
+            }
+            Err(e) => self.last_backup_error = Some(e),
+        }
+    }
+    /// Copies the current on-disk state.json into `dir` as
+    /// state-backup-YYYYMMDD-HHmmss.json (Taipei) and prunes the folder's
+    /// backups to the newest BACKUP_KEEP. Returns the full path written.
+    fn write_backup_file(&self, dir: &std::path::Path) -> Result<String, String> {
+        let content =
+            std::fs::read(&self.path).map_err(|e| format!("讀取 state.json 失敗：{e}"))?;
+        let name = format!(
+            "state-backup-{}.json",
+            local(now()).format("%Y%m%d-%H%M%S")
+        );
+        let dest = dir.join(name);
+        std::fs::write(&dest, &content).map_err(|e| format!("寫入備份失敗：{e}"))?;
+        let files = backup_files(dir);
+        if files.len() > BACKUP_KEEP {
+            for old in &files[..files.len() - BACKUP_KEEP] {
+                let _ = std::fs::remove_file(old);
+            }
+        }
+        Ok(dest.to_string_lossy().into_owned())
+    }
+    /// The export_data payload as a JSON string: the watch groups (with the
+    /// active group index), all positions and the monthly snapshots.
+    /// Settings and rules stay out.
+    fn export_text(&self) -> Result<String, String> {
+        let payload = json!({
+            "app": "smallstocks-tw",
+            "version": 1,
+            "groups": self.saved.groups,
+            "activeGroup": self.saved.active_group,
+            "positions": self.saved.positions,
+            "monthlySnapshots": self.saved.monthly_snapshots,
+        });
+        serde_json::to_string_pretty(&payload).map_err(|e| format!("匯出序列化失敗：{e}"))
+    }
+    /// Where export_data_file writes: the user's Downloads folder when it
+    /// exists (Windows %USERPROFILE%\Downloads, elsewhere $HOME/Downloads),
+    /// else the folder holding state.json.
+    fn export_dir(&self) -> PathBuf {
+        let home = std::env::var_os("USERPROFILE")
+            .filter(|v| !v.is_empty())
+            .or_else(|| std::env::var_os("HOME").filter(|v| !v.is_empty()));
+        if let Some(h) = home {
+            let d = PathBuf::from(h).join("Downloads");
+            if d.is_dir() {
+                return d;
+            }
+        }
+        self.path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."))
     }
     /// Name of the calendar closure on this Taipei date, if the official calendar lists one.
     fn closure_on(&self, ms: i64) -> Option<&calendar::Closure> {
@@ -837,6 +1116,18 @@ impl Core {
             })
             .collect()
     }
+    /// The settings as the UI and MCP may see them: identical to the stored
+    /// settings except the Telegram bot token, which is replaced by a
+    /// `telegramTokenSet` flag. The token itself never leaves the core.
+    fn settings_view(&self) -> Value {
+        let mut v = serde_json::to_value(&self.saved.settings).unwrap_or_else(|_| json!({}));
+        let token_set = !self.saved.settings.telegram_bot_token.trim().is_empty();
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove("telegramBotToken");
+            obj.insert("telegramTokenSet".into(), json!(token_set));
+        }
+        v
+    }
     pub fn snapshot(&self) -> Value {
         let months = daily::months(now());
         // Daily summaries cover the visible watchlist plus Taiwan holdings, so
@@ -860,7 +1151,7 @@ impl Core {
             .iter()
             .map(|c| (c.clone(), self.intraday_view(c)))
             .collect();
-        json!({"watchlist":self.saved.watchlist,"groups":self.saved.groups,"activeGroup":self.saved.active_group,"positions":self.saved.positions,"settings":self.saved.settings,"privacyShortcutError":self.privacy_shortcut_error,"rules":self.saved.rules,"events":self.saved.events,"quotes":self.quotes,"demo":self.demo,"error":self.error,"sourceNote":self.source_note,"lastFetch":self.last_fetch,"nextPoll":self.next_poll,"marketOpen":self.market_open(now()),"marketClosedReason":self.closed_reason(now()),"calendar":self.calendar_view(),"revision":self.revision,"now":now(),"dailySummaries":summaries,"intraday":intraday})
+        json!({"watchlist":self.saved.watchlist,"groups":self.saved.groups,"activeGroup":self.saved.active_group,"positions":self.saved.positions,"monthlySnapshots":self.saved.monthly_snapshots,"names":self.saved.names,"settings":self.settings_view(),"privacyShortcutError":self.privacy_shortcut_error,"rules":self.saved.rules,"events":self.saved.events,"quotes":self.quotes,"demo":self.demo,"error":self.error,"sourceNote":self.source_note,"lastBackupAt":self.last_backup_at.as_ref().map(|(at, path)| json!({"at":at,"path":path})),"lastBackupError":self.last_backup_error,"lastFetch":self.last_fetch,"nextPoll":self.next_poll,"marketOpen":self.market_open(now()),"marketClosedReason":self.closed_reason(now()),"calendar":self.calendar_view(),"revision":self.revision,"now":now(),"dailySummaries":summaries,"intraday":intraday})
     }
     pub fn queue_intraday(&mut self, code: &str) {
         let at = now();
@@ -1063,16 +1354,56 @@ impl Core {
         if tool == "export_data" {
             // One JSON string packing the watch groups and the positions —
             // settings and rules deliberately stay out (see import_data).
-            let payload = json!({
-                "app": "smallstocks-tw",
-                "version": 1,
-                "groups": self.saved.groups,
-                "activeGroup": self.saved.active_group,
-                "positions": self.saved.positions,
-            });
-            let text = serde_json::to_string_pretty(&payload)
-                .map_err(|e| format!("匯出序列化失敗：{e}"))?;
-            return Ok(Value::String(text));
+            return Ok(Value::String(self.export_text()?));
+        }
+        if tool == "export_data_file" {
+            // The same payload, written to a file by the core itself: the
+            // desktop shell's Blob-download path is silently ignored by
+            // WebView2, so the settings page's export button calls this and
+            // reports the path it gets back.
+            let text = self.export_text()?;
+            let file = format!("smallstocks-data-{}.json", local(now()).format("%Y%m%d"));
+            let dest = self.export_dir().join(file);
+            std::fs::write(&dest, text).map_err(|e| format!("匯出寫檔失敗：{e}"))?;
+            return Ok(json!({"path": dest.to_string_lossy()}));
+        }
+        if tool == "telegram_test" {
+            // UI-only on purpose: this command is not in the MCP tool list,
+            // so an agent can neither spend the user's bot nor probe whether
+            // a token is stored. Sends with the saved settings; the reply
+            // never carries the token or the request URL.
+            telegram_send_blocking(
+                &self.saved.settings,
+                "Maxi stocks 測試訊息：Telegram 推播已連通",
+            )?;
+            return Ok(json!({"sent": true}));
+        }
+        if tool == "backup_now" {
+            // Manual backup: same write as the automatic one but without
+            // the once-a-day throttle; the folder must be configured and
+            // exist. Also reachable through MCP (no secrets involved).
+            let dir_raw = self.saved.settings.backup_dir.trim().to_string();
+            if dir_raw.is_empty() {
+                return Err("尚未設定備份資料夾".into());
+            }
+            let dir = PathBuf::from(&dir_raw);
+            if !dir.is_dir() {
+                return Err("備份資料夾不存在，請先建立它或改指向現有資料夾".into());
+            }
+            return match self.write_backup_file(&dir) {
+                Ok(path) => {
+                    self.last_backup_at = Some((
+                        local(now()).format("%Y-%m-%d %H:%M:%S").to_string(),
+                        path.clone(),
+                    ));
+                    self.last_backup_error = None;
+                    Ok(json!({"path": path}))
+                }
+                Err(e) => {
+                    self.last_backup_error = Some(e.clone());
+                    Err(format!("備份失敗：{e}"))
+                }
+            };
         }
         let mut next = self.clone();
         next.saved.normalize_groups();
@@ -1244,6 +1575,66 @@ impl Core {
                 }
                 next.saved.positions.retain(|p| p.code != code);
             }
+            "record_monthly_snapshot" => {
+                // First write wins: the UI calls this whenever the header
+                // total is computable and the month is not yet recorded,
+                // so a repeat call for a recorded month is a plain no-op,
+                // never an overwrite and never an error.
+                let month = args["month"].as_str().ok_or("需要月份")?.trim();
+                if !valid_month_key(month) {
+                    return Err("月份需為 YYYY-MM".into());
+                }
+                let total_twd = args["totalTwd"]
+                    .as_f64()
+                    .filter(|n| n.is_finite() && *n > 0.)
+                    .ok_or("總資產必須大於零")?;
+                let twd_value = args["twdValue"]
+                    .as_f64()
+                    .filter(|n| n.is_finite() && *n >= 0.)
+                    .ok_or("台幣市值格式錯誤")?;
+                let usd_value = match args.get("usdValue") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(
+                        v.as_f64()
+                            .filter(|n| n.is_finite() && *n >= 0.)
+                            .ok_or("美元市值格式錯誤")?,
+                    ),
+                };
+                let rate = match args.get("rate") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(
+                        v.as_f64()
+                            .filter(|n| n.is_finite() && *n > 0.)
+                            .ok_or("匯率格式錯誤")?,
+                    ),
+                };
+                let recorded_on = args["recordedOn"].as_str().ok_or("需要記錄日期")?.trim();
+                if !valid_lot_date(recorded_on) {
+                    return Err("記錄日期需為 YYYY-MM-DD".into());
+                }
+                if !next
+                    .saved
+                    .monthly_snapshots
+                    .iter()
+                    .any(|s| s.month == month)
+                {
+                    next.saved.monthly_snapshots.push(MonthlySnapshot {
+                        month: month.to_string(),
+                        total_twd,
+                        twd_value,
+                        usd_value,
+                        rate,
+                        recorded_on: recorded_on.to_string(),
+                    });
+                }
+            }
+            "delete_monthly_snapshot" => {
+                let month = args["month"].as_str().ok_or("需要月份")?.trim();
+                if !valid_month_key(month) {
+                    return Err("月份需為 YYYY-MM".into());
+                }
+                next.saved.monthly_snapshots.retain(|s| s.month != month);
+            }
             "import_positions" => {
                 let text = args["text"].as_str().ok_or("需要匯入文字")?;
                 let mut added = 0usize;
@@ -1368,6 +1759,61 @@ impl Core {
                         None => new_positions.push(Position { code, lots }),
                     }
                 }
+                // Monthly snapshots ride the same whole-file replace. Old
+                // exports have no such field and simply mean none; a bad
+                // entry (month shape, total, recorded-on date) is skipped
+                // and tallied like a bad lot, and a repeated month keeps
+                // its first entry, mirroring first-write-wins recording.
+                let mut new_snapshots: Vec<MonthlySnapshot> = Vec::new();
+                let mut skipped_snapshots = 0usize;
+                if let Some(raw_snapshots) = v.get("monthlySnapshots") {
+                    let Some(raw_snapshots) = raw_snapshots.as_array() else {
+                        return Err("匯出檔案的月度紀錄格式錯誤，檔案未匯入".into());
+                    };
+                    for s in raw_snapshots {
+                        let month = s["month"].as_str().unwrap_or("").trim();
+                        let recorded_on = s["recordedOn"].as_str().unwrap_or("").trim();
+                        let parsed = (|| {
+                            if !valid_month_key(month) || !valid_lot_date(recorded_on) {
+                                return None;
+                            }
+                            let total_twd = s["totalTwd"]
+                                .as_f64()
+                                .filter(|n| n.is_finite() && *n > 0.)?;
+                            let twd_value = s["twdValue"]
+                                .as_f64()
+                                .filter(|n| n.is_finite() && *n >= 0.)?;
+                            let usd_value = match s.get("usdValue") {
+                                None | Some(Value::Null) => None,
+                                Some(v) => Some(
+                                    v.as_f64().filter(|n| n.is_finite() && *n >= 0.)?,
+                                ),
+                            };
+                            let rate = match s.get("rate") {
+                                None | Some(Value::Null) => None,
+                                Some(v) => {
+                                    Some(v.as_f64().filter(|n| n.is_finite() && *n > 0.)?)
+                                }
+                            };
+                            Some(MonthlySnapshot {
+                                month: month.to_string(),
+                                total_twd,
+                                twd_value,
+                                usd_value,
+                                rate,
+                                recorded_on: recorded_on.to_string(),
+                            })
+                        })();
+                        match parsed {
+                            Some(snap)
+                                if !new_snapshots.iter().any(|x| x.month == snap.month) =>
+                            {
+                                new_snapshots.push(snap)
+                            }
+                            _ => skipped_snapshots += 1,
+                        }
+                    }
+                }
                 // An enabled rule must keep its symbol in the monitoring
                 // union, exactly as set_watchlist guards it.
                 let mut union: Vec<String> = Vec::new();
@@ -1398,11 +1844,13 @@ impl Core {
                     "lots": lot_total,
                     "skippedSymbols": skipped_symbols,
                     "skippedLots": skipped_lots,
+                    "skippedSnapshots": skipped_snapshots,
                 }));
                 next.saved.groups = new_groups;
                 next.saved.active_group = (v["activeGroup"].as_u64().unwrap_or(0) as usize)
                     .min(next.saved.groups.len() - 1);
                 next.saved.positions = new_positions;
+                next.saved.monthly_snapshots = new_snapshots;
                 next.saved.sync_watchlist();
                 next.saved
                     .intraday_cache
@@ -1422,9 +1870,6 @@ impl Core {
                         return Err("列顯示需為 numbers、trend 或 minimal".into());
                     }
                     next.saved.settings.row_display = v.into();
-                }
-                if let Some(v) = args.get("updateCheck") {
-                    next.saved.settings.update_check = v.as_bool().ok_or("更新檢查需為布林值")?;
                 }
                 if let Some(v) = args.get("showCodes") {
                     next.saved.settings.show_codes = v.as_bool().ok_or("代號顯示需為布林值")?;
@@ -1471,6 +1916,41 @@ impl Core {
                 if let Some(v) = args.get("windowOpacity") {
                     let v = v.as_f64().ok_or("視窗透明度需為數字")?;
                     next.saved.settings.window_opacity = clamp_window_opacity(v);
+                }
+                if let Some(v) = args.get("telegramEnabled") {
+                    next.saved.settings.telegram_enabled =
+                        v.as_bool().ok_or("Telegram 推播需為布林值")?;
+                }
+                if let Some(v) = args.get("telegramChatId") {
+                    next.saved.settings.telegram_chat_id =
+                        v.as_str().ok_or("chat id 需為文字")?.trim().into();
+                }
+                if let Some(v) = args.get("telegramBotToken") {
+                    // Write-only secret: accepted here from the settings
+                    // page only (the MCP schema deliberately has no such
+                    // field) and never echoed back — snapshots carry
+                    // telegramTokenSet instead. An empty value means "keep
+                    // the stored token"; clearing goes through
+                    // telegramClearToken so a blank field cannot wipe it.
+                    let v = v.as_str().ok_or("bot token 需為文字")?.trim();
+                    if !v.is_empty() {
+                        next.saved.settings.telegram_bot_token = v.into();
+                    }
+                }
+                if args.get("telegramClearToken").and_then(Value::as_bool) == Some(true) {
+                    next.saved.settings.telegram_bot_token = String::new();
+                }
+                if let Some(v) = args.get("backupEnabled") {
+                    next.saved.settings.backup_enabled =
+                        v.as_bool().ok_or("自動備份需為布林值")?;
+                }
+                if let Some(v) = args.get("backupDir") {
+                    next.saved.settings.backup_dir =
+                        v.as_str().ok_or("備份資料夾需為文字")?.trim().into();
+                }
+                if let Some(v) = args.get("chatWindow") {
+                    next.saved.settings.chat_window =
+                        v.as_bool().ok_or("聊天視窗需為布林值")?;
                 }
                 next.next_poll = 0;
             }
@@ -1590,6 +2070,7 @@ impl Core {
         let mut next = self.clone();
         let open = next.market_open(at);
         let mut emitted = Vec::new();
+        let mut names_changed = false;
         for q in quotes {
             if !next.saved.watches(&q.symbol) {
                 continue;
@@ -1607,9 +2088,13 @@ impl Core {
                 next.record_intraday(&q, at);
             }
             // Each symbol is judged against its own market's session: Taiwan
-            // symbols against the TWSE session, Yahoo symbols against US hours.
+            // symbols against the TWSE session, TAIFEX symbols against the
+            // futures sessions (the night session included), Yahoo symbols
+            // against US hours.
             let quote_open = if is_tw_symbol(&q.symbol) {
                 open
+            } else if is_taifex_symbol(&q.symbol) {
+                taifex_market_open(at)
             } else {
                 us_market_open(at)
             };
@@ -1624,13 +2109,22 @@ impl Core {
                     emitted.push(e)
                 }
             }
+            // Learn the name any source reports (MIS, Shioaji and Yahoo all
+            // carry one): quotes are runtime-only, so this persisted cache is
+            // what lets names survive a restart and the close-day view.
+            if !q.name.is_empty()
+                && next.saved.names.get(&q.symbol).map(String::as_str) != Some(q.name.as_str())
+            {
+                next.saved.names.insert(q.symbol.clone(), q.name.clone());
+                names_changed = true;
+            }
             next.quotes.insert(q.symbol.clone(), q);
         }
         next.saved.events.truncate(500);
         next.last_fetch = Some(at);
         next.error = None;
         next.failures = 0;
-        if !emitted.is_empty() || at - next.last_intraday_save >= 60_000 {
+        if names_changed || !emitted.is_empty() || at - next.last_intraday_save >= 60_000 {
             next.revision += 1;
             match next.persist() {
                 Ok(()) => next.last_intraday_save = at,
@@ -2399,29 +2893,12 @@ mod tests {
         std::fs::remove_dir(dir).unwrap();
     }
     #[test]
-    fn update_check_is_a_shared_persistent_setting() {
-        let dir = std::env::temp_dir().join(format!("smallstocks-update-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("state.json");
-        let mut core = Core::load(path.clone(), true).unwrap();
-        assert!(core.saved.settings.update_check);
-        assert!(core
-            .execute("set_settings", json!({"updateCheck":"no"}))
-            .is_err());
-        core.execute("set_settings", json!({"updateCheck":false}))
-            .unwrap();
-        assert!(!Core::load(path, true).unwrap().saved.settings.update_check);
-        assert_eq!(core.snapshot()["settings"]["updateCheck"], false);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-    #[test]
     fn old_settings_keep_numbers_by_default() {
         let cfg: Settings =
             serde_json::from_value(json!({"appearance":"gray","paused":false,"refreshSeconds":15}))
                 .unwrap();
         assert_eq!(cfg.row_display, "numbers");
         assert!(!cfg.show_codes);
-        assert!(cfg.update_check, "old settings keep the update check on");
         assert_eq!(cfg.appearance, "gray");
     }
     #[test]
@@ -2462,7 +2939,7 @@ mod tests {
             r#"{"watchlist":["2330","0050","2330"],"settings":{"appearance":"small","paused":false,"refreshSeconds":15}}"#,
         )
         .unwrap();
-        let c = Core::load(path.clone(), true).unwrap();
+        let mut c = Core::load(path.clone(), true).unwrap();
         assert_eq!(c.saved.groups.len(), 1);
         assert_eq!(c.saved.groups[0].name, "自選1");
         assert_eq!(
@@ -2867,6 +3344,27 @@ mod tests {
         }
     }
     #[test]
+    fn taifex_market_open_covers_both_sessions_and_the_saturday_tail() {
+        // Taipei epoch millis, November 2026: Thu 12th, Fri 13th, Sat 14th,
+        // Mon 16th.
+        let cases: [(&str, i64, bool); 11] = [
+            ("Thu 10:00 regular session", 1794448800000, true),
+            ("Thu 08:45 regular open", 1794444300000, true),
+            ("Thu 13:45 regular close still in session", 1794462300000, true),
+            ("Thu 14:00 between sessions", 1794463200000, false),
+            ("Thu 16:00 after-hours session", 1794470400000, true),
+            ("Thu 15:00 after-hours open", 1794466800000, true),
+            ("Fri 03:00 night session, early leg", 1794510000000, true),
+            ("Sat 03:00 Friday's night session tail", 1794596400000, true),
+            ("Sat 10:00 no Saturday day session", 1794621600000, false),
+            ("Mon 03:00 no Sunday night session", 1794769200000, false),
+            ("Thu 05:00 night close, session over", 1794430800000, false),
+        ];
+        for (label, at, want) in cases {
+            assert_eq!(taifex_market_open(at), want, "{label}");
+        }
+    }
+    #[test]
     fn us_market_open_follows_eastern_hours_and_dst() {
         let et = |y: i32, mo: u32, d: u32, h: u32, mi: u32, off: i32| {
             FixedOffset::west_opt(off * 3600)
@@ -3149,5 +3647,408 @@ mod tests {
         assert!(c.execute("import_data", json!({"json": many})).is_err());
         assert_eq!(c.saved.groups.len(), 1);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn ingested_names_are_cached_into_the_snapshot_and_survive_a_reload() {
+        let dir =
+            std::env::temp_dir().join(format!("smallstocks-names-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let mut c = Core::load(path.clone(), true).unwrap();
+        // The default watchlist holds 2330; a named quote teaches the cache.
+        assert!(c.saved.names.is_empty());
+        let t = ts();
+        c.ingest(vec![q(Some(100.), t)], t);
+        assert_eq!(c.saved.names.get("2330").map(String::as_str), Some("台積電"));
+        assert_eq!(c.snapshot()["names"]["2330"], "台積電");
+        // A nameless quote never erases a learned name.
+        let mut blank = q(Some(101.), t + 1000);
+        blank.name = String::new();
+        c.ingest(vec![blank], t + 1000);
+        assert_eq!(c.saved.names.get("2330").map(String::as_str), Some("台積電"));
+        // The cache reached disk with the ingest save: a fresh load of the
+        // same file carries the name before any quote arrives.
+        let reloaded = Core::load(path, true).unwrap();
+        assert_eq!(
+            reloaded.snapshot()["names"]["2330"],
+            "台積電",
+            "names persist across a restart"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn a_save_without_names_loads_with_an_empty_cache() {
+        let dir = std::env::temp_dir().join(format!(
+            "smallstocks-oldnames-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(&path, br#"{"watchlist":["2330"]}"#).unwrap();
+        let c = Core::load(path, true).unwrap();
+        assert!(c.saved.names.is_empty());
+        assert_eq!(c.snapshot()["names"], json!({}));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn export_data_file_writes_the_export_payload() {
+        let dir =
+            std::env::temp_dir().join(format!("smallstocks-expfile-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = Core::load(dir.join("state.json"), true).unwrap();
+        c.execute(
+            "add_lot",
+            json!({"code":"2330","date":"2026-11-10","price":1487,"shares":64}),
+        )
+        .unwrap();
+        let text = c
+            .execute("export_data", json!({}))
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        let out = c.execute("export_data_file", json!({})).unwrap();
+        let path = out["path"].as_str().unwrap();
+        // Named by the local date; with no Downloads folder for the test
+        // user it lands beside state.json (the temp dir either way here).
+        assert!(
+            path.ends_with(&format!(
+                "smallstocks-data-{}.json",
+                local(now()).format("%Y%m%d")
+            )),
+            "unexpected export path: {path}"
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), text);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn monthly_snapshot_records_once_deletes_and_rejects_bad_input() {
+        let dir = std::env::temp_dir().join(format!(
+            "smallstocks-monthly-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let mut c = Core::load(path.clone(), true).unwrap();
+        let good = json!({"month":"2026-11","totalTwd":6_600_000.0,"twdValue":6_500_000.0,"usdValue":3030.0,"rate":33.0,"recordedOn":"2026-11-02"});
+        let snap = c.execute("record_monthly_snapshot", good.clone()).unwrap();
+        assert_eq!(snap["monthlySnapshots"].as_array().unwrap().len(), 1);
+        assert_eq!(snap["monthlySnapshots"][0]["month"], "2026-11");
+        assert_eq!(snap["monthlySnapshots"][0]["totalTwd"], 6_600_000.0);
+        assert_eq!(snap["monthlySnapshots"][0]["recordedOn"], "2026-11-02");
+        // First write wins: a second call for the same month — even with a
+        // different total — is a no-op, not an overwrite and not an error.
+        let other = json!({"month":"2026-11","totalTwd":9_999_999.0,"twdValue":9_999_999.0,"recordedOn":"2026-11-20"});
+        let snap = c.execute("record_monthly_snapshot", other).unwrap();
+        assert_eq!(snap["monthlySnapshots"].as_array().unwrap().len(), 1);
+        assert_eq!(snap["monthlySnapshots"][0]["totalTwd"], 6_600_000.0);
+        assert_eq!(snap["monthlySnapshots"][0]["recordedOn"], "2026-11-02");
+        // The record reached disk.
+        let reloaded = Core::load(path, true).unwrap();
+        assert_eq!(reloaded.saved.monthly_snapshots.len(), 1);
+        // Every invalid call is refused and records nothing.
+        for bad in [
+            json!({"month":"2026-1","totalTwd":100.0,"twdValue":100.0,"recordedOn":"2026-11-02"}),
+            json!({"month":"2026-13","totalTwd":100.0,"twdValue":100.0,"recordedOn":"2026-11-02"}),
+            json!({"month":"2026/11","totalTwd":100.0,"twdValue":100.0,"recordedOn":"2026-11-02"}),
+            json!({"totalTwd":100.0,"twdValue":100.0,"recordedOn":"2026-11-02"}),
+            json!({"month":"2026-12","totalTwd":0.0,"twdValue":0.0,"recordedOn":"2026-12-01"}),
+            json!({"month":"2026-12","totalTwd":-5.0,"twdValue":0.0,"recordedOn":"2026-12-01"}),
+            json!({"month":"2026-12","totalTwd":"100","twdValue":100.0,"recordedOn":"2026-12-01"}),
+            json!({"month":"2026-12","totalTwd":100.0,"twdValue":100.0,"recordedOn":"2026-12-32"}),
+            json!({"month":"2026-12","totalTwd":100.0,"twdValue":100.0,"recordedOn":"12/01/2026"}),
+            json!({"month":"2026-12","totalTwd":100.0,"twdValue":100.0,"usdValue":-1.0,"recordedOn":"2026-12-01"}),
+            json!({"month":"2026-12","totalTwd":100.0,"twdValue":100.0,"rate":0.0,"recordedOn":"2026-12-01"}),
+        ] {
+            assert!(
+                c.execute("record_monthly_snapshot", bad).is_err(),
+                "bad input accepted"
+            );
+        }
+        assert_eq!(c.saved.monthly_snapshots.len(), 1);
+        // Delete removes the row; deleting it again is a harmless no-op,
+        // and a malformed month is refused.
+        let snap = c
+            .execute("delete_monthly_snapshot", json!({"month":"2026-11"}))
+            .unwrap();
+        assert_eq!(snap["monthlySnapshots"].as_array().unwrap().len(), 0);
+        let snap = c
+            .execute("delete_monthly_snapshot", json!({"month":"2026-11"}))
+            .unwrap();
+        assert_eq!(snap["monthlySnapshots"].as_array().unwrap().len(), 0);
+        assert!(c
+            .execute("delete_monthly_snapshot", json!({"month":"nope"}))
+            .is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn export_import_data_round_trips_monthly_snapshots() {
+        let dir =
+            std::env::temp_dir().join(format!("smallstocks-mexp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = Core::load(dir.join("state.json"), true).unwrap();
+        c.execute(
+            "record_monthly_snapshot",
+            json!({"month":"2026-10","totalTwd":6_100_000.0,"twdValue":6_100_000.0,"recordedOn":"2026-10-01"}),
+        )
+        .unwrap();
+        c.execute(
+            "record_monthly_snapshot",
+            json!({"month":"2026-11","totalTwd":6_600_000.0,"twdValue":6_500_000.0,"usdValue":3030.0,"rate":33.0,"recordedOn":"2026-11-02"}),
+        )
+        .unwrap();
+        let text = c
+            .execute("export_data", json!({}))
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        let parsed: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["monthlySnapshots"].as_array().unwrap().len(), 2);
+
+        let dir2 =
+            std::env::temp_dir().join(format!("smallstocks-mimp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir2).unwrap();
+        let mut c2 = Core::load(dir2.join("state.json"), true).unwrap();
+        let snap = c2.execute("import_data", json!({"json": text})).unwrap();
+        assert_eq!(snap["dataImport"]["skippedSnapshots"], 0);
+        assert_eq!(snap["monthlySnapshots"].as_array().unwrap().len(), 2);
+        let nov = c2
+            .saved
+            .monthly_snapshots
+            .iter()
+            .find(|s| s.month == "2026-11")
+            .unwrap();
+        assert_eq!(nov.total_twd, 6_600_000.);
+        assert_eq!(nov.usd_value, Some(3030.));
+        assert_eq!(nov.rate, Some(33.));
+
+        // Bad entries are skipped and tallied; a duplicate month keeps its
+        // first entry; good rows still land.
+        let mixed = json!({
+            "app": "smallstocks-tw", "version": 1,
+            "groups": [{"name": "自選1", "codes": ["2330"]}],
+            "positions": [],
+            "monthlySnapshots": [
+                {"month": "2026-09", "totalTwd": 5_900_000, "twdValue": 5_900_000, "recordedOn": "2026-09-01"},
+                {"month": "2026-13", "totalTwd": 1, "twdValue": 1, "recordedOn": "2026-09-01"},
+                {"month": "2026-08", "totalTwd": -1, "twdValue": 1, "recordedOn": "2026-08-01"},
+                {"month": "2026-07", "totalTwd": 1, "twdValue": 1, "recordedOn": "2026-07-32"},
+                {"month": "2026-09", "totalTwd": 2, "twdValue": 2, "recordedOn": "2026-09-03"},
+            ],
+        })
+        .to_string();
+        let snap = c2.execute("import_data", json!({"json": mixed})).unwrap();
+        assert_eq!(snap["dataImport"]["skippedSnapshots"], 4);
+        assert_eq!(c2.saved.monthly_snapshots.len(), 1);
+        assert_eq!(c2.saved.monthly_snapshots[0].month, "2026-09");
+        assert_eq!(c2.saved.monthly_snapshots[0].total_twd, 5_900_000.);
+
+        // An old export without the field imports as an empty list and
+        // replaces what was there (whole-file replace semantics).
+        let old = json!({
+            "app": "smallstocks-tw", "version": 1,
+            "groups": [{"name": "自選1", "codes": ["2330"]}],
+            "positions": [],
+        })
+        .to_string();
+        let snap = c2.execute("import_data", json!({"json": old})).unwrap();
+        assert_eq!(snap["dataImport"]["skippedSnapshots"], 0);
+        assert!(c2.saved.monthly_snapshots.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(dir2).unwrap();
+    }
+    #[test]
+    fn telegram_settings_persist_but_the_token_never_enters_a_snapshot() {
+        let dir = std::env::temp_dir().join(format!(
+            "smallstocks-tg-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let mut c = Core::load(path.clone(), true).unwrap();
+        c.execute(
+            "set_settings",
+            json!({"telegramEnabled":true,"telegramChatId":"1926601428","telegramBotToken":"123456:TESTTOKEN","backupEnabled":true,"backupDir":"/somewhere/backups"}),
+        )
+        .unwrap();
+        assert!(c.saved.settings.telegram_enabled);
+        assert_eq!(c.saved.settings.telegram_chat_id, "1926601428");
+        assert_eq!(c.saved.settings.telegram_bot_token, "123456:TESTTOKEN");
+        assert!(c.saved.settings.backup_enabled);
+        assert_eq!(c.saved.settings.backup_dir, "/somewhere/backups");
+        // The settings survive a reload (they live in state.json)…
+        let mut restored = Core::load(path, true).unwrap();
+        assert_eq!(restored.saved.settings.telegram_bot_token, "123456:TESTTOKEN");
+        assert_eq!(restored.saved.settings.telegram_chat_id, "1926601428");
+        // …but the snapshot only reports that a token is set, never the
+        // token itself: no field, and the value nowhere in the JSON text.
+        let snap = restored.snapshot();
+        assert_eq!(snap["settings"]["telegramEnabled"], json!(true));
+        assert_eq!(snap["settings"]["telegramChatId"], "1926601428");
+        assert_eq!(snap["settings"]["telegramTokenSet"], json!(true));
+        assert!(snap["settings"].get("telegramBotToken").is_none());
+        assert!(
+            !snap.to_string().contains("TESTTOKEN"),
+            "snapshot must never carry the bot token"
+        );
+        // A blank token submit keeps the stored token (the settings field
+        // is write-only); only the explicit clear flag drops it.
+        restored
+            .execute("set_settings", json!({"telegramBotToken":""}))
+            .unwrap();
+        assert_eq!(restored.saved.settings.telegram_bot_token, "123456:TESTTOKEN");
+        restored
+            .execute("set_settings", json!({"telegramClearToken":true}))
+            .unwrap();
+        assert!(restored.saved.settings.telegram_bot_token.is_empty());
+        assert_eq!(
+            restored.snapshot()["settings"]["telegramTokenSet"],
+            json!(false)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn chat_window_setting_round_trips_and_defaults_off() {
+        let dir = std::env::temp_dir().join(format!(
+            "smallstocks-chat-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let mut c = Core::load(path.clone(), true).unwrap();
+        // Absent from an old state file, the toggle defaults to off.
+        assert!(!c.saved.settings.chat_window);
+        assert_eq!(c.snapshot()["settings"]["chatWindow"], json!(false));
+        c.execute("set_settings", json!({"chatWindow": true}))
+            .unwrap();
+        assert!(c.saved.settings.chat_window);
+        assert_eq!(c.snapshot()["settings"]["chatWindow"], json!(true));
+        // It persists in state.json across a reload…
+        let restored = Core::load(path, true).unwrap();
+        assert!(restored.saved.settings.chat_window);
+        // …and a non-boolean value is refused, leaving the setting alone.
+        let mut c2 = restored;
+        assert!(c2.execute("set_settings", json!({"chatWindow": "yes"})).is_err());
+        assert!(c2.saved.settings.chat_window);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn telegram_test_is_guarded_and_alerts_mirror_only_notice_channels() {
+        let dir = std::env::temp_dir().join(format!(
+            "smallstocks-tgtest-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = Core::load(dir.join("state.json"), true).unwrap();
+        // Nothing configured: the test command refuses before any send,
+        // naming the missing piece.
+        let err = c.execute("telegram_test", json!({})).unwrap_err();
+        assert!(err.contains("bot token"), "{err}");
+        c.execute("set_settings", json!({"telegramBotToken":"123456:TESTTOKEN"}))
+            .unwrap();
+        let err = c.execute("telegram_test", json!({})).unwrap_err();
+        assert!(err.contains("chat id"), "{err}");
+        // Guard errors never carry the token either.
+        assert!(!err.contains("TESTTOKEN"), "{err}");
+        // The request builder pairs the stored chat with the text.
+        c.saved.settings.telegram_chat_id = "42".into();
+        let (url, body) = telegram_request(&c.saved.settings, "🔔 測試").unwrap();
+        assert_eq!(body["chat_id"], "42");
+        assert_eq!(body["text"], "🔔 測試");
+        assert!(url.starts_with("https://api.telegram.org/bot"));
+        // Alerts mirror strip/card events only, prefixed, and only when
+        // the push is enabled.
+        let event = |channel: &str| Event {
+            id: "e".into(),
+            rule_id: "r".into(),
+            symbol: "2330".into(),
+            text: "台積電 觸及門檻".into(),
+            source_at: 0,
+            detected_at: 0,
+            channel: channel.into(),
+            value: 0.,
+            threshold: 0.,
+            source: String::new(),
+        };
+        let events = vec![event("strip"), event("card"), event("log"), event("off")];
+        assert!(telegram_alerts(&c.saved.settings, &events).is_empty());
+        c.saved.settings.telegram_enabled = true;
+        let alerts = telegram_alerts(&c.saved.settings, &events);
+        assert_eq!(alerts.len(), 2);
+        assert_eq!(alerts[0].1["text"], "🔔 台積電 觸及門檻");
+        assert_eq!(alerts[0].1["chat_id"], "42");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn state_backups_write_throttle_prune_and_noop() {
+        let dir = std::env::temp_dir().join(format!(
+            "smallstocks-backup-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let bdir = dir.join("backups");
+        std::fs::create_dir_all(&bdir).unwrap();
+        let state_path = dir.join("state.json");
+        let mut c = Core::load(state_path.clone(), true).unwrap();
+        // Folder configured but backups disabled: saving writes nothing.
+        c.execute(
+            "set_settings",
+            json!({"backupDir": bdir.to_string_lossy()}),
+        )
+        .unwrap();
+        assert!(backup_files(&bdir).is_empty());
+        assert!(c.last_backup_at.is_none());
+        // Enabling triggers the first backup through the persist itself,
+        // byte-identical to the state just saved.
+        c.execute("set_settings", json!({"backupEnabled": true}))
+            .unwrap();
+        let files = backup_files(&bdir);
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            std::fs::read(&files[0]).unwrap(),
+            std::fs::read(&state_path).unwrap()
+        );
+        assert!(c.last_backup_at.is_some());
+        assert!(c.last_backup_error.is_none());
+        // A second automatic call the same day adds no file…
+        c.maybe_backup(false);
+        assert_eq!(backup_files(&bdir).len(), 1);
+        // …while backup_now ignores the throttle and reports its path.
+        let out = c.execute("backup_now", json!({})).unwrap();
+        let written = out["path"].as_str().unwrap();
+        assert!(std::path::Path::new(written).exists());
+        // Pruning: 15 seeded older backups plus today's passes the cap, so
+        // the next write keeps only the newest BACKUP_KEEP.
+        for d in 1..=15 {
+            std::fs::write(
+                bdir.join(format!("state-backup-202601{d:02}-000000.json")),
+                "{}",
+            )
+            .unwrap();
+        }
+        c.maybe_backup(true);
+        let files = backup_files(&bdir);
+        assert_eq!(files.len(), BACKUP_KEEP);
+        assert!(!bdir.join("state-backup-20260101-000000.json").exists());
+        assert!(!bdir.join("state-backup-20260102-000000.json").exists());
+        assert!(bdir.join("state-backup-20260115-000000.json").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+        // A missing folder is a quiet no-op for the automatic path, and a
+        // clear error for the manual one.
+        let dir2 = std::env::temp_dir().join(format!(
+            "smallstocks-backup2-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir2).unwrap();
+        let mut c2 = Core::load(dir2.join("state.json"), true).unwrap();
+        c2.saved.settings.backup_enabled = true;
+        c2.saved.settings.backup_dir = dir2.join("gone").to_string_lossy().into_owned();
+        c2.maybe_backup(false);
+        assert!(c2.last_backup_at.is_none());
+        assert!(c2.last_backup_error.is_none());
+        let err = c2.execute("backup_now", json!({})).unwrap_err();
+        assert!(err.contains("不存在"), "{err}");
+        std::fs::remove_dir_all(dir2).unwrap();
     }
 }

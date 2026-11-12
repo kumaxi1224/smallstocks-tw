@@ -5,14 +5,26 @@ import {
   change,
   shellOpacity,
   shouldKeepScroll,
+  sizeSignature,
   ruleText,
   latestCloseDate,
   livePrice,
   portfolioSummary,
+  combinedTotals,
+  monthlyRows,
   portfolioIntradaySeries,
+  nextPositionSort,
+  sortedPositions,
   formatMoney,
 } from "../src/model.ts";
-import type { Quote, Rule, Snapshot, Position } from "../src/model.ts";
+import type {
+  Quote,
+  Rule,
+  Snapshot,
+  Position,
+  CurrencyTotal,
+  MonthlySnapshot,
+} from "../src/model.ts";
 describe("display truthfulness", () => {
   it("uses the actual newest watched close date, even when it is not today", () => {
     const state = {
@@ -174,6 +186,40 @@ describe("what a closed session shows", () => {
       kind: "final",
       changePoints: 100,
     });
+  });
+  it("carries the day's high and low: the official row's, else the quote's session range", () => {
+    const days: {
+      date: string;
+      close: number;
+      changePercent: number;
+      high?: number;
+      low?: number;
+    }[] = [
+      friday,
+      { date: "2026-11-09", close: 2236, changePercent: 4.7, high: 2250, low: 2200 },
+    ];
+    const official = snapshot(
+      "15:30:00",
+      { tradeAt: at("13:30:00"), sourceAt: at("13:30:00") },
+      days,
+    );
+    expect(closeDay(official, "2330")).toMatchObject({ high: 2250, low: 2200 });
+    const fin = snapshot("13:36:00", {
+      tradeAt: at("13:30:00"),
+      sourceAt: at("13:30:00"),
+      dayHigh: 2245,
+      dayLow: 2195,
+    });
+    expect(closeDay(fin, "2330")).toMatchObject({
+      kind: "final",
+      high: 2245,
+      low: 2195,
+    });
+    const noRange = snapshot("13:36:00", {
+      tradeAt: at("13:30:00"),
+      sourceAt: at("13:30:00"),
+    });
+    expect(closeDay(noRange, "2330")).toMatchObject({ high: null, low: null });
   });
 });
 import { aging, ageSeconds, oldestDataAt, points } from "../src/model.ts";
@@ -366,6 +412,72 @@ describe("portfolio summary", () => {
     expect(portfolioSummary([], {})).toEqual({ positions: [], totals: [] });
   });
 });
+describe("position sorting", () => {
+  // 9999 has no quote at all: market value and both P&Ls are null. 2317 has
+  // a price but no previous close, so only its day P&L is null.
+  const positions: Position[] = [
+    { code: "2330", lots: [{ date: "", price: 1000, shares: 100 }] },
+    { code: "0050", lots: [{ date: "", price: 100, shares: 300 }] },
+    { code: "2317", lots: [{ date: "", price: 200, shares: 50 }] },
+    { code: "9999", lots: [{ date: "", price: 50, shares: 10 }] },
+  ];
+  const summary = portfolioSummary(positions, {
+    "2330": { price: 1200, previous: 1150 },
+    "0050": { price: 90, previous: 100 },
+    "2317": { price: 210, previous: null },
+  });
+  const codes = (list: Position[]) => list.map((p) => p.code);
+  const sorted = (key: "code" | "shares" | "marketValue" | "dayPnl" | "totalPnl", dir: "asc" | "desc") =>
+    codes(sortedPositions(positions, summary.positions, { key, dir }));
+  it("keeps the recorded order when no sort is chosen", () => {
+    expect(codes(sortedPositions(positions, summary.positions, null))).toEqual([
+      "2330",
+      "0050",
+      "2317",
+      "9999",
+    ]);
+  });
+  it("sorts by code", () => {
+    expect(sorted("code", "asc")).toEqual(["0050", "2317", "2330", "9999"]);
+    expect(sorted("code", "desc")).toEqual(["9999", "2330", "2317", "0050"]);
+  });
+  it("sorts by shares", () => {
+    expect(sorted("shares", "desc")).toEqual(["0050", "2330", "2317", "9999"]);
+    expect(sorted("shares", "asc")).toEqual(["9999", "2317", "2330", "0050"]);
+  });
+  it("sorts by market value, unpriced rows last in both directions", () => {
+    expect(sorted("marketValue", "desc")).toEqual(["2330", "0050", "2317", "9999"]);
+    expect(sorted("marketValue", "asc")).toEqual(["2317", "0050", "2330", "9999"]);
+  });
+  it("sorts by day P&L, unknown values last in both directions", () => {
+    expect(sorted("dayPnl", "desc")).toEqual(["2330", "0050", "2317", "9999"]);
+    expect(sorted("dayPnl", "asc")).toEqual(["0050", "2330", "2317", "9999"]);
+  });
+  it("sorts by total P&L, unknown values last in both directions", () => {
+    expect(sorted("totalPnl", "desc")).toEqual(["2330", "2317", "0050", "9999"]);
+    expect(sorted("totalPnl", "asc")).toEqual(["0050", "2317", "2330", "9999"]);
+  });
+  it("does not mutate the recorded order", () => {
+    sorted("shares", "desc");
+    expect(codes(positions)).toEqual(["2330", "0050", "2317", "9999"]);
+  });
+  it("cycles header clicks: numbers start descending, code ascending, same column flips", () => {
+    expect(nextPositionSort(null, "shares")).toEqual({ key: "shares", dir: "desc" });
+    expect(nextPositionSort(null, "code")).toEqual({ key: "code", dir: "asc" });
+    expect(nextPositionSort({ key: "shares", dir: "desc" }, "shares")).toEqual({
+      key: "shares",
+      dir: "asc",
+    });
+    expect(nextPositionSort({ key: "code", dir: "asc" }, "code")).toEqual({
+      key: "code",
+      dir: "desc",
+    });
+    expect(nextPositionSort({ key: "shares", dir: "asc" }, "dayPnl")).toEqual({
+      key: "dayPnl",
+      dir: "desc",
+    });
+  });
+});
 describe("portfolio intraday series", () => {
   const t0 = 1_700_000_000_000 - (1_700_000_000_000 % 60000);
   const min = (n: number) => t0 + n * 60000;
@@ -450,6 +562,37 @@ describe("portfolio intraday series", () => {
     expect(usd.previousTotal).toBeNull();
   });
 });
+describe("window size signature", () => {
+  const base = {
+    tab: "positions",
+    appearance: "small",
+    rowDisplay: "numbers",
+    watchCount: 12,
+    demo: false,
+    eventCount: 0,
+  };
+  it("is stable while nothing that decides the size changes", () => {
+    // A poll re-render with the same factors must produce the same
+    // signature, so resize() leaves a hand-dragged window size alone.
+    expect(sizeSignature(base)).toBe(sizeSignature({ ...base }));
+    // Event counts above the three-line cap bucket identically.
+    expect(sizeSignature({ ...base, eventCount: 3 })).toBe(
+      sizeSignature({ ...base, eventCount: 500 }),
+    );
+  });
+  it("changes on every deliberate switch", () => {
+    const sig = sizeSignature(base);
+    expect(sizeSignature({ ...base, tab: "watch" })).not.toBe(sig);
+    expect(sizeSignature({ ...base, appearance: "gray" })).not.toBe(sig);
+    expect(sizeSignature({ ...base, rowDisplay: "minimal" })).not.toBe(sig);
+    expect(sizeSignature({ ...base, watchCount: 13 })).not.toBe(sig);
+    expect(sizeSignature({ ...base, demo: true })).not.toBe(sig);
+    expect(sizeSignature({ ...base, eventCount: 1 })).not.toBe(sig);
+    expect(sizeSignature({ ...base, eventCount: 2 })).not.toBe(
+      sizeSignature({ ...base, eventCount: 1 }),
+    );
+  });
+});
 describe("money formatting", () => {
   it("rounds TWD amounts to whole dollars and keeps USD at two decimals", () => {
     expect(formatMoney(6495466.53, "TWD")).toBe("6,495,467");
@@ -460,5 +603,101 @@ describe("money formatting", () => {
     expect(formatMoney(63, "USD", true)).toBe("+63.00");
     expect(formatMoney(null, "TWD")).toBe("—");
     expect(formatMoney(0, "TWD", true)).toBe("0");
+  });
+});
+describe("combined TWD totals", () => {
+  const total = (
+    currency: CurrencyTotal["currency"],
+    marketValue: number | null,
+    dayPnl: number | null,
+  ): CurrencyTotal => ({
+    currency,
+    marketValue,
+    dayPnl,
+    dayPnlPercent: null,
+    totalPnl: null,
+    totalPnlPercent: null,
+  });
+  it("passes a TWD-only portfolio through without a rate", () => {
+    const c = combinedTotals([total("TWD", 6_495_467, -148_819)], null);
+    expect(c).not.toBeNull();
+    expect(c!.total).toBe(6_495_467);
+    expect(c!.dayPnl).toBe(-148_819);
+    expect(c!.rate).toBeNull();
+    // dayPct is measured against yesterday's combined value.
+    expect(c!.dayPnlPercent).toBeCloseTo((-148_819 / 6_644_286) * 100, 10);
+  });
+  it("converts USD at the rate and reports the rate it used", () => {
+    const c = combinedTotals(
+      [total("TWD", 100_000, 1_000), total("USD", 15_436.12, 360.41)],
+      32.97,
+    );
+    expect(c).not.toBeNull();
+    expect(c!.total).toBeCloseTo(100_000 + 15_436.12 * 32.97, 6);
+    expect(c!.dayPnl).toBeCloseTo(1_000 + 360.41 * 32.97, 6);
+    expect(c!.rate).toBe(32.97);
+    const previous = c!.total - c!.dayPnl;
+    expect(c!.dayPnlPercent).toBeCloseTo((c!.dayPnl / previous) * 100, 10);
+  });
+  it("is null when USD holdings have no usable rate", () => {
+    const totals = [total("TWD", 100_000, 1_000), total("USD", 500, 5)];
+    expect(combinedTotals(totals, null)).toBeNull();
+    expect(combinedTotals(totals, undefined)).toBeNull();
+    expect(combinedTotals(totals, 0)).toBeNull();
+    expect(combinedTotals(totals, -3)).toBeNull();
+    expect(combinedTotals(totals, Number.NaN)).toBeNull();
+  });
+  it("is null with no holdings or an unknown currency total", () => {
+    expect(combinedTotals([], 32.97)).toBeNull();
+    expect(combinedTotals([total("TWD", null, null)], null)).toBeNull();
+    expect(combinedTotals([total("TWD", 100_000, null)], null)).toBeNull();
+    expect(
+      combinedTotals(
+        [total("TWD", 100_000, 1_000), total("USD", null, 5)],
+        32.97,
+      ),
+    ).toBeNull();
+  });
+});
+describe("monthly snapshot rows", () => {
+  const snap = (month: string, totalTwd: number): MonthlySnapshot => ({
+    month,
+    totalTwd,
+    twdValue: totalTwd,
+    usdValue: null,
+    rate: null,
+    recordedOn: `${month}-01`,
+  });
+  it("sorts newest first without mutating the input order", () => {
+    const input = [snap("2026-09", 100), snap("2026-11", 130), snap("2026-10", 120)];
+    const rows = monthlyRows(input);
+    expect(rows.map((r) => r.month)).toEqual(["2026-11", "2026-10", "2026-09"]);
+    expect(input.map((s) => s.month)).toEqual(["2026-09", "2026-11", "2026-10"]);
+  });
+  it("compares each month against the previous recorded month, gaps included", () => {
+    // No October snapshot: November still compares against September,
+    // the previous month that has a record.
+    const rows = monthlyRows([snap("2026-09", 100), snap("2026-11", 130)]);
+    expect(rows[0]!.month).toBe("2026-11");
+    expect(rows[0]!.change).toBe(30);
+    expect(rows[0]!.changePct).toBeCloseTo(30, 10);
+    const rows2 = monthlyRows([
+      snap("2026-09", 200),
+      snap("2026-10", 190),
+      snap("2026-11", 209),
+    ]);
+    expect(rows2[0]!.change).toBe(19);
+    expect(rows2[0]!.changePct).toBeCloseTo(10, 10);
+    expect(rows2[1]!.change).toBe(-10);
+    expect(rows2[1]!.changePct).toBeCloseTo(-5, 10);
+  });
+  it("gives the oldest row no change and tolerates empty input", () => {
+    const rows = monthlyRows([snap("2026-11", 130), snap("2026-10", 120)]);
+    expect(rows[1]!.change).toBeNull();
+    expect(rows[1]!.changePct).toBeNull();
+    expect(monthlyRows([])).toEqual([]);
+    expect(monthlyRows(undefined)).toEqual([]);
+    const single = monthlyRows([snap("2026-11", 130)]);
+    expect(single[0]!.change).toBeNull();
   });
 });

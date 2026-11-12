@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "SmallStocks TW",
-  "version": "0.1.22",
+  "version": "0.1.29",
   "identifier": "com.chroniclecore.smallstocks-tw",
   "build": {
     "devUrl": "http://127.0.0.1:1432",
@@ -51,15 +51,6 @@
     "homepage": "https://smallstocks.chroniclecore.com",
     "macOS": {
       "signingIdentity": "-"
-    }
-  },
-  "plugins": {
-    "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZBNTRDQTMxQUM5RjFBNjkKUldScEdwK3NNY3BVYW4xRW5ETXFvNFhhblVqWFQwb0oxaWlRU1g0SSt3VTZxMWdJWis3cEs3alAK",
-      "endpoints": [
-        "https://github.com/Zaious/smallstocks-tw/releases/latest/download/latest.json"
-      ],
-      "requireSignedVersion": true
     }
   }
 }

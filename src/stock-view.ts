@@ -18,6 +18,10 @@ export interface StockDetail {
   name: string;
   price: number | null;
   pct: number | null;
+  /** Session high/low: the close day's range when closed, else the live
+   * quote's. Null when neither source gives one. */
+  dayHigh: number | null;
+  dayLow: number | null;
   date: string;
   sourceTime: string;
   source: string;
@@ -36,6 +40,7 @@ export function stockDetail(s: Snapshot, c: string): StockDetail {
     d = closed ? closeDay(s, c) : undefined;
   const name =
       q?.name ||
+      s.names?.[c] ||
       (c === "t00"
         ? "加權指數"
         : c === "o00"
@@ -69,6 +74,8 @@ export function stockDetail(s: Snapshot, c: string): StockDetail {
     name,
     price,
     pct,
+    dayHigh: closed ? (d?.high ?? null) : (q?.dayHigh ?? null),
+    dayLow: closed ? (d?.low ?? null) : (q?.dayLow ?? null),
     date,
     sourceTime: closed ? "收盤" : time(q?.sourceAt),
     source: closed

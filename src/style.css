@@ -94,6 +94,19 @@ header {
   font-size: 10px;
   letter-spacing: 1px;
 }
+/* Combined (≈ TWD) portfolio total beside the brand, always visible;
+ * empty (and so display:none) whenever the figure would be a guess. */
+.header-assets {
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.header-assets:empty {
+  display: none;
+}
 .window-actions button {
   font-size: 18px;
   line-height: 18px;
@@ -183,6 +196,13 @@ nav .gear {
   font: 10px var(--mono);
   color: var(--muted);
 }
+/* The code sits in a fixed-width column so the name starts at the same x
+   on every row, whether the code is t00 or TWD=X. */
+.stock-name > .stock-code {
+  width: 64px;
+  flex: none;
+  text-align: left;
+}
 .price {
   font: 500 12px var(--mono);
   width: 72px;
@@ -215,7 +235,8 @@ nav .gear {
   opacity: 1;
 }
 .quote.aging .price,
-.quote.aging .change {
+.quote.aging .change,
+.quote.aging .day-range {
   color: var(--muted);
 }
 .price.book {
@@ -247,6 +268,51 @@ nav .gear {
   width: 56px;
   flex: none;
   text-align: right;
+}
+/* Numbers rows are two lines tall: the change stacks points over percent
+   in one fixed-width column, and a day-range cell follows it — low line
+   over high line, each with a small muted label. The range cell is always
+   rendered in this mode, so rows keep one height whether or not the
+   point change is shown and whether or not a source gave a range. */
+.quote.two-line {
+  height: 32px;
+}
+.quote.two-line .change {
+  flex-direction: column;
+  align-items: flex-end;
+  justify-content: center;
+  gap: 0;
+  width: 68px;
+}
+.quote.two-line .change-points {
+  width: 100%;
+  line-height: 14px;
+  min-height: 14px;
+}
+.quote.two-line .change-pct {
+  width: 100%;
+  font-size: 10px;
+  line-height: 13px;
+}
+.day-range {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  flex: none;
+  width: 78px;
+  font: 11px var(--mono);
+  line-height: 14px;
+}
+.day-range .dr-line {
+  display: flex;
+  align-items: baseline;
+  justify-content: flex-end;
+  gap: 4px;
+}
+.day-range .dr-line i {
+  font: normal 9px var(--sans, inherit);
+  font-style: normal;
+  color: var(--muted);
 }
 /* Portfolio page: per-currency summary cards and fixed-width position rows,
    aligned the same way as the watch rows. */
@@ -434,6 +500,30 @@ nav .gear {
 .pos-row .pos-cell {
   text-align: right;
 }
+/* Sortable column headers are buttons reset to look like the plain header
+   labels around them; only the active column carries an arrow and the
+   brighter text color. */
+.pos-head .pos-sort {
+  padding: 0;
+  font-size: 10px;
+  color: var(--muted);
+  text-align: right;
+  white-space: nowrap;
+}
+.pos-head .pos-sort:first-child {
+  text-align: left;
+}
+.pos-head .pos-sort:hover {
+  background: none;
+  color: var(--text);
+}
+.pos-head .pos-sort.active {
+  color: var(--text);
+}
+/* The add-lot form now sits below the holdings list, not above it. */
+#lot-form {
+  margin-top: 14px;
+}
 .pos-row {
   background: var(--panel);
   border-radius: 5px;
@@ -441,6 +531,51 @@ nav .gear {
   padding: 3px 6px;
   cursor: pointer;
   font: 11px var(--mono);
+}
+/* Monthly snapshot table on the portfolio page: the same grid discipline
+   as the positions table, with a trailing slot for the row's delete ✕. */
+.monthly-table {
+  min-width: 440px;
+}
+.monthly-head,
+.monthly-row {
+  display: grid;
+  grid-template-columns: minmax(60px, 1fr) 104px 128px 80px 22px;
+  gap: 6px;
+  align-items: baseline;
+  font-variant-numeric: tabular-nums;
+}
+.monthly-head {
+  font-size: 10px;
+  color: var(--muted);
+  padding: 0 6px 2px;
+}
+.monthly-head > span:not(:first-child),
+.monthly-row .pos-cell {
+  text-align: right;
+}
+.monthly-row {
+  background: var(--panel);
+  border-radius: 5px;
+  margin: 2px 0;
+  padding: 3px 6px;
+  font: 11px var(--mono);
+}
+.monthly-month {
+  font-family: var(--font);
+}
+.monthly-date {
+  color: var(--muted);
+}
+.monthly-del {
+  color: var(--muted);
+  font-size: 11px;
+  padding: 1px 4px;
+  text-align: center;
+}
+.monthly-del:hover {
+  background: none;
+  color: var(--text);
 }
 .pos-name {
   display: flex;
@@ -526,10 +661,17 @@ nav .gear {
 .quote-time {
   display: none;
 }
+/* The stale marker gets a reserved slot on every row: when it appears on
+   one row only, the code and name must not shift sideways. */
+.stock-name:before {
+  content: "";
+  width: 9px;
+  flex: none;
+  font-size: 9px;
+}
 .stale .stock-name:before {
   content: "○";
   color: var(--muted);
-  font-size: 9px;
 }
 .quote:hover .quote-time {
   display: inline;

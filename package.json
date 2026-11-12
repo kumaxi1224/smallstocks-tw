@@ -1,6 +1,6 @@
 {
   "name": "smallstocks-tw",
-  "version": "0.1.22",
+  "version": "0.1.29",
   "private": true,
   "type": "module",
   "scripts": {
@@ -15,8 +15,7 @@
   "dependencies": {
     "@tauri-apps/api": "^2.12.1",
     "@tauri-apps/plugin-opener": "^2.7.2",
-    "@tauri-apps/plugin-process": "^2.4.0",
-    "@tauri-apps/plugin-updater": "^2.14.1"
+    "@tauri-apps/plugin-process": "^2.4.0"
   },
   "devDependencies": {
     "@playwright/test": "^1.65.0",

@@ -1,5 +1,5 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
-import type { Snapshot, DailyView, Position } from "./model.ts";
+import type { Snapshot, DailyView, Position, MonthlySnapshot } from "./model.ts";
 import { parsePositionsImport } from "./model.ts";
 export const desktop = isTauri();
 let preview: Snapshot = {
@@ -7,6 +7,8 @@ let preview: Snapshot = {
   groups: [{ name: "自選1", codes: ["t00", "2330", "0050"] }],
   activeGroup: 0,
   positions: [],
+  monthlySnapshots: [],
+  names: {},
   dailySummaries: {},
   intraday: {},
   settings: {
@@ -19,6 +21,12 @@ let preview: Snapshot = {
     quoteSource: "mis",
     sidecarPort: 18765,
     windowOpacity: 1,
+    telegramEnabled: false,
+    telegramChatId: "",
+    telegramTokenSet: false,
+    backupEnabled: false,
+    backupDir: "",
+    chatWindow: false,
   },
   quotes: {},
   rules: [],
@@ -48,6 +56,7 @@ export async function request(
   preview.groups ??= [{ name: "自選1", codes: [...preview.watchlist] }];
   preview.activeGroup ??= 0;
   preview.positions ??= [];
+  preview.monthlySnapshots ??= [];
   if (tool !== "import_positions") delete preview.positionsImport;
   if (tool === "add_lot") {
     const code = String(args.code ?? "")
@@ -72,6 +81,23 @@ export async function request(
   }
   if (tool === "delete_position")
     preview.positions = preview.positions.filter((p) => p.code !== args.code);
+  if (tool === "record_monthly_snapshot") {
+    // Same first-write-wins rule as the core: an existing month is a no-op.
+    const month = String(args.month ?? "");
+    if (!preview.monthlySnapshots.some((s) => s.month === month))
+      preview.monthlySnapshots.push({
+        month,
+        totalTwd: Number(args.totalTwd),
+        twdValue: Number(args.twdValue),
+        usdValue: (args.usdValue as number | null) ?? null,
+        rate: (args.rate as number | null) ?? null,
+        recordedOn: String(args.recordedOn ?? ""),
+      });
+  }
+  if (tool === "delete_monthly_snapshot")
+    preview.monthlySnapshots = preview.monthlySnapshots.filter(
+      (s) => s.month !== args.month,
+    );
   if (tool === "import_positions") {
     const parsed = parsePositionsImport(String(args.text ?? ""));
     for (const { code, lot } of parsed.lots) {
@@ -84,7 +110,15 @@ export async function request(
       failedLines: parsed.failedLines,
     };
   }
-  if (tool === "set_settings") Object.assign(preview.settings, args);
+  if (tool === "set_settings") {
+    // The preview mirrors the core's token discipline: a submitted token
+    // is never stored, only the fact that one was set.
+    const { telegramBotToken, telegramClearToken, ...rest } = args;
+    Object.assign(preview.settings, rest);
+    if (typeof telegramBotToken === "string" && telegramBotToken.trim())
+      preview.settings.telegramTokenSet = true;
+    if (telegramClearToken === true) preview.settings.telegramTokenSet = false;
+  }
   if (tool === "set_watchlist") {
     preview.watchlist = args.symbols as string[];
     preview.groups[preview.activeGroup]!.codes = preview.watchlist;
@@ -194,6 +228,39 @@ export async function request(
   localStorage.setItem("smallstocks-preview", JSON.stringify(preview));
   return structuredClone(preview);
 }
+/**
+ * Desktop only: the core writes the export_data payload to a file itself
+ * and returns the full path written. A Blob download from the settings
+ * page is silently ignored by WebView2, so the desktop export goes through
+ * here instead; the browser preview keeps the exportData() Blob path.
+ */
+export async function exportDataFile(): Promise<string> {
+  const r = await invoke<{ path: string }>("core_request", {
+    tool: "export_data_file",
+    args: {},
+  });
+  return r.path;
+}
+/**
+ * Desktop only: sends the Telegram test message with the settings stored
+ * in the core. The browser preview has no bot and no token, so it refuses.
+ */
+export async function telegramTest(): Promise<void> {
+  if (!desktop) throw new Error("瀏覽器預覽無法發送 Telegram 訊息");
+  await invoke("core_request", { tool: "telegram_test", args: {} });
+}
+/**
+ * Desktop only: writes a state backup into the configured folder right
+ * away and returns the full path written.
+ */
+export async function backupNow(): Promise<string> {
+  if (!desktop) throw new Error("瀏覽器預覽無法備份設定");
+  const r = await invoke<{ path: string }>("core_request", {
+    tool: "backup_now",
+    args: {},
+  });
+  return r.path;
+}
 /** The export_data payload as a JSON string (desktop core or preview). */
 export async function exportData(): Promise<string> {
   if (desktop)
@@ -205,6 +272,7 @@ export async function exportData(): Promise<string> {
       groups: preview.groups ?? [],
       activeGroup: preview.activeGroup ?? 0,
       positions: preview.positions ?? [],
+      monthlySnapshots: preview.monthlySnapshots ?? [],
     },
     null,
     2,
@@ -227,6 +295,7 @@ export async function importData(jsonText: string): Promise<Snapshot> {
     groups?: Snapshot["groups"];
     activeGroup?: number;
     positions?: Position[];
+    monthlySnapshots?: MonthlySnapshot[];
   };
   try {
     v = JSON.parse(jsonText);
@@ -245,12 +314,16 @@ export async function importData(jsonText: string): Promise<Snapshot> {
   );
   preview.watchlist = [...(v.groups[preview.activeGroup]?.codes ?? [])];
   preview.positions = Array.isArray(v.positions) ? v.positions : [];
+  preview.monthlySnapshots = Array.isArray(v.monthlySnapshots)
+    ? v.monthlySnapshots
+    : [];
   preview.dataImport = {
     groups: v.groups.length,
     positions: preview.positions.length,
     lots: preview.positions.reduce((n, p) => n + p.lots.length, 0),
     skippedSymbols: [],
     skippedLots: 0,
+    skippedSnapshots: 0,
   };
   preview.revision++;
   localStorage.setItem("smallstocks-preview", JSON.stringify(preview));

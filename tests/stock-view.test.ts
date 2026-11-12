@@ -73,3 +73,26 @@ it("says how old a live price is once it is more than a minute behind", () => {
   s.now = at + 30_000;
   expect(stockDetail(s, "2330").status).toBe("盤中資料");
 });
+it("exposes the session high and low: the live quote's, then the close day's when closed", () => {
+  const s = state();
+  Object.assign(s.quotes["2330"]!, { dayHigh: 105, dayLow: 95 });
+  expect(stockDetail(s, "2330").dayHigh).toBe(105);
+  expect(stockDetail(s, "2330").dayLow).toBe(95);
+  s.marketOpen = false;
+  s.dailySummaries = {
+    "2330": {
+      days: [
+        { date: "2026-11-06", close: 100, changePercent: 1, high: 108, low: 92 },
+      ],
+      sources: ["TWSE"],
+    },
+  } as unknown as Snapshot["dailySummaries"];
+  const d = stockDetail(s, "2330");
+  expect(d.dayHigh).toBe(108);
+  expect(d.dayLow).toBe(92);
+});
+it("leaves the high and low null when no source gives a range", () => {
+  const s = state();
+  expect(stockDetail(s, "2330").dayHigh).toBeNull();
+  expect(stockDetail(s, "2330").dayLow).toBeNull();
+});

@@ -3,6 +3,7 @@ mod core;
 mod daily;
 mod intraday;
 mod mcp;
+mod taifex;
 mod yahoo;
 use core::{now, Core};
 use serde_json::{json, Value};
@@ -218,6 +219,9 @@ fn show_main_window(app: &tauri::AppHandle) {
         let _ = w.unminimize();
         let _ = w.set_focus();
     }
+    // The PTT chat window comes back too, but only when its setting is on
+    // (sync also recreates it if it is somehow gone).
+    let _ = sync_chat_window(app);
 }
 /// The privacy shortcut is a toggle: it hides everything, and brings the monitor back when the
 /// main window is hidden or minimized.
@@ -258,33 +262,6 @@ fn mcp_exe() -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
-/// How this copy was installed. "installed" (the Windows installer, a macOS app outside a disk
-/// image) can replace itself; "portable" (the Windows zip) and "other" (a development build) only
-/// get a link to the download page.
-#[tauri::command]
-fn install_kind() -> &'static str {
-    if cfg!(debug_assertions) {
-        return "other";
-    }
-    let Ok(exe) = std::env::current_exe() else {
-        return "other";
-    };
-    if cfg!(target_os = "windows") {
-        // The NSIS installer writes uninstall.exe next to the program; the zip has none.
-        let installed = exe
-            .parent()
-            .is_some_and(|d| d.join("uninstall.exe").is_file());
-        return if installed { "installed" } else { "portable" };
-    }
-    if cfg!(target_os = "macos") {
-        let path = exe.to_string_lossy();
-        let movable = path.contains(".app/Contents/MacOS/")
-            && !path.starts_with("/Volumes/")
-            && !path.contains("/AppTranslocation/");
-        return if movable { "installed" } else { "other" };
-    }
-    "other"
-}
 #[tauri::command]
 fn hide_stock_detail(app: tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("detail") {
@@ -405,6 +382,7 @@ fn core_request(
         .execute(&tool, args)?;
     if tool == "set_settings" {
         sync_main_window(&app)?;
+        sync_chat_window(&app)?;
     }
     Ok(result)
 }
@@ -420,6 +398,47 @@ fn sync_main_window(app: &tauri::AppHandle) -> Result<(), String> {
         .get_webview_window("main")
         .ok_or("main window unavailable")?;
     window.set_always_on_top(enabled).map_err(|e| e.to_string())
+}
+/// The PTT chat window: a plain decorated webview on the channel's public
+/// preview feed (t.me/s renders server-side, so no Telegram login is
+/// needed). The label appears in no capability file, so the remote page
+/// gets no IPC access at all — it is a browser pane, nothing more.
+const CHAT_WINDOW_LABEL: &str = "ptt-chat";
+const CHAT_URL: &str = "https://t.me/s/ptt_stock_follow_chat";
+/// Make the chat window match the `chatWindow` setting: create and show it
+/// when the setting is on, close it when off. Called after every
+/// set_settings (UI and MCP alike) and once at startup.
+fn sync_chat_window(app: &tauri::AppHandle) -> Result<(), String> {
+    let enabled = app
+        .state::<mcp::Shared>()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .saved
+        .settings
+        .chat_window;
+    match app.get_webview_window(CHAT_WINDOW_LABEL) {
+        Some(w) if enabled => {
+            let _ = w.show();
+            let _ = w.unminimize();
+            let _ = w.set_focus();
+            Ok(())
+        }
+        Some(w) => w.close().map_err(|e| e.to_string()),
+        None if enabled => {
+            let url = tauri::Url::parse(CHAT_URL).map_err(|_| "聊天視窗網址無效".to_string())?;
+            tauri::WebviewWindowBuilder::new(
+                app,
+                CHAT_WINDOW_LABEL,
+                tauri::WebviewUrl::External(url),
+            )
+            .title("PTT 股票閒聊")
+            .inner_size(440., 640.)
+            .build()
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        None => Ok(()),
+    }
 }
 #[tauri::command]
 async fn search_stocks(query: String) -> Result<Value, String> {
@@ -484,6 +503,12 @@ pub fn run() {
         Core::load(dir.join("state.json"), demo())
             .expect("cannot read settings; original file preserved"),
     ));
+    // One automatic-backup attempt per launch; the core throttles it to
+    // once a day and stays silent when backups are off or unconfigured.
+    state
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .maybe_backup(false);
     let setup_state = state.clone();
     if let Some(window) = context
         .config_mut()
@@ -518,12 +543,10 @@ pub fn run() {
                 })
                 .build(),
         )
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_opener::init())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
-            install_kind,
             mcp_exe,
             privacy_toggle,
             quit_app,
@@ -582,6 +605,11 @@ pub fn run() {
                 tray = tray.icon(icon.clone())
             }
             tray.build(app)?;
+            // Restore the PTT chat window if its setting was left on.
+            if let Err(e) = sync_chat_window(app.handle()) {
+                setup_state.lock().unwrap_or_else(PoisonError::into_inner).error =
+                    Some(format!("聊天視窗開啟失敗：{e}"));
+            }
             // A long-running test instance must not take the user's own hide shortcut from them.
             let skip_shortcut = std::env::var_os("SMALLSTOCKS_NO_GLOBAL_SHORTCUT").is_some();
             let registered = if skip_shortcut {
@@ -611,7 +639,7 @@ pub fn run() {
                 let mut tick = 0;
                 loop {
                     std::thread::sleep(Duration::from_millis(500));
-                    let (tw_codes, yahoo_codes, is_demo, revision, quote_source, sidecar_port) = {
+                    let (tw_codes, yahoo_codes, taifex_codes, is_demo, revision, quote_source, sidecar_port) = {
                         let mut s = poll_state.lock().unwrap_or_else(PoisonError::into_inner);
                         let at = now();
                         // Polling covers the union of every watch group, not just the active tab.
@@ -624,18 +652,41 @@ pub fn run() {
                             .filter(|c| core::is_tw_symbol(c))
                             .cloned()
                             .collect();
-                        let yahoo_codes: Vec<String> = all_codes
+                        // TAIFEX family codes split out before the Yahoo bucket:
+                        // letters only, so without this they would fall through
+                        // to Yahoo, which has no Taiwan futures to give them.
+                        let taifex_codes: Vec<String> = all_codes
                             .iter()
-                            .filter(|c| !core::is_tw_symbol(c))
+                            .filter(|c| core::is_taifex_symbol(c))
                             .cloned()
                             .collect();
+                        let mut yahoo_codes: Vec<String> = all_codes
+                            .iter()
+                            .filter(|c| !core::is_tw_symbol(c) && !core::is_taifex_symbol(c))
+                            .cloned()
+                            .collect();
+                        // Internal USD/TWD rate for the header's combined
+                        // (≈ TWD) total: fetched whenever a USD position
+                        // exists. It joins no watch group and renders as
+                        // no row; after ingest it is parked in the quotes
+                        // map directly, since ingest drops unwatched codes.
+                        let has_usd_position = s
+                            .saved
+                            .positions
+                            .iter()
+                            .any(|p| !core::is_tw_symbol(&p.code) && !core::is_taifex_symbol(&p.code));
+                        if has_usd_position && !yahoo_codes.iter().any(|c| c == "TWD=X") {
+                            yahoo_codes.push("TWD=X".into());
+                        }
                         // The TWSE polling window gates only the Taiwan fetch. Yahoo
-                        // symbols trade on US hours (Taipei night), so they keep
-                        // polling whenever any are watched; with none watched the
-                        // loop rests outside the window exactly as before. A cold
-                        // start (nothing fetched yet) still fills every list once.
+                        // symbols trade on US hours (Taipei night) and TAIFEX
+                        // symbols trade the futures night session, so either
+                        // keeps polling whenever any are watched; with none
+                        // watched the loop rests outside the window exactly as
+                        // before. A cold start (nothing fetched yet) still
+                        // fills every list once.
                         let tw_due = s.demo || s.polling_window(at) || s.last_fetch.is_none();
-                        if !tw_due && yahoo_codes.is_empty() {
+                        if !tw_due && yahoo_codes.is_empty() && taifex_codes.is_empty() {
                             s.next_poll = at + 60_000;
                             continue;
                         }
@@ -643,6 +694,7 @@ pub fn run() {
                         (
                             if tw_due { tw_codes } else { Vec::new() },
                             yahoo_codes,
+                            taifex_codes,
                             s.demo,
                             s.config_revision,
                             s.saved.settings.quote_source.clone(),
@@ -654,6 +706,7 @@ pub fn run() {
                         tick += 1;
                         let mut codes = tw_codes.clone();
                         codes.extend(yahoo_codes.iter().cloned());
+                        codes.extend(taifex_codes.iter().cloned());
                         Ok(core::demo_quotes(&codes, tick))
                     } else {
                         let mut quotes: Vec<core::Quote> = Vec::new();
@@ -679,6 +732,12 @@ pub fn run() {
                                 Err(e) => errors.push(e),
                             }
                         }
+                        if !taifex_codes.is_empty() {
+                            match taifex::fetch(&client, &taifex_codes) {
+                                Ok(served) => quotes.extend(served),
+                                Err(e) => errors.push(e),
+                            }
+                        }
                         if quotes.is_empty() && !errors.is_empty() {
                             Err(errors.join("；"))
                         } else {
@@ -700,11 +759,39 @@ pub fn run() {
                     }
                     match result {
                         Ok(quotes) => {
+                            // The internal TWD=X rate rides the Yahoo fetch
+                            // but is not a watched symbol, so ingest would
+                            // drop it: set it aside and park it in the
+                            // quotes map, where the header readout looks.
+                            let fx = quotes.iter().find(|q| q.symbol == "TWD=X").cloned();
                             let events = s.ingest(quotes, now());
+                            if let Some(fx) = fx {
+                                s.quotes.insert("TWD=X".into(), fx);
+                            }
                             s.source_note = note;
                             if !s.notices_hidden {
-                                for e in events {
-                                    let _ = handle.emit("stock-notice", &e);
+                                for e in &events {
+                                    let _ = handle.emit("stock-notice", e);
+                                }
+                            }
+                            // Mirror strip/card events to Telegram alongside
+                            // the local notices: one fire-and-forget send
+                            // per event on its own thread (the poll loop and
+                            // the local notices never wait on it), silent on
+                            // failure — the request URL carries the bot
+                            // token and must never reach a log or the UI.
+                            if !s.demo {
+                                let tg_settings = s.saved.settings.clone();
+                                for (url, body) in core::telegram_alerts(&tg_settings, &events) {
+                                    std::thread::spawn(move || {
+                                        if let Ok(client) =
+                                            reqwest::blocking::Client::builder()
+                                                .timeout(Duration::from_secs(10))
+                                                .build()
+                                        {
+                                            let _ = client.post(&url).json(&body).send();
+                                        }
+                                    });
                                 }
                             }
                         }
@@ -858,6 +945,23 @@ pub fn run() {
                     api.prevent_close();
                     hide_stock_detail(window.app_handle().clone());
                     let _ = window.hide();
+                }
+            }
+            if window.label() == CHAT_WINDOW_LABEL {
+                if let tauri::WindowEvent::CloseRequested { .. } = event {
+                    // The user closed the chat window by hand: flip the
+                    // setting off so state and screen agree (the next poll
+                    // re-renders the settings page with the toggle off).
+                    // When sync_chat_window closes it programmatically the
+                    // setting is already false, so this stays a no-op.
+                    // Quitting the app destroys windows without a
+                    // CloseRequested, so the setting survives a restart.
+                    let app = window.app_handle();
+                    let state = app.state::<mcp::Shared>();
+                    let mut core = state.lock().unwrap_or_else(PoisonError::into_inner);
+                    if core.saved.settings.chat_window {
+                        let _ = core.execute("set_settings", json!({"chatWindow": false}));
+                    }
                 }
             }
         })

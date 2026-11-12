@@ -34,6 +34,9 @@ export interface Quote {
   receivedAt: number;
   /** When the last trade happened, when the source said. */
   tradeAt?: number | null;
+  /** Session high/low from the source; absent when the source gives none. */
+  dayHigh?: number | null;
+  dayLow?: number | null;
   date: string;
   source: string;
 }
@@ -74,6 +77,46 @@ export interface Position {
   code: string;
   lots: Lot[];
 }
+/** One month's recorded portfolio total (TWD equivalent), captured by the
+ * core the first time the app ran that month with complete quotes. */
+export interface MonthlySnapshot {
+  /** "YYYY-MM". */
+  month: string;
+  totalTwd: number;
+  twdValue: number;
+  usdValue: number | null;
+  rate: number | null;
+  /** Taipei date the total was actually captured, "YYYY-MM-DD". */
+  recordedOn: string;
+}
+export interface MonthlyRow extends MonthlySnapshot {
+  /** Change against the previous recorded month; null for the oldest row. */
+  change: number | null;
+  changePct: number | null;
+}
+/**
+ * Monthly snapshots as table rows, newest first. Each row's change compares
+ * against the previous *recorded* month — a month with no snapshot simply
+ * does not take part, so a gap never distorts the comparison — and the
+ * oldest row has nothing to compare against (nulls).
+ */
+export function monthlyRows(
+  snapshots: MonthlySnapshot[] | undefined,
+): MonthlyRow[] {
+  const sorted = [...(snapshots ?? [])].sort((a, b) =>
+    a.month < b.month ? 1 : a.month > b.month ? -1 : 0,
+  );
+  return sorted.map((s, i) => {
+    const prev = sorted[i + 1];
+    if (!prev) return { ...s, change: null, changePct: null };
+    const delta = s.totalTwd - prev.totalTwd;
+    return {
+      ...s,
+      change: delta,
+      changePct: prev.totalTwd !== 0 ? (delta / prev.totalTwd) * 100 : null,
+    };
+  });
+}
 export interface Snapshot {
   intraday: Record<string, IntradayView>;
   dailySummaries: Record<string, DailyView>;
@@ -83,6 +126,12 @@ export interface Snapshot {
   activeGroup?: number;
   /** Held positions with purchase lots; absent on old states. */
   positions?: Position[];
+  /** Monthly portfolio snapshots; absent on old states. */
+  monthlySnapshots?: MonthlySnapshot[];
+  /** Display names the core learned from live quotes, keyed by code. This
+   * persisted cache is the name fallback when no live quote is on hand
+   * (after a restart, or in the close-day view); absent on old states. */
+  names?: Record<string, string>;
   /** Tally of the import_positions call that produced this snapshot, if any. */
   positionsImport?: { added: number; failedLines: number[] };
   /** Tally of the import_data call that produced this snapshot, if any. */
@@ -92,6 +141,7 @@ export interface Snapshot {
     lots: number;
     skippedSymbols: string[];
     skippedLots: number;
+    skippedSnapshots: number;
   };
   settings: {
     alwaysOnTop?: boolean;
@@ -102,11 +152,20 @@ export interface Snapshot {
     showCodes?: boolean;
     hideNames?: boolean;
     showChangePoints?: boolean;
-    updateCheck?: boolean;
     quoteSource?: "mis" | "shioaji";
     sidecarPort?: number;
     /** Shell background opacity, 0.4–1.0; absent means fully opaque. */
     windowOpacity?: number;
+    /** Telegram alert push. The bot token itself never leaves the core:
+     * the snapshot carries only whether one is stored. */
+    telegramEnabled?: boolean;
+    telegramChatId?: string;
+    telegramTokenSet?: boolean;
+    /** Automatic state.json backups into a user-chosen folder. */
+    backupEnabled?: boolean;
+    backupDir?: string;
+    /** Auxiliary PTT chat window (public t.me/s preview, no login). */
+    chatWindow?: boolean;
   };
   quotes: Record<string, Quote>;
   rules: Rule[];
@@ -114,6 +173,10 @@ export interface Snapshot {
   demo: boolean;
   error: string | null;
   sourceNote?: string | null;
+  /** Latest state backup outcome, once one has run: when and where it
+   * landed, or why it failed. Absent on old states. */
+  lastBackupAt?: { at: string; path: string } | null;
+  lastBackupError?: string | null;
   privacyShortcutError?: string | null;
   lastFetch: number | null;
   nextPoll: number;
@@ -188,6 +251,31 @@ export const shouldKeepScroll = (
   tab: string,
   resetPending: boolean,
 ) => !resetPending && renderedTab !== null && renderedTab === tab;
+/**
+ * The factors that decide the main window's target size, joined into one
+ * signature. resize() compares it against the last applied signature and
+ * does nothing while it is unchanged, so a size the user dragged by hand
+ * survives poll re-renders; only a deliberate switch (another tab, another
+ * appearance or display mode, a longer or shorter watchlist, demo or event
+ * presence) re-asserts the computed size. The event count is bucketed the
+ * way the height formulas consume it (presence, capped at three lines).
+ */
+export const sizeSignature = (f: {
+  tab: string;
+  appearance: string;
+  rowDisplay?: string;
+  watchCount: number;
+  demo: boolean;
+  eventCount: number;
+}) =>
+  [
+    f.tab,
+    f.appearance,
+    f.rowDisplay ?? "",
+    f.watchCount,
+    f.demo ? 1 : 0,
+    Math.min(f.eventCount, 3),
+  ].join("|");
 export const time = (n: number | null | undefined) =>
   n
     ? new Date(n).toLocaleTimeString("zh-TW", {
@@ -261,6 +349,10 @@ export interface CloseDay {
   changePercent: number | null;
   /** Point change of the close, when the source gives one. */
   changePoints: number | null;
+  /** The day's trading range: the daily row's high/low, or the live
+   * quote's session range for a "final" close. Null when unknown. */
+  high: number | null;
+  low: number | null;
   kind: "official" | "final" | "previous";
 }
 const taipeiDay = (ms: number) =>
@@ -286,6 +378,8 @@ export function closeDay(
         close: d.close,
         changePercent: d.changePercent,
         changePoints: d.change,
+        high: d.high ?? null,
+        low: d.low ?? null,
         kind: "official",
       };
     if (sameDay && settled && s.now >= closeAt)
@@ -294,6 +388,8 @@ export function closeDay(
         close: q.price,
         changePercent: q.changePercent,
         changePoints: q.previous != null ? q.price - q.previous : null,
+        high: q.dayHigh ?? null,
+        low: q.dayLow ?? null,
         kind: "final",
       };
   }
@@ -303,6 +399,8 @@ export function closeDay(
         close: d.close,
         changePercent: d.changePercent,
         changePoints: d.change,
+        high: d.high ?? null,
+        low: d.low ?? null,
         kind: s.now && d.date === taipeiDay(s.now) ? "official" : "previous",
       }
     : undefined;
@@ -441,6 +539,102 @@ export function portfolioSummary(
     });
   }
   return { positions: rows, totals };
+}
+export interface CombinedTotal {
+  /** Total market value expressed in TWD. */
+  total: number;
+  /** Today's P&L expressed in TWD. */
+  dayPnl: number;
+  /** dayPnl as a percent of yesterday's combined value; null at zero. */
+  dayPnlPercent: number | null;
+  /** The USD/TWD rate used, or null when no conversion was needed. */
+  rate: number | null;
+}
+/**
+ * Combines the per-currency portfolio totals into a single TWD figure for
+ * the header: TWD as-is plus USD converted at `rate` (TWD per USD, from
+ * the internal TWD=X quote). Returns null whenever the combined number
+ * would be a guess: no holdings at all, a currency total whose market
+ * value or day P&L is unknown, or USD holdings without a usable rate.
+ * A TWD-only portfolio needs no rate.
+ */
+export function combinedTotals(
+  totals: CurrencyTotal[],
+  rate: number | null | undefined,
+): CombinedTotal | null {
+  if (!totals.length) return null;
+  let total = 0;
+  let dayPnl = 0;
+  let usedRate: number | null = null;
+  for (const t of totals) {
+    if (t.marketValue == null || t.dayPnl == null) return null;
+    let factor = 1;
+    if (t.currency === "USD") {
+      if (rate == null || !Number.isFinite(rate) || rate <= 0) return null;
+      factor = rate;
+      usedRate = rate;
+    }
+    total += t.marketValue * factor;
+    dayPnl += t.dayPnl * factor;
+  }
+  const previous = total - dayPnl;
+  return {
+    total,
+    dayPnl,
+    dayPnlPercent: previous !== 0 ? (dayPnl / previous) * 100 : null,
+    rate: usedRate,
+  };
+}
+/** Columns of the positions table a click on the header can sort by. */
+export type PositionSortKey =
+  | "code"
+  | "shares"
+  | "marketValue"
+  | "dayPnl"
+  | "totalPnl";
+export type PositionSortDir = "asc" | "desc";
+export interface PositionSort {
+  key: PositionSortKey;
+  dir: PositionSortDir;
+}
+/**
+ * The sort a header click asks for next: a fresh column starts descending
+ * for numbers (biggest first) and ascending for the code column; clicking
+ * the active column again flips its direction.
+ */
+export function nextPositionSort(
+  current: PositionSort | null,
+  key: PositionSortKey,
+): PositionSort {
+  if (current?.key === key)
+    return { key, dir: current.dir === "asc" ? "desc" : "asc" };
+  return { key, dir: key === "code" ? "asc" : "desc" };
+}
+/**
+ * Orders positions by one summary column, using the values portfolioSummary
+ * computed (never recomputed here). Rows whose value is unknown — a P&L
+ * whose inputs are missing — sink to the bottom in both directions, and
+ * equal values keep the recorded order. A null sort returns the recorded
+ * order untouched.
+ */
+export function sortedPositions(
+  positions: Position[],
+  rows: PositionSummary[],
+  sort: PositionSort | null,
+): Position[] {
+  if (!sort) return positions;
+  const byCode = new Map(rows.map((r) => [r.code, r]));
+  const sign = sort.dir === "asc" ? 1 : -1;
+  const key = sort.key;
+  return [...positions].sort((a, b) => {
+    if (key === "code")
+      return sign * (a.code < b.code ? -1 : a.code > b.code ? 1 : 0);
+    const va = byCode.get(a.code)?.[key] ?? null;
+    const vb = byCode.get(b.code)?.[key] ?? null;
+    if (va == null) return vb == null ? 0 : 1;
+    if (vb == null) return -1;
+    return sign * (va - vb);
+  });
 }
 /** One minute of the portfolio's aggregate value on the session grid. */
 export interface PortfolioValuePoint {

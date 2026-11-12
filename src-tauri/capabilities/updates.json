@@ -1,9 +1,8 @@
 {
   "identifier": "updates",
-  "description": "Only the main window may check for, install and restart into a new version, and open the release page",
+  "description": "Only the main window may restart itself and open the project pages",
   "windows": ["main"],
   "permissions": [
-    "updater:default",
     "process:allow-restart",
     {
       "identifier": "opener:allow-open-url",
