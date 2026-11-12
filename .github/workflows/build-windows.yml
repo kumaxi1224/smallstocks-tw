@@ -1,0 +1,40 @@
+name: Build Windows (portable)
+
+# Manual or on-push build of the Windows portable zip for this fork.
+# Mirrors the CI build-windows job, then packages with the repo's own
+# scripts/package-portable.ps1 and uploads the zip as an artifact.
+# No updater signing and no release publishing: a personal build only.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - name: Third-party licences
+        run: node scripts/third-party-licenses.mjs
+      - run: npm run tauri build -- --no-bundle
+      - name: Package portable zip
+        shell: pwsh
+        run: ./scripts/package-portable.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SmallStocks-TW-windows-portable
+          path: releases/SmallStocks-TW-*-windows-x64.zip
+          if-no-files-found: error

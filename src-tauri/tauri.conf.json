@@ -1,0 +1,65 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "SmallStocks TW",
+  "version": "0.1.14",
+  "identifier": "com.chroniclecore.smallstocks-tw",
+  "build": {
+    "devUrl": "http://127.0.0.1:1432",
+    "frontendDist": "../dist",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "SmallStocks TW",
+        "width": 360,
+        "height": 148,
+        "minWidth": 300,
+        "minHeight": 100,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "visible": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "app", "dmg"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "category": "Finance",
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    },
+    "publisher": "ChronicleCore Studio",
+    "copyright": "Copyright 2026 ChronicleCore Studio. Apache License 2.0.",
+    "shortDescription": "A quiet local Taiwan stock monitor.",
+    "homepage": "https://smallstocks.chroniclecore.com",
+    "macOS": {
+      "signingIdentity": "-"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZBNTRDQTMxQUM5RjFBNjkKUldScEdwK3NNY3BVYW4xRW5ETXFvNFhhblVqWFQwb0oxaWlRU1g0SSt3VTZxMWdJWis3cEs3alAK",
+      "endpoints": [
+        "https://github.com/Zaious/smallstocks-tw/releases/latest/download/latest.json"
+      ],
+      "requireSignedVersion": true
+    }
+  }
+}

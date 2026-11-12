@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://smallstocks.chroniclecore.com/sitemap.xml

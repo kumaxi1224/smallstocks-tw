@@ -1,0 +1,17 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+.local-test/
+*.log
+releases/
+src-tauri/icons/android/
+src-tauri/icons/ios/
+.env
+.env.*
+!.env.example
+.local-notes/
+
+# Made at release time (scripts/third-party-licenses.mjs)
+THIRD_PARTY_LICENSES.txt
+sidecar/sidecar-token.txt

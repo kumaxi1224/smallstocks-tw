@@ -1,0 +1,142 @@
+# A version tag (v0.1.14) builds Windows and macOS into a DRAFT release: nothing is public until the
+# maintainer reads it and presses Publish. It holds the Windows installer (per user, no admin) and a
+# portable zip, the macOS disk image, SHA256 sums and, because the maintainer's update key is in the
+# repository secrets, the signed update files and latest.json that installed copies read to learn
+# about a new version (the start-up check).
+# macOS is signed and notarized when the Apple secrets are set (the maintainer's Developer ID, the same
+# one Basesmall and SmalLoL use); without them it is ad-hoc signed and macOS asks the user to confirm
+# on first open. Windows is not code-signed.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            args: --bundles nsis
+            rust_targets: ""
+          # app as well as dmg: the update file (.app.tar.gz) is only made from the app bundle.
+          - os: macos-latest
+            args: --target universal-apple-darwin --bundles app,dmg
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - name: Third-party licences for this platform
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "macos-latest" ]; then node scripts/third-party-licenses.mjs aarch64-apple-darwin; else node scripts/third-party-licenses.mjs; fi
+      - name: Tests
+        if: startsWith(matrix.os, 'windows')
+        shell: bash
+        run: |
+          npm test
+          cargo test --manifest-path src-tauri/Cargo.toml --lib
+      # With the maintainer's Developer ID secrets the app is signed and notarized; without them it keeps
+      # the ad-hoc signature. Only secrets that exist are passed on: Tauri treats a variable that is set
+      # but empty as a certificate to import, and fails.
+      - name: macOS signing and notarization secrets
+        if: startsWith(matrix.os, 'macos')
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -n "${!v}" ]; then echo "$v=${!v}" >> "$GITHUB_ENV"; echo "$v: set"; else echo "$v: not set"; fi
+          done
+      # The released app needs the real public key in tauri.conf.json and the private key to sign
+      # update files; this step refuses to build without them.
+      - name: Update signing key
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if grep -q REPLACE_WITH_PUBLIC_KEY src-tauri/tauri.conf.json; then
+            echo "::error::src-tauri/tauri.conf.json still has the placeholder public key"; exit 1
+          fi
+          if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "TAURI_SIGNING_PRIVATE_KEY=$TAURI_SIGNING_PRIVATE_KEY" >> "$GITHUB_ENV"
+            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" >> "$GITHUB_ENV"
+            echo "UPDATER_CONFIG=--config src-tauri/tauri.updater.conf.json" >> "$GITHUB_ENV"
+            echo "update key: set"
+          else
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is not set; run tools/updater-key.ps1 first"; exit 1
+          fi
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: SmallStocks TW ${{ github.ref_name }}
+          releaseBody: See CHANGELOG.md. The Windows build is not code-signed, so SmartScreen may warn.
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }} --config src-tauri/tauri.release.conf.json ${{ env.UPDATER_CONFIG }}
+      # Tauri notarizes the app inside the image but not the image itself; do the image too and put
+      # it back on the draft under the name the release already uses (spaces become dots).
+      - name: Notarize and staple the macOS disk image
+        if: startsWith(matrix.os, 'macos') && env.APPLE_ID != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          dmg=$(ls src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg)
+          xcrun notarytool submit "$dmg" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+          name=$(basename "$dmg" | tr ' ' '.')
+          cp "$dmg" "$RUNNER_TEMP/$name"
+          gh release upload '${{ github.ref_name }}' "$RUNNER_TEMP/$name" --clobber
+      - name: Windows portable zip (no install, no admin)
+        if: startsWith(matrix.os, 'windows')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ./scripts/package-portable.ps1 | Out-Null
+          $v = '${{ github.ref_name }}'.TrimStart('v')
+          gh release upload '${{ github.ref_name }}' "releases/SmallStocks-TW-$v-windows-x64.zip" --clobber
+
+  # One checksum file for everything a person can download, made after every platform has uploaded.
+  checksums:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: SHA256 sums of the downloadable files
+        shell: bash
+        run: |
+          tag='${{ github.ref_name }}'; v="${tag#v}"
+          mkdir files && cd files
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern '*.zip' --pattern '*setup.exe' --pattern '*.dmg'
+          sha256sum * > "../SHA256SUMS-$v.txt"
+          cd ..
+          cat "SHA256SUMS-$v.txt"
+          gh release upload "$tag" "SHA256SUMS-$v.txt" --repo "$GITHUB_REPOSITORY" --clobber

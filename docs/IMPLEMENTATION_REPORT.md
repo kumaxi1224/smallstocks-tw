@@ -1,0 +1,287 @@
+# 0.1.0 本機預覽版開發紀錄
+
+最新 0.1.1 驗證結果附於文件末。
+
+日期：2026-11-06（台灣）。執行環境：Windows x64、Node 24.14、Rust 1.97、WebView2。
+
+## 已實作
+
+- Tauri 2 外殼、置頂與拖曳、托盤、關閉時隱藏、隱私快捷鍵。架構沿用系列經驗，通知 CSS、品牌色彩與元件風格複用 SmalLoL／Basesmall。
+- small 彩色／灰階、terminal 灰階與 txt 灰階。四種呈現共用自選、規則與歷史；通知與所選色彩一致。
+- 本機直接批次取得 MIS，名稱／代號搜尋與批次自選，上限 30 檔；不是 30 檔已驗證的服務承諾。
+- 單一 Rust 核心持續執行。來源時間、取得時間、成交與委託分開；不由每個 UI／agent 分別抓行情。
+- 價格與漲跌幅跨越規則，每日一次／一次性、關閉／只記錄／細條／卡片，圖形介面可建立、修改、停用及刪除。
+- 事件歷史、當日觸發鎖與設定本機保存；寫入失敗不改動現有設定。重啟重建觀測基準，保留已觸發記錄。
+- MCP stdio bridge 與本機經 token 保護的 RPC。agent 與 UI 共用核心；支援查詢、管理自選／設定／規則與事件。未內建 LLM。
+- 獨立合成示範模式、獨立測試資料夾、UI 預覽與可重跑的驗證腳本。
+
+## 已取得的驗證結果
+
+| 檢查 | 結果 |
+| --- | --- |
+| npm run build | 通過：TypeScript 與 Vite 生產建置 |
+| npm test | 通過：3 個顯示真實性／跳脫／灰階方向文字測試 |
+| cargo test --manifest-path src-tauri/Cargo.toml --lib | 通過：7 個 Rust 測試，含門檻跨越、重複／過期／亂序／缺值、換日／時段、持久化與寫入失敗 |
+| cargo clippy --lib --manifest-path src-tauri/Cargo.toml -- -D warnings | 通過 |
+| node scripts/ui-check.mjs | 通過：搜尋、批次自選、規則建立／修改／停用、四種外觀、水平溢位與頁面錯誤檢查 |
+| node scripts/desktop-check.mjs | 第一輪通過：實際 Tauri/WebView2，驗證 RPC 身分檢查、MCP initialize／tools、stdio bridge、agent 寫入共用規則、合成行情跨越、獨立通知窗與事件落盤 |
+| MIS 少量真實請求 | 成功：上市／上櫃／ETF／兩個指數與名稱搜尋；詳細限制見 DATA_PROBE.md |
+
+實際視窗截圖位於 `.local-test/screenshots/desktop-*.png`；腳本每次使用不同測試資料夾，不使用使用者現有設定。完成通知排版與小窗高度修正後，最終封裝與實機複驗結果補記於下節。
+
+## 發行與尚未驗證的部分
+
+這是供本機試用的預覽版，沒有公開發布、上架、程式碼簽章或自動更新。尚未完成盤中整個交易時段的穩定性、來源延遲、官方休市日曆、安裝／解除安裝全流程與 macOS／Linux 驗證。MCP 驗證透過標準 JSON-RPC／stdio 完成，尚未宣稱已在每一種 agent host 實測。
+
+價格缺值時保守略過判定，可能漏掉快照間變化；不支援逐筆、大單、量能、封板或公告事件。資料使用條件仍須另行確認。沒有動到 DesktopLOL／DesktopMLB 的任何來源檔案，沒有讀取或複用私鑰。
+
+## 最終封裝複驗
+
+最終 `npm run tauri build -- --bundles nsis` 成功，產出 Windows x64 執行檔與 NSIS 安裝檔（安裝檔約 2.40 MiB）。執行檔 8,842,752 bytes，隨後以同一產物複驗：
+
+- `npm run check:desktop` 通過。四種實際 Tauri 視窗截圖、MCP 寫入的規則、標準 stdio bridge、合成行情跨門檻與右下獨立通知，以及事件落盤均驗證成功。長通知已能分兩行，小窗三檔自選與管理入口能完整顯示。
+- `node scripts/live-check.mjs` 通過。一般模式由本體直接取得 2330、0050、t00，`demo=false`，無連線錯誤；本次收到的來源時間約比取得時間早 15,983 秒。這批資料不被當作新鮮行情，沒有觸發事件。這只驗證收盤後實際接入與保守處理，不能當作盤中延遲量測。
+- 所有測試程序已結束，測試狀態與截圖留在工作區 `.local-test`，未帶入試用包。
+
+免安裝包以 `scripts/package-portable.ps1` 製作，含執行檔、Demo.cmd、README、LICENSE 與 NOTICE；安裝檔亦另保留供試用。NSIS 安裝／解除安裝流程尚未在本輪實際操作。
+
+## 0.1.1 — 正式收盤與每日歷史
+
+新增日資料 adapter、休市首頁摘要、按月走勢與資料表、MCP get_daily_history、本機快取。以既有 core 統一管理歷史佇列與快取，不在每個視窗／agent 重複抓取。歷史取得不灌入即時 ingest，也不變更監看設定版本；避免歷史回應使進行中的即時請求被誤棄。
+
+- npm run build 通過。
+- npm test：5 個測試通過。
+- cargo test --manifest-path src-tauri/Cargo.toml --lib：10 個測試通過。
+- cargo clippy --lib --manifest-path src-tauri/Cargo.toml -- -D warnings 通過。
+- scripts/ui-check.mjs 通過，新增月切換、每日資料表與走勢檢查。
+- scripts/daily-check.mjs 在獨立資料夾使用實際 Windows 程式與官方來源通過：2330、0050 的 2026-11，以及 t00、6488、o00 的 2026-10。後三項各回傳 19 個交易日，上櫃量欄確認為張；指數不捏造成交量。月份重讀確認快取命中，歷史快取落盤且事件數保持為零。
+- 實際 WebView2 休市摘要與月份走勢截圖留在 .local-test/screenshots/desktop-close.png 與 desktop-daily.png。
+
+日資料價格未還原。15:00 是本程式排除未完成當日資料的保守門檻，不是官方保證所有資料已於此時完成發布；以實際來源日期及內容為準。初次背景下載可能逐檔出現「正在取得」；資料公布／快取更新以頁面顯示為準。
+
+最終 0.1.1 執行檔複驗完成：daily-check 使用既有測試快取重啟成功、五類來源讀取與休市畫面通過；check:desktop 的 MCP、規則共用、合成跨門檻、右下通知與事件落盤亦通過。測試用桌面實例與開發伺服器已結束。
+
+交付檔：releases/SmallStocks-TW-0.1.1-windows-x64.zip（3,363,715 bytes）及同版 x64 安裝檔（2,551,250 bytes）。免安裝包中的執行檔與已驗證建置檔 SHA256 一致：07E1DABC12E4C041E2EEF19ED96CF2EA02B36A7610A1D4AB651B5536A37EBB6A。
+
+## 0.1.2 — 緊湊主窗
+
+依使用者試用回饋，移除休市主窗的大卡片與走勢，盤中／休市皆單列清單。三檔預設 360 × 148，列高 22；休市顯示正式收盤與日期，點擊標的才開行情。標題、工具列、詳情頁字級及間距同步縮小，自選管理改為標題列「＋」。
+
+驗證：npm run build、5 個前端測試、10 個 Rust 測試與 ui-check 通過。UI 檢查包含三檔與十檔完整可見、四種外觀、點擊股票開啟對應行情、自選及規則操作。daily-check 使用最終 Windows 執行檔通過；實測主窗邏輯尺寸不超過 360 × 150、三檔完整可見且主窗沒有走勢圖，月歷史及快取照常可用。截圖為 .local-test/screenshots/desktop-close.png。
+
+測試期間偵測到另一個版本的實例正在執行，未關閉或操作它。獨立設定目錄改用獨立實例識別，避免 QA 被單一實例機制轉送到使用者視窗。
+
+0.1.2 已產出免安裝 zip 與 NSIS 安裝檔。安裝／解除安裝流程仍未於本輪操作；發布狀態維持本機預覽。
+
+## 0.1.3 — 移除重複日期
+
+共同收盤日期移至底部狀態列，每個股票列不再重複顯示同一天日期；較舊的個別標的仍保留日期，完整日期保留於列提示。共同日期取自實際監看的行情，不預設為今天。
+
+TypeScript／Vite 建置與 6 個前端測試通過，包括較舊的實際日期及排除非自選標的。最終 Windows 執行檔 daily-check 通過，確認三列沒有重複日期、底部有共同收盤日期、視窗仍維持 360 × 148，歷史與快取可用。0.1.3 免安裝與安裝包均已產出，免安裝執行檔雜湊與已驗證建置一致。
+
+## 0.1.4 — 單行走勢切換
+
+依使用者選擇實作「盤中看當天、休市看近日」。標題列可在數字與走勢間切換，預設維持數字；曲線取代中間價格欄，保留名稱／漲跌幅，價格仍可在列提示與詳情查看。純數字與曲線同為 22 px 列高，三檔仍維持 360 × 148。
+
+新增 intraday.rs 與獨立來源佇列：按需讀取 Yahoo Finance 當天一分鐘序列，本機 MIS 有效成交快照另存局部紀錄，兩者不合併、不用來判定事件。跨日、未來點、缺價格與長時間空缺均有處理；無足夠資料不畫假線。櫃買來源不足時顯示局部或等待。
+
+驗證結果：
+
+- TypeScript／Vite 生產建置、9 個前端測試、14 個 Rust 測試、Clippy warnings-as-errors 通過。
+- UI-check 通過，包含單行切換、三檔同高度、十檔密度、四種外觀及原有操作。
+- intraday-check 在預檢與最終 release 均通過。2330、0050、6488、t00 各取得當天 271 個分鐘時間點；確認同日、來源一致、缺櫃買資料不捏造、MCP 一般狀態不包含整包點位。
+- 實際 WebView2 切換前後主窗尺寸與 22 px 列高完全一致，休市使用日收盤線，數字模式選擇會保存。
+- 最終 check:desktop 通過，包含 stdio MCP、規則共用、合成跨門檻、獨立通知窗及事件持久化。未干擾使用者現有 0.1.1 實例，測試程序與開發伺服器均已結束。
+
+分鐘線可能延遲，這次是在收盤後驗證當天補線。盤中長時間連續更新、延遲與跨交易時段切換仍需實盤觀察，未聲稱已驗證。
+
+交付 0.1.4 免安裝包（3,399,678 bytes）與安裝檔（2,575,124 bytes）。免安裝執行檔 SHA256 與已驗證建置相同：8133F02213CA663F93C2A79102968BB675A244772F54DF5E76CB36D2C9BE6143。
+
+## 0.1.5 — Windows 式 Terminal／記事本
+
+依使用者回饋，這兩種模式重做視窗外框與內容，而非沿用 small 共用標題、導覽與頁尾。記事本使用分頁、檔案／編輯／檢視、唯讀純文字區與狀態列；Terminal 使用 PowerShell 分頁外框、等寬輸出、數字欄對齊及模式內命令輸入。
+
+外觀參考 Microsoft 官方：[Notepad](https://blogs.windows.com/windows-insider/2025/05/30/text-formatting-in-notepad-begin-rolling-out-to-windows-insiders/) 與 [Windows Terminal](https://devblogs.microsoft.com/commandline/windows-terminal-is-now-the-default-in-windows-11/)。本機記事本的控制未獲准，改以官方公開畫面核對，沒有讀取或修改使用者既有記事本文件內容。參考圖片僅留在忽略的測試資料夾，不打包進產品。
+
+功能與驗證：
+
+- 以 disguise.ts／disguise.css 管理兩種模式。輪詢僅更新內容，保留輸入、選取、捲動與開啟的選單；獨立 data-note-edit 命名修正與規則編輯的事件衝突。
+- 記事本可全選／複製、縮放與切換狀態列；Terminal 可輸入模式內 help／pause／resume／settings 等，不會執行系統命令。
+- 10 個前端測試、14 個 Rust 測試、TypeScript／Vite 建置及 Clippy warnings-as-errors 通過。
+- disguise-check 通過：原生式外框、數字欄對齊、輸入／選取跨輪詢保留、選單／縮放／狀態列、返回 small、無頁面錯誤。測試未寫入系統剪貼簿。
+- ui-check 通過，small 緊湊列、單行走勢、自選與規則操作保留。
+- 最終 Windows 執行檔 check:desktop 通過，包括視窗標題權限、隱藏共用導覽、最大化／還原，以及原有 stdio MCP、規則共用、合成事件通知與持久化。
+
+最終截圖：.local-test/screenshots/desktop-terminal.png、desktop-txt.png。測試實例與開發伺服器均已結束。
+
+交付 0.1.5 免安裝包（3,404,568 bytes）與安裝檔（2,578,457 bytes）。免安裝執行檔 SHA256 與已驗證建置一致：3113079A8D4A4E0C582860BA474F90327BA60ECA16A8EFF3CD98DCD1ED48B285。
+
+## 0.1.6 — 四種外觀極簡顯示與代號選項
+
+顯示內容新增 minimal，與外觀獨立；預設仍 numbers。ShowCodes 預設 false，管理／搜尋與明細保留代號，名稱未取得時仍以代號辨識。
+
+- small／灰階只留名稱、當日方向與小型操作，約 30 px 高細條；寬度由使用者控制，依實際換行調整高度。Native 外框保留，資料區簡化。
+- 方向 ▲／▼／—／○ 分別表示上漲／下跌／平盤／資料未確認。缺價格、過期快照、較舊收盤不能被當成有效當日方向。
+- Hover／鍵盤焦點使用獨立不取得焦點、滑鼠穿透的 detail 視窗，避免細條裁切資訊。離開、Escape、切換頁面與隱藏時清除浮窗。
+- 自動高度在 Rust 端保留當前寬度，避免與使用者拖曳競爭；超出工作區時調整位置，最大化時不自動縮窗。極簡 Native 選單開啟時暫時展開、關閉後縮回。
+
+驗證：
+
+- TypeScript／Vite 建置、12 個前端測試、14 個 Rust 測試、Clippy warnings-as-errors 通過。
+- minimal-check 通過四種外觀、名稱並排／換行、hover 明細、焦點跨輪詢保留、點擊行情與代號開關。
+- ui-check 與 disguise-check 通過，原有數字／走勢、操作、原生式外框與選取／輸入保留。
+- desktop-minimal-check 在預檢與最終 Windows release 均通過：small 三檔主窗不超過 40 px 高（實測約 30）、明細窗不取得焦點且不撐大主窗、滑出後隱藏；700／300 寬度切換改變換行與高度，不把寬度改回預設。四種外觀、Native 選單與設定持久化均驗證。
+- 最終 check:desktop 通過原有 stdio MCP、規則共用、合成事件通知與持久化。測試實例與開發伺服器已結束，未關閉使用者原有程式。
+
+最終截圖：.local-test/screenshots/desktop-minimal-small.png、desktop-minimal-gray.png、desktop-minimal-terminal.png、desktop-minimal-txt.png；細節為 desktop-minimal-detail.png。
+
+交付 0.1.6 免安裝包（3,431,282 bytes）與安裝檔（2,596,408 bytes）。免安裝執行檔 SHA256 與已驗證建置相同：4E1B15F30FE494A0D8A6E9275C7298232BCC4B95E86C9C28EDE915A62A869C0D。
+
+## 0.1.7 — 有厚度的正三角形
+
+依使用者確認，small／灰階極簡方向標記採等邊正三角形正面與明暗側面，柱身比前一試稿減薄三分之一。SVG 僅在方向或外觀變更時替換，維持 22 px 列高；Terminal／記事本、平盤與未知狀態保留文字符號。
+
+- 12 個前端測試、TypeScript／Vite 生產建置、四種外觀 minimal-check 通過。
+- Windows x64 release 與 NSIS 安裝檔建置成功。
+- 實際 WebView2 的診斷複驗通過四種外觀、獨立不搶焦點的明細窗、代號選配、使用者寬度／自動高度、Native 選單與設定保存。首次 desktop-minimal-check 曾在等待主窗縮高時逾時；同一產物加診斷複驗未重現，尚未確認首次逾時原因。
+- 未修改使用者正在執行的 0.1.1 程式與設定，沒有公開發布 GitHub。
+
+原始 desktop-minimal-check 再次執行亦通過，使用同一份最終 Windows 產物。
+
+交付 0.1.7 免安裝包與安裝檔，封裝執行檔 SHA256 與已驗證建置相同：D8CAED618ACCF0669701B0559F2A35C75DA770332DA03338EEB7145B49B3DAB7。
+
+## 0.1.8 — 專屬圖示與專案介紹
+
+新增可編輯的 assets/brand/icon.svg：沿用 Basesmall／SmalLoL 的深色圓角底板，以台股紅漲綠跌的兩枚淺厚正三角形代表本作。透過 Tauri CLI 生成多尺寸 ICO／PNG；Windows 套件與 tray 使用共用應用程式圖示，瀏覽器使用 SVG favicon。已檢視 32px 縮圖及從最終 Windows 執行檔取出的內嵌圖示，確認為新圖樣。
+
+README 依兩個系列專案的介紹結構重寫，主標為 Taiwan stocks, but small.，先介紹常駐監看、低調外觀及提醒，再介紹選配的 agent/MCP；完整繁體中文操作說明移至 docs/USAGE.zh-TW.md，免安裝包會攜帶。README 展示實際桌面驗證截圖並標示合成示範資料。GitHub 簡介保存於 .github/description.txt。
+
+- 12 個前端測試、TypeScript／Vite 生產建置通過。
+- Windows x64 release 與 NSIS 建置成功，已檢查新圖示嵌入產物。
+- 初始化本機 Git main 分支；排除實際設定、測試資料、依賴與建置／下載產物。當時尚未建立遠端儲存庫（現已有公開的 GitHub 儲存庫）；沒有公開發布安裝檔。
+
+最終 0.1.8 的 desktop-minimal-check 通過四種實際視窗、獨立明細窗、代號選項、寬度／自動高度、Native 選單與設定保存。
+
+交付 0.1.8 免安裝包與安裝檔；免安裝執行檔與已驗證建置 SHA256 相同：BD3D7AE7BE6BBE4927B66B403271CDCDEA041018962DFAF0825B4F005AB79D47。
+
+## 0.1.9 — 主視窗置頂選項與 small 視覺介紹
+
+新增共用 alwaysOnTop 設定，預設 true，舊設定未包含欄位時沿用原行為。介面及 MCP 都由核心驗證／保存；成功後 Rust 更新原生主視窗。啟動時直接從設定恢復，避免前端載入前先強制置頂。通知與暫時明細保留各自浮窗行為。
+
+- 15 個 Rust 測試與 12 個前端測試通過；新增舊設定相容、型別驗證及置頂選擇保存測試。
+- TypeScript／Vite 與 Windows x64 release／NSIS 建置通過。
+- window-settings-check 以獨立測試設定驗證：預設置頂、UI 關閉、四種外觀沿用、隱藏時 MCP 開關且不自行顯示主窗，以及完整重開後原生置頂狀態恢復。檢查的是原生視窗狀態，非僅設定值。
+- minimal-check 通過四種外觀、明細、焦點保存、點擊行情、代號及換行檢查。
+- README 補齊 small 風格、一般數字列、同列高的單行走勢，以及極簡與 hover 明細。數字列及明細為最終 Windows 程式合成資料截圖；走勢圖透過實際瀏覽器預覽呈現明確標示的合成整場示意，沒有把清晨少量點位或 pending 畫面宣稱完整盤中資料。圖片可用 scripts/window-settings-check.mjs 與 scripts/readme-trend-image.mjs 重產。
+
+使用者原有 0.1.1 執行檔與設定保持原樣；未新增公開 GitHub Releases。
+交付 0.1.9 免安裝包與安裝檔；封裝執行檔 SHA256 與已驗證建置一致：502D7BDE1517EC26DE6B8CF1989623CD438BA4D0D8E0619983EDD72B73917540。
+
+## 0.1.10 — 平台差異外觀與三鍵隱私快捷鍵
+
+Terminal／文字文件視圖依 navigator.platform 的桌面平台分支呈現，四種外觀仍共用同一監看核心。Windows 保留 Terminal／PowerShell、記事本的分頁、選單與狀態列；Mac UI 分支使用左側交通燈、中央文件標題、zsh 提示與 TextEdit 純文字文件窗，不帶 Windows 分頁或 CRLF 狀態列。設定、文字縮放、選取與輸入保存使用相同邏輯；primary modifier 分別是 Ctrl 與 Command。
+
+原隱藏四鍵 Ctrl+Alt+Shift+S 改為 Windows Ctrl+Alt+S／Mac Command+Option+S。原生全域註冊與前端按鍵處理共用 privacy_hide，隱藏所有視窗並抑制後續通知、不暫停核心。註冊失敗以 privacyShortcutError 回傳並在設定頁顯示，原生視窗內仍有三鍵處理與隱藏控制。Mac Option+S 可能改變輸入字元，前端依實體 KeyS 判定，另有回歸測試。
+
+驗證：
+
+- 14 個前端測試、15 個 Rust 測試、TypeScript／Vite 建置通過。
+- platform-ui-check 通過 Windows 與 Mac UI 平台分支、提示字元、Ctrl／Command 設定與縮放、輸入／文字選取跨輪詢保留、極簡與 hover 明細。Mac 分支使用瀏覽器平台模擬，截圖 docs/media/mac-terminal-preview.png、mac-textedit-preview.png，並非原生 Mac 截圖。
+- disguise-check 通過 Windows 外框、對齊、指令、選單、縮放及狀態列；minimal-check 通過四種外觀與點擊明細。回歸檢查發現瀏覽器 preview 浮窗偶爾攔截股票點擊，已讓該浮窗滑鼠穿透，與原生明細窗一致，重新檢查通過。
+
+尚未產出或驗證 macOS 套件；Mac WebKit、系統選單／系統匣、資料路徑與全域按鍵仍需在 Mac 完整驗證。僅宣稱平台 UI 差異已實作，不宣稱 Mac 已可用。
+
+最終 Windows 0.1.10 release／NSIS 建置成功。window-settings-check 通過：三鍵全域註冊成功、程式內三鍵事件進入原生隱藏操作，主視窗／明細／通知均隱藏，paused 仍為 false；同時通過置頂 UI／MCP 切換、隱藏時套用與重開保存。這不包含 Mac 原生全域按鍵實測。
+
+交付 0.1.10 Windows 免安裝包與安裝檔；封裝執行檔 SHA256 與已驗證建置一致：25A09D5CC1B8912B2572552E5E6BBE57A98F0759323A6DFA01B285191CE4B188。
+
+## 2026-11-08 — 繁體中文產品網站
+
+新增 site/ 純靜態宣傳頁，延續 Basesmall／SmalLoL 的配色、系統字體、金色主按鈕、留白及工作情境展示；複用本專案 icon、示範截圖與通知素材，沒有修改前兩作來源。首頁以「台股，縮小著看。」介紹三種 small 顯示方式、灰階／終端機／文字外觀、事件規則、收盤回顧與選配 MCP；沒有虛構回饋、下載數或原生 Mac 支援。
+
+- 互動：數字／單行走勢／極簡 tab（含鍵盤切換）、Windows／Mac 外觀切換、MCP JSON 複製、FAQ。
+- 下載：查詢 GitHub 已發布版本；目前沒有公開安裝包，因此明確顯示狀態、保留版本區連結，不放假的下載按鈕。檔案發布後可自動帶出合法 GitHub ZIP／安裝檔連結及大小。空版本、有效檔案、查詢失敗三種狀態均驗證。
+- scripts/site-check.mjs 通過：繁體中文、內容切換、鍵盤操作、MCP 複製、內部連結、無 JavaScript 時的內容／版本入口、1440／768／390 寬度無水平溢位、明暗主題與圖片載入；沒有頁面錯誤。另人工檢視桌機／手機首頁與完整頁面截圖。沒有新增分析追蹤、外部字體或帳號。
+- 產出可部署 site/dist、分享圖、favicon、sitemap、robots、llms.txt、404；有獨立建置腳本與網站 README。網站以獨立工作目錄發布，沒有改動應用程式 origin。
+- 私人檢閱站部署成功並確認 deployment succeeded；維持僅擁有者可見，尚未接自訂網域或公開發布官網。
+
+本輪僅網站變更，桌面程式版本仍為 0.1.10。
+
+## 2026-11-08 — 網站資訊順序、並排外觀與高解析圖片
+
+依網站回饋調整：先展示融入工作視窗的價值，終端機／文字文件直接並排，不必切換外觀才看得到；Windows／Mac 平台按鈕同時更新兩張圖。手機上下排列且都直接可見。small 數字／走勢／棋子區移到後面，定位為偏好系列美術的選擇，保留灰階細條。
+
+- scripts/site-assets.mjs 從真正的程式瀏覽器預覽以 4× deviceScaleFactor 重拍：small 360px 寬畫面為 1440px 像素，終端機／文件 520px 畫面為 2080px；不是放大舊 PNG。所有畫面明確為合成示範，Mac 仍為 UI 預覽。small 三個 tab 與兩個工作外觀都提供原圖入口。
+- 減少 hero、區段、圖框、FAQ 與頁尾空白，small 標題與說明改為並排；同一 1440px 桌機視口、預設內容下，整頁高度由 5160px 減至 4283px（約 17%）。
+- site-check 通過：兩種工作外觀預設同時可見、區段先後順序、small 三種圖片實際像素／渲染寬度至少 2.5 倍、原圖連結隨 tab 更新、平台同時切兩圖、鍵盤切換、MCP 複製、下載狀態與手機／平板／桌機無水平溢位。人工檢視完整手機頁與兩個重點區域。
+- 同一私人檢閱站更新成功（deployment succeeded），沒有變更分享對象，也沒有桌面程式變更。
+
+## 0.1.11 — 審查修正與文件整理
+
+依一輪程式審查修正：存檔失敗不再丟棄該輪行情與已偵測的跨越事件；背景工作 panic 後自動重啟；已用完的「一次」規則重新啟用後可再次生效；版本號改讀建置版本；macOS 設定資料夾改為 `~/Library/Application Support`。細節見 CHANGELOG「未發布」。
+
+- 新增 2 個 Rust 測試（存檔失敗後行情與事件保留並於下一輪補存、一次規則重新武裝但每日防重複保留）。Rust 17 個測試、clippy warnings-as-errors、rustfmt 檢查與 14 個前端測試、TypeScript／Vite 建置通過。
+- 新增 `scripts/mis-time-probe.mjs`，供盤中判斷 MIS 欄位 `t` 是快照時間還是最近成交時間。收盤後的一次查詢中各檔 `t` 相同（13:30:00），但集合競價會造成同樣結果，**尚未下結論**；放寬新鮮度判斷前須先在盤中量測。
+- 文件整理：移除公開文件中的私人檢閱站網址、託管專案 ID 與內部來源 commit；`site/.openai/` 取消追蹤並加入忽略。內部規劃筆記不再放入公開儲存庫，儲存庫歷史已一併清理。
+
+### Intel Mac 實機驗證（x86_64、macOS 26.2、示範模式）
+
+在 Mac 上以 rustup 自行建置（`npx tauri build --bundles app`），未簽章、未公證、非 universal。
+
+- 通過：`cargo test --lib` 17 個測試；產出 x86_64 `.app`，含 `.icns` 圖示。
+- 通過：首次啟動建立 `~/Library/Application Support/SmallStocks-TW-demo/`，內含 `state.json` 與 `mcp-connection.json`（修正前會寫到暫存資料夾）。
+- 通過：本機 RPC 帶 token 可讀 `get_status`（示範資料、三檔自選、無錯誤），不帶 token 回 401；全域隱私快捷鍵註冊成功（`privacyShortcutError` 為空）。
+- 通過（目視實際視窗截圖）：透過 MCP `set_settings` 切換 small、terminal、txt，Mac 版外觀分別為 small 細條、左側交通燈的 zsh 終端機窗與 TextEdit 式純文字窗，內容為示範資料。
+- 未驗證：真實行情（當日休市）、盤中長時間、隱私快捷鍵實際按下後的隱藏行為、系統匣、通知窗、極簡與 hover 明細、簽章／公證、安裝後首次開啟的 Gatekeeper 流程、其他 macOS 版本與 Apple Silicon。因此只宣稱「示範模式可在 Intel Mac 啟動並顯示三種外觀」，不宣稱 Mac 已可正式使用。
+- 網站與 README 的 Mac 終端機／文字文件圖已改用上述原生視窗截圖（只截應用程式視窗本身，2x 像素，示範資料），取代先前的瀏覽器預覽；說明文字同步改為「Intel Mac 原生視窗截圖」，並保留「尚無 Mac 試用包、真實行情與長時間使用未驗證」。
+
+### 0.1.11 發布包（Windows x64）
+
+- 版本 0.1.11（package.json、Cargo、tauri.conf 同步）。TypeScript／Vite 建置、14 個前端測試、17 個 Rust 測試、clippy、rustfmt 檢查通過。
+- `npm run tauri build -- --bundles nsis` 成功；免安裝 zip 3,548,190 bytes、安裝檔 2,597,958 bytes。zip 內 `smallstocks-tw.exe` 與剛建置的執行檔 SHA256 相同：D2F3A15AF24FC8BA3FB5F08F5C557AA754BF706A28CE24523D0E3367FE609E63。
+- 以最終執行檔通過：`check:desktop`（RPC 身分、MCP、規則共用、合成跨門檻、獨立通知窗與事件落盤）、`window-settings-check`（置頂與三鍵隱私快捷鍵）、`desktop-minimal-check`（四種外觀、明細窗、寬度與設定保存）、`daily-check`（官方日資料，2330、0050、t00、6488、o00，上櫃量欄為張）、`live-check`（本體直接取得 2330、0050、t00，來源時間約為 209,763 秒前，即上週五收盤資料，因此沒有觸發事件；這只驗證休市保守處理，不是盤中延遲量測）。
+- 未簽章、無自動更新；NSIS 安裝／解除安裝流程仍未實際操作；盤中長時間穩定性仍未驗證；MIS 欄位 `t` 語意待盤中以 `scripts/mis-time-probe.mjs` 量測。
+- 網站：`site-check` 通過；正式網址 smallstocks.chroniclecore.com，以 Cloudflare Worker 提供。
+- 2026-11-09 網站已部署到 https://smallstocks.chroniclecore.com（Cloudflare Worker，只提供 `site/dist` 的 23 個檔）。以瀏覽器載入確認標題、版本顯示與無頁面錯誤；GitHub 版本仍為草稿，網站依實際狀態顯示「公開安裝包尚未發布」，沒有下載按鈕。`README.md`、`build.mjs`、本機託管設定與 `dist/` 路徑皆回 404。草稿版本發布後的下載按鈕尚未以真實發布資料驗證。
+
+### 2026-11-09／10 盤中實測與發布前修正
+
+兩個交易日的盤中實測改變了不少設計，記錄量到的事實與限制：
+
+- 盤中證交所個股的頂層成交價 `z` 多半是「-」，最後一筆成交在回應的 `trade` 區塊（價格、成交時間、成交量）；官網前端的 `tradeFallback` 模組與數個開源專案也這樣讀。我們原本沒讀，已補上；收盤後的回應也含這個區塊。
+- 個股資料時間（t）不規則前進（量到約 5 至 125 秒不等，偶有倒退），伺服器回應有快取；`trade` 區塊更新比成交慢，2330 曾在 11:29 顯示 10:58 的最後成交，而雅虎的延遲價顯示之後還有成交，所以價格可能差一格。畫面因此分開顯示資料時間，並對超過 1 分鐘的列變灰、超過 3 分鐘標過期。
+- 4 小時多的實機監看（369 個盤中取樣，期間為了換新版重啟數次）：沒有任何錯誤取樣；抓取間隔最大 16 秒；個股資料年齡中位數 69 秒、95 百分位 125 秒、最大 216 秒；記憶體 36 至 86 MB，約 10:30 一次升到 86 MB 後持平。
+- 真實提醒觸發兩次，都是程式自己偵測：10:41:55「2330 成交價降至 2255.00元（門檻 2255.00）」、13:20:00「2330 成交價升至 2280.00元（門檻 2275.00）」。「期間內曾觸及」補抓只有單元測試，盤中沒遇到。
+- 實測找到並修掉：收盤前（13:30:00）就停止輪詢，漏掉收盤單一價（現在輪詢到 13:36）；收盤後停在前一個交易日（現在顯示今日最後一筆並標示待官方日資料）；hover 明細窗閃一下消失（顯示後系統回報的焦點一得一失被誤當成離開）；找不到系統匣所以叫不回視窗（「−」改縮到工作列、隱私快捷鍵改為切換、新增釘選與完全隱藏按鈕、設定頁新增重新啟動與結束）；切分頁時視窗固定放大成 500×500（改為寬度不變、只往下展開）。
+- 新增：官方休市日曆、自動更新（本機用測試金鑰驗證簽章檢查；實際更新流程待下一版）、第三方授權清單、買賣中間價規則、收盤輪詢與原始回應存檔（`SMALLSTOCKS_CAPTURE_RAW`）。
+- 仍未驗證：處置股約每 2 分鐘才撮合一次，現行 3 分鐘過期門檻是否合適；以伺服器時間而非本機時鐘計算資料年齡；Windows 安裝檔的實際安裝／解除安裝；從 GitHub 下載後的 SmartScreen；Mac 的新版行為（Mac 睡著連不上，也沒有 Mac 安裝包）；授權：證交所使用條款第 6 條禁止未經同意以自動化程式下載資料，MIS 本身的條款未查到，維護者決定不寄信詢問，文件維持「資料使用條件需自行確認」。
+
+## 0.1.12 — Windows 與 Mac 同時發布
+
+- 發布流程（`.github/workflows/release.yml`）同時在 Windows 與 macOS runner 建置：Windows NSIS 安裝檔加免安裝 zip，macOS universal（x86_64 + arm64）`.app` 與 `.dmg`；`checksums` 工作最後對 zip／setup.exe／dmg 產生 `SHA256SUMS`。沒有 Apple 憑證時 macOS 為 ad-hoc 簽章，Gatekeeper 會擋下第一次開啟（`spctl` 回報 rejected），需在「隱私權與安全性」按「仍要打開」。
+- 手動的 `mac-preview.yml` 可在發布前先建 Mac 預覽包。CI 的 macOS runner 上 28 個 Rust 測試通過。
+- Intel Mac（x86_64、macOS 26.2）實機驗證 CI 建出的 universal 應用程式（2026-11-11 盤中，真實行情，獨立設定資料夾）：`lipo` 為 x86_64 與 arm64；啟動後資料夾建立在指定路徑，取得 t00、2330、0050 的價格與日高低，休市日曆載入，無錯誤；`privacyShortcutError` 為空，按下 ⌘⌥S 後主視窗隱藏、再按一次叫回；視窗截圖顯示 small 數字列、釘選與完全隱藏按鈕及中文字型正常。
+- 未驗證：公證（沒有 Apple 憑證）、Apple Silicon 實機、Mac 長時間運作、通知窗與極簡 hover 明細、從網路下載後帶隔離屬性的實際開啟流程、Mac 上的更新並重新啟動。
+- 發布與驗證（2026-11-11）：Release 工作流程的 Windows、macOS 與 checksums 三個工作都成功；草稿的 zip、setup.exe、dmg 的 SHA256 與 `SHA256SUMS-0.1.12.txt` 相符；`latest.json` 含 windows 與 darwin（aarch64、x86_64）平台；setup.exe 與 `.app.tar.gz` 的更新簽章以設定檔公鑰驗證通過（金鑰 6A54CA31AC9F1A69），且與 `latest.json` 內的簽章相同；對 zip、安裝檔、Mac 應用程式內容掃描私人字串與測試資料，無命中（Mac 執行檔中的 "Downloads" 為相依套件的系統資料夾名稱）。已公開並設為最新版，網站已部署，真實瀏覽器載入確認三個下載按鈕指向 v0.1.12。
+- 公開版 DMG 在 Intel Mac 上：SHA256 相符、版本為 0.1.12、`lipo` 為 x86_64 與 arm64、簽章為 ad-hoc、`spctl` 回報 rejected（符合預期）；直接啟動後取得三檔真實行情，無錯誤。
+- 自動更新首次實測（Windows）：安裝 0.1.11 後啟動，程式顯示「有新版本 v0.1.12」，按「更新並重新啟動」，約 4 秒內新版已安裝（執行檔版本 0.1.12）並自動重新啟動，三檔行情與 MCP serverInfo 為 0.1.12。測試安裝已解除安裝。那次新版出現在預設資料夾（測試時先用 `/D` 裝到暫存資料夾）；0.1.13 的測試則直接更新了 `/D` 的暫存資料夾，兩次落點不同，原因未查明，但兩次都得到可用的新版並自動重啟。Mac 的程式內更新尚未實測。
+
+## 0.1.13 — MCP 設定複製按鈕
+
+- 「外觀與設定」新增「agent（MCP，選配）」：複製 JSON 設定、`claude mcp add` 指令、`codex mcp add` 指令，路徑由 Rust 命令 `mcp_exe`（`current_exe`）提供；文字由 `src/mcp-setup.ts` 產生，測試確認 JSON 可解析、路徑有空格時加引號、內容不含 token 或連線檔名。前端 29 個測試、Rust 28 個測試、clippy 通過。
+- Windows 真實 app（CDP 點擊）與 Intel Mac（鍵盤聚焦＋空白鍵，讀 `pbpaste`）都確認三種內容正確。Mac 實測抓到 Windows 看不到的問題：macOS 網頁元件拒絕在 `await` 之後寫剪貼簿（`NotAllowedError`）；改為啟動時先取路徑、點擊時同步複製，並以 `execCommand("copy")` 備援。
+- 發布與驗證（2026-11-11）：Release 工作流程三個工作成功；zip、setup.exe、dmg 的 SHA256 與 `SHA256SUMS-0.1.13.txt` 相符；`latest.json` 含 windows 與 darwin 平台，setup.exe 與 `.app.tar.gz` 簽章以設定檔公鑰驗證通過；內容掃描無私人字串（僅 Mac 執行檔相依套件的 "Downloads" 字樣）。已公開為最新版、網站已部署，真實瀏覽器確認三個下載按鈕指向 v0.1.13。
+- 自動更新第二次實測（Windows）：公開的 0.1.12 安裝檔（SHA256 與發布值相符）安裝後，程式顯示「有新版本」，按「更新並重新啟動」，新版安裝並自動重啟，MCP serverInfo 為 0.1.13、三檔行情正常；測試安裝已解除。
+- Mac 程式內更新首次實測（Intel Mac、macOS 26.2）：把公開 0.1.12 的 DMG（SHA256 與發布值相符）內的應用程式複製到暫存資料夾執行，設定頁顯示「有新版本 v0.1.13」與「更新並重新啟動」；以鍵盤聚焦並按下後，6 秒內 `CFBundleShortVersionString` 變為 0.1.13，新行程自動啟動，MCP serverInfo 為 0.1.13、三檔行情正常；`codesign --verify --deep --strict` 通過（ad-hoc）、仍為 x86_64＋arm64。測試用應用程式已刪除。
+- 未驗證：Codex 指令格式未在 Codex 上執行；複製內容在正式安裝後的 `/Applications` 路徑未驗證；Apple Silicon；Mac 公證。
+
+## 0.1.14 — Mac 簽章與公證
+
+- 維護者以 `tools/macos-signing.ps1` 把 Developer ID 憑證與 Apple 帳號的 App 專用密碼存入儲存庫 secrets（第一次貼上的密碼不完整，公證回 `401 Invalid credentials`，重貼後通過；預覽建置失敗期間沒有發布任何東西）。
+- Tauri 只公證 `.app`；新增流程步驟在 macOS 工作中對 `.dmg` 另行公證、蓋票（`notarytool submit --wait`、`stapler staple`），並以 `--clobber` 換掉草稿裡的 DMG，之後 `checksums` 工作才計算 SHA256（所以校驗碼對應的是蓋過票的檔案）。`mac-preview.yml` 同步加了這一步，先以手動預覽驗證。
+- 驗證（Intel Mac、macOS 26.2；對 DMG 與更新包都加上瀏覽器下載的隔離屬性）：公開版 DMG 的 SHA256 與 `SHA256SUMS-0.1.14.txt` 相符；`stapler validate` 對 DMG 與 `.app` 都通過；`spctl` 對 DMG 與 `.app` 都是 `accepted`、`source=Notarized Developer ID`；`codesign --verify --deep --strict` 通過，簽署者 Developer ID Application（團隊 L3PW92ZK84），仍為 x86_64＋arm64；更新用的 `.app.tar.gz` 內的應用程式同樣 accepted 且已蓋票。
+- Windows 與 Mac 的更新簽章、`latest.json` 內容、私人字串掃描與先前版本相同結果（僅 Mac 執行檔相依套件的 "Downloads" 字樣）。已公開為最新版、網站已部署並拿掉「仍要打開」說明，真實瀏覽器確認三個下載按鈕指向 v0.1.14。
+- Mac 程式內更新（從未簽章的公開 0.1.13 到簽章公證的 0.1.14）實測成功：3 秒內換成 0.1.14 並重啟，換上的應用程式為 Developer ID 簽章、已蓋票、`spctl` accepted，MCP serverInfo 為 0.1.14、三檔行情正常。測試用應用程式已刪除。
+- 首次開啟流程實測（Intel Mac、macOS 26.2）：從公開網址 `releases/latest/download/...` 下載 DMG（SHA256 與發布值相符），手動補上瀏覽器會加的隔離屬性（curl 不會加），以 `open` 交給 Finder 掛載，DMG 順利掛載、沒有警告；把 App 複製出來（同樣帶隔離屬性）後用 `open` 開啟，syspolicyd 記錄 `Prompt shown`，畫面是標準提示「『SmallStocks TW』是一個從網際網路下載的 App。確定要打開嗎？ … Apple 已進行檢查但並未偵測到惡意軟體」，只有「取消」「打開」兩個按鈕（不是需要到「隱私權與安全性」的阻擋警告）；按下「打開」後 App 開啟並顯示行情。此時 App 由 Gatekeeper 以 App Translocation 路徑執行，所以程式內更新會判定為非安裝版、只顯示下載連結；拖進「應用程式」後再開才是安裝版。
+- 未驗證：用真實瀏覽器（Safari／Chrome）下載的隔離屬性內容；Apple Silicon 實機；Windows 版仍未簽章。
+
