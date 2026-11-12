@@ -37,6 +37,7 @@ import {
   closeDay,
   aging,
   oldestDataAt,
+  portfolioSummary,
   BOOK_NOTE,
 } from "./model.ts";
 import { historyBody } from "./daily-view.ts";
@@ -49,7 +50,13 @@ import {
   hideDetail,
 } from "./minimal.ts";
 import type { SkinAction } from "./disguise.ts";
-import type { DailyView, Snapshot, Appearance, Rule } from "./model.ts";
+import type {
+  DailyView,
+  Snapshot,
+  Appearance,
+  Rule,
+  PositionQuote,
+} from "./model.ts";
 
 document.body.dataset.platform = isMac ? "macos" : "windows";
 const app = document.querySelector<HTMLDivElement>("#app")!;
@@ -143,7 +150,7 @@ function dailyPage() {
   if (dailySymbol) void loadDaily();
   else document.querySelector("#daily-body")!.textContent = "請先加入自選股。";
 }
-app.innerHTML = `<main class="shell"><header data-tauri-drag-region><span class="brand" data-tauri-drag-region><i></i><b>small</b><span>stocks / TW</span></span><div class="window-actions"><button id="row-display" title="切換數字、走勢與極簡" aria-label="切換顯示內容">數字</button><button id="manage" aria-label="＋ 管理自選" title="管理自選">＋</button><button id="pin" class="pin-btn" aria-pressed="true" aria-label="視窗保持置頂" title="已置頂：點一下取消置頂"><svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M9.8 1.2 14.8 6.2 13.4 7.6 12.3 7.2 9.4 10.1 9.9 12 8.5 13.4 5.6 10.5 2.2 13.9 1.5 13.2 4.9 9.8 2 6.9 3.4 5.5 5.3 6 8.2 3.1 7.8 2z" fill="currentColor"/></svg></button><button id="stealth" class="stealth-btn" aria-label="隱藏全部視窗" title="完全隱藏（含通知），監看持續。叫回：${privacyShortcutLabel}"><svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M8 3.5C4.6 3.5 2 6 1 8c1 2 3.6 4.5 7 4.5s6-2.5 7-4.5c-1-2-3.6-4.5-7-4.5zm0 1.8a2.7 2.7 0 1 1 0 5.4 2.7 2.7 0 0 1 0-5.4z" fill="currentColor"/><path d="M2.3 2.3 13.7 13.7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button><button id="hide" aria-label="縮到工作列" title="縮到工作列；監看持續。叫回：點工作列按鈕，或按 ${privacyShortcutLabel}">−</button></div></header><nav aria-label="主選單"><button data-tab="watch" class="active">自選</button><button data-tab="daily">行情</button><button data-tab="rules">提醒 <span id="rule-count"></span></button><button data-tab="history">紀錄</button><button data-tab="settings" class="gear">外觀與設定</button></nav><div id="banner"></div><section id="content"></section><footer><span id="health"></span><span id="source">TWSE MIS</span></footer><div id="message" role="status" aria-live="polite"></div></main>`;
+app.innerHTML = `<main class="shell"><header data-tauri-drag-region><span class="brand" data-tauri-drag-region><i></i><b>small</b><span>stocks / TW</span></span><div class="window-actions"><button id="row-display" title="切換數字、走勢與極簡" aria-label="切換顯示內容">數字</button><button id="manage" aria-label="＋ 管理自選" title="管理自選">＋</button><button id="pin" class="pin-btn" aria-pressed="true" aria-label="視窗保持置頂" title="已置頂：點一下取消置頂"><svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M9.8 1.2 14.8 6.2 13.4 7.6 12.3 7.2 9.4 10.1 9.9 12 8.5 13.4 5.6 10.5 2.2 13.9 1.5 13.2 4.9 9.8 2 6.9 3.4 5.5 5.3 6 8.2 3.1 7.8 2z" fill="currentColor"/></svg></button><button id="stealth" class="stealth-btn" aria-label="隱藏全部視窗" title="完全隱藏（含通知），監看持續。叫回：${privacyShortcutLabel}"><svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M8 3.5C4.6 3.5 2 6 1 8c1 2 3.6 4.5 7 4.5s6-2.5 7-4.5c-1-2-3.6-4.5-7-4.5zm0 1.8a2.7 2.7 0 1 1 0 5.4 2.7 2.7 0 0 1 0-5.4z" fill="currentColor"/><path d="M2.3 2.3 13.7 13.7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button><button id="hide" aria-label="縮到工作列" title="縮到工作列；監看持續。叫回：點工作列按鈕，或按 ${privacyShortcutLabel}">−</button></div></header><nav aria-label="主選單"><button data-tab="watch" class="active">自選</button><button data-tab="positions">持股</button><button data-tab="daily">行情</button><button data-tab="rules">提醒 <span id="rule-count"></span></button><button data-tab="history">紀錄</button><button data-tab="settings" class="gear">外觀與設定</button></nav><div id="banner"></div><section id="content"></section><footer><span id="health"></span><span id="source">TWSE MIS</span></footer><div id="message" role="status" aria-live="polite"></div></main>`;
 const content = app.querySelector<HTMLElement>("#content")!;
 const showError = (e: unknown) => {
   const el = document.querySelector<HTMLElement>("#message")!;
@@ -514,6 +521,85 @@ function groupTabs() {
     active = viewActive();
   return `<div class="group-tabs" role="tablist" aria-label="自選分組">${groups.map((g, i) => `<button type="button" role="tab" aria-selected="${i === active}" class="group-tab${i === active ? " active" : ""}" data-group="${i}">${esc(g.name)}</button>`).join("")}${groups.length < 10 ? '<button type="button" class="group-tab add" data-group-add title="新增分組" aria-label="新增分組">＋</button>' : ""}</div>`;
 }
+/** The position whose lot detail is open on the portfolio page, if any. */
+let expandedPosition: string | null = null;
+/** Outcome line of the last positions import, kept across re-renders. */
+let positionsMessage = "";
+/** Prices the portfolio page was last rendered with; the poll compares
+ * against it so the page follows live quotes without a full tab re-render
+ * policy of its own. */
+let positionsSig = "";
+/**
+ * Price inputs for every held code, from the same sources the watch rows use:
+ * live quotes while the market runs; after the Taiwan close, Taiwan codes use
+ * the official close day (its previous close is derived from the close's own
+ * change, the same numbers the rows show). Yahoo codes always use the live
+ * quote, around the clock.
+ */
+function positionQuotes(): Record<string, PositionQuote> {
+  const out: Record<string, PositionQuote> = {};
+  for (const p of state.positions ?? []) {
+    const c = p.code;
+    const closed = !state.marketOpen && !state.demo && !isYahooSymbol(c);
+    const d = closed ? closeDay(state, c) : undefined;
+    if (d) {
+      const previous =
+        d.changePoints != null
+          ? d.close - d.changePoints
+          : d.changePercent != null && d.changePercent > -100
+            ? d.close / (1 + d.changePercent / 100)
+            : null;
+      out[c] = { price: d.close, previous };
+    } else {
+      const q = state.quotes[c];
+      out[c] = { price: livePrice(q).price, previous: q?.previous ?? null };
+    }
+  }
+  return out;
+}
+function positionsSignature() {
+  const quotes = positionQuotes();
+  return JSON.stringify([
+    state.marketOpen,
+    (state.positions ?? []).map((p) => [
+      p.code,
+      quotes[p.code]?.price ?? null,
+      quotes[p.code]?.previous ?? null,
+    ]),
+  ]);
+}
+function positionsPage() {
+  const positions = state.positions ?? [];
+  const summary = portfolioSummary(positions, positionQuotes());
+  const today = new Date(state.now).toLocaleDateString("sv-SE", {
+    timeZone: "Asia/Taipei",
+  });
+  const sign = (n: number | null | undefined) =>
+    n == null || n === 0 ? "flat" : n > 0 ? "up" : "down";
+  const cards = summary.totals
+    .map(
+      (t) => `<div class="pos-card"><h2>${t.currency === "TWD" ? "新台幣" : "美元"} 持股</h2><div class="pos-line"><span>總市值</span><span class="pos-total">${t.marketValue == null ? "—" : number(t.marketValue)}</span></div><div class="pos-line"><span>今日損益</span><span class="pos-num ${sign(t.dayPnl)}">${t.dayPnl == null ? "—" : points(t.dayPnl)}${t.dayPnlPercent != null ? `（${change(t.dayPnlPercent)}）` : ""}</span></div><div class="pos-line"><span>總損益</span><span class="pos-num ${sign(t.totalPnl)}">${t.totalPnl == null ? "—" : points(t.totalPnl)}${t.totalPnlPercent != null ? `（${change(t.totalPnlPercent)}）` : ""}</span></div></div>`,
+    )
+    .join("");
+  const byCode = new Map(summary.positions.map((r) => [r.code, r]));
+  const rowsHtml = positions
+    .map((p) => {
+      const r = byCode.get(p.code)!;
+      const name = state.quotes[p.code]?.name ?? "";
+      const expanded = expandedPosition === p.code;
+      const lots = expanded
+        ? `<div class="pos-lots">${p.lots
+            .map(
+              (l, i) =>
+                `<div class="pos-lot"><span>${esc(l.date || "未記錄日期")}</span><span>購入價 ${number(l.price)}</span><span>${number(l.shares)} 股</span><button type="button" data-del-lot="${esc(p.code)}:${i}">刪除</button></div>`,
+            )
+            .join("")}<div class="pos-lot-actions"><button type="button" class="secondary" data-add-lot="${esc(p.code)}">＋ 加一筆</button><button type="button" class="secondary" data-del-position="${esc(p.code)}">刪除整檔持股</button></div></div>`
+        : "";
+      return `<div class="pos-row-wrap"><div class="pos-row" data-expand="${esc(p.code)}" title="點擊展開購入批次"><span class="pos-name"><span class="stock-code">${esc(displaySymbol(p.code))}</span><strong>${esc(name)}</strong></span><span class="pos-cell">${number(r.shares)}</span><span class="pos-cell">${number(r.avgPrice)}</span><span class="pos-cell">${number(r.price)}</span><span class="pos-cell">${number(r.marketValue)}</span><span class="pos-cell pos-num ${sign(r.dayPnl)}">${r.dayPnl == null ? "—" : points(r.dayPnl)}</span><span class="pos-cell pos-num ${sign(r.totalPnl)}">${r.totalPnlPercent == null ? "—" : change(r.totalPnlPercent)}</span></div>${lots}</div>`;
+    })
+    .join("");
+  return `<div class="pane"><h1>你的投資組合</h1><p class="intro">記錄每檔的購入批次，市值與損益用目前報價自動計算；台股收盤後以官方收盤計。台幣與美元分開彙總，不相加。</p>${positions.length ? `<div class="pos-summary">${cards}</div>` : ""}<form id="lot-form"><div class="form-grid"><label>代號<input name="code" id="lot-code" required placeholder="2330 或 VOO"></label><label>購入日期<input name="date" type="date" value="${today}"></label><label>購入價（每股）<input name="price" type="number" step="any" required placeholder="例如 2395"></label><label>股數<input name="shares" type="number" step="any" required placeholder="例如 64，可含碎股"></label></div><button class="primary" type="submit">新增一筆</button></form><div class="pos-import"><h2>貼上匯入</h2><p class="note">一行一筆：代號, 日期, 購入價, 股數；日期可省略（代號, 購入價, 股數）。分隔可用逗號、Tab 或空白，價格不要加千分位逗號。</p><textarea id="import-text" rows="4" placeholder="2330, 2026-11-10, 2395, 64"></textarea><button id="import-btn" class="secondary" type="button">匯入</button>${positionsMessage ? `<p class="note">${esc(positionsMessage)}</p>` : ""}</div>${positions.length ? `<div class="positions-list"><div class="pos-table"><div class="pos-head"><span>代號 · 名稱</span><span>股數</span><span>均價</span><span>現價</span><span>市值</span><span>今日損益</span><span>總損益%</span></div>${rowsHtml}</div></div>` : '<div class="empty">還沒有持股紀錄。用上方表單新增一筆，或用「貼上匯入」一次貼上多筆，組合市值與每日損益就會自動計算。</div>'}</div>`;
+}
 function watch() {
   const a = state.settings.appearance;
   const last = state.events[0];
@@ -536,6 +622,10 @@ function render() {
       e.classList.toggle("active", (e as HTMLElement).dataset.tab === tab),
     );
   if (tab === "watch") content.innerHTML = watch();
+  if (tab === "positions") {
+    content.innerHTML = positionsPage();
+    positionsSig = positionsSignature();
+  }
   if (tab === "daily") dailyPage();
   if (tab === "settings")
     content.innerHTML = `<div class="pane"><h1>讓它融入你的桌面</h1><p class="intro">同一份自選與提醒，換一種工作時的樣子。</p><div class="appearance-grid">${[
@@ -900,6 +990,73 @@ function bind() {
         void mutate("upsert_rule", { ...r, enabled: !r.enabled });
       }),
   );
+  document.querySelector("#lot-form")?.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const data = Object.fromEntries(
+      new FormData(e.target as HTMLFormElement).entries(),
+    );
+    void mutate("add_lot", {
+      code: String(data.code ?? ""),
+      date: String(data.date ?? ""),
+      price: Number(data.price),
+      shares: Number(data.shares),
+    });
+  });
+  document.querySelector("#import-btn")?.addEventListener("click", () => {
+    const text =
+      document.querySelector<HTMLTextAreaElement>("#import-text")!.value;
+    void (async () => {
+      try {
+        // Not mutate(): the import tally rides this one response and is kept
+        // in a module variable so later polls do not wipe the outcome line.
+        state = await request("import_positions", { text });
+        const r = state.positionsImport;
+        positionsMessage = r
+          ? `匯入完成：成功 ${r.added} 筆${r.failedLines.length ? `；失敗 ${r.failedLines.length} 筆（第 ${r.failedLines.join("、")} 行）` : ""}`
+          : "";
+        apply();
+        render();
+      } catch (e) {
+        showError(e);
+      }
+    })();
+  });
+  document.querySelectorAll<HTMLElement>("[data-expand]").forEach((el) =>
+    el.addEventListener("click", () => {
+      const code = el.dataset.expand!;
+      expandedPosition = expandedPosition === code ? null : code;
+      render();
+    }),
+  );
+  document.querySelectorAll<HTMLButtonElement>("[data-del-lot]").forEach(
+    (b) =>
+      (b.onclick = () => {
+        const [code, idx] = b.dataset.delLot!.split(":");
+        void mutate("delete_lot", { code, index: Number(idx) });
+      }),
+  );
+  document.querySelectorAll<HTMLButtonElement>("[data-add-lot]").forEach(
+    (b) =>
+      (b.onclick = () => {
+        const code = document.querySelector<HTMLInputElement>("#lot-code");
+        if (!code) return;
+        code.value = displaySymbol(b.dataset.addLot!);
+        document
+          .querySelector<HTMLInputElement>('#lot-form [name="price"]')
+          ?.focus();
+      }),
+  );
+  document
+    .querySelectorAll<HTMLButtonElement>("[data-del-position]")
+    .forEach(
+      (b) =>
+        (b.onclick = () => {
+          const code = b.dataset.delPosition!;
+          if (!confirm(`刪除 ${displaySymbol(code)} 的全部持股紀錄？`)) return;
+          if (expandedPosition === code) expandedPosition = null;
+          void mutate("delete_position", { code });
+        }),
+    );
 }
 document.querySelectorAll<HTMLButtonElement>("[data-tab]").forEach(
   (b) =>
@@ -1023,6 +1180,24 @@ async function poll() {
         Boolean(previous.events.length) !== Boolean(state.events.length)
       )
         void resize();
+    } else if (tab === "positions") {
+      // The portfolio page follows live quotes: re-render when the valued
+      // prices move (or the state revision does), but never while the user is
+      // typing in the lot form or the import box, and keep the scroll place.
+      const el = document.activeElement as HTMLElement | null;
+      const typing =
+        !!el &&
+        content.contains(el) &&
+        ["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName);
+      if (
+        !typing &&
+        (previous.revision !== state.revision ||
+          positionsSignature() !== positionsSig)
+      ) {
+        const top = content.scrollTop;
+        render();
+        content.scrollTop = top;
+      }
     } else if (
       previous.revision !== state.revision &&
       !content.contains(document.activeElement)

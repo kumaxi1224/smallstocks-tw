@@ -64,6 +64,16 @@ export interface WatchGroup {
   name: string;
   codes: string[];
 }
+/** One purchase lot of a held position; date is YYYY-MM-DD or "" when unrecorded. */
+export interface Lot {
+  date: string;
+  price: number;
+  shares: number;
+}
+export interface Position {
+  code: string;
+  lots: Lot[];
+}
 export interface Snapshot {
   intraday: Record<string, IntradayView>;
   dailySummaries: Record<string, DailyView>;
@@ -71,6 +81,10 @@ export interface Snapshot {
   /** Watch groups; `watchlist` above is the active group's codes. */
   groups?: WatchGroup[];
   activeGroup?: number;
+  /** Held positions with purchase lots; absent on old states. */
+  positions?: Position[];
+  /** Tally of the import_positions call that produced this snapshot, if any. */
+  positionsImport?: { added: number; failedLines: number[] };
   settings: {
     alwaysOnTop?: boolean;
     appearance: Appearance;
@@ -268,6 +282,173 @@ export function latestCloseDate(
 }
 export const ruleText = (r: Rule) =>
   `${displaySymbol(r.symbol)} · ${METRIC_LABEL[r.metric] ?? r.metric}${r.direction === "above" ? "升至" : "降至"} ${number(r.threshold)}${r.metric === "price" || r.metric === "mid" ? " 元" : "%"}`;
+/** The price inputs a portfolio valuation needs for one code. `previous` is
+ * the prior close behind today's change; either may be missing. */
+export interface PositionQuote {
+  price: number | null;
+  previous: number | null;
+}
+export type Currency = "TWD" | "USD";
+export interface PositionSummary {
+  code: string;
+  currency: Currency;
+  /** Total shares across all lots. */
+  shares: number;
+  /** Volume-weighted average purchase price; null when no shares are held. */
+  avgPrice: number | null;
+  /** Total purchase cost, Σ price × shares over the lots. */
+  cost: number;
+  price: number | null;
+  marketValue: number | null;
+  /** (price − previous) × shares; null when price or previous is unknown. */
+  dayPnl: number | null;
+  /** (price − avgPrice) × shares; null when there is no price. */
+  totalPnl: number | null;
+  /** totalPnl as a percent of cost; null when there is no price. */
+  totalPnlPercent: number | null;
+}
+export interface CurrencyTotal {
+  currency: Currency;
+  /** Σ market value over positions that have a price; null when none do. */
+  marketValue: number | null;
+  /** Σ day P&L over positions with a known previous close; null when none. */
+  dayPnl: number | null;
+  /** dayPnl as a percent of yesterday's market value of those same positions. */
+  dayPnlPercent: number | null;
+  /** Σ total P&L over priced positions; null when none are priced. */
+  totalPnl: number | null;
+  /** totalPnl as a percent of the cost of the priced positions. */
+  totalPnlPercent: number | null;
+}
+export interface PortfolioSummary {
+  positions: PositionSummary[];
+  /** One entry per currency actually held, TWD first. Never summed across. */
+  totals: CurrencyTotal[];
+}
+/**
+ * Values a portfolio from purchase lots and caller-supplied prices. Pure: the
+ * caller decides where each code's price/previous came from (live quote, or
+ * the official close after the Taiwan session). Yahoo-routed codes are USD,
+ * everything else TWD, and the two currencies are totalled separately.
+ */
+export function portfolioSummary(
+  positions: Position[],
+  quotesByCode: Record<string, PositionQuote>,
+): PortfolioSummary {
+  const rows: PositionSummary[] = positions.map((p) => {
+    const currency: Currency = isYahooSymbol(p.code) ? "USD" : "TWD";
+    const shares = p.lots.reduce((n, l) => n + l.shares, 0);
+    const cost = p.lots.reduce((n, l) => n + l.price * l.shares, 0);
+    const avgPrice = shares > 0 ? cost / shares : null;
+    const q = quotesByCode[p.code];
+    const price = q?.price ?? null;
+    const previous = q?.previous ?? null;
+    const marketValue = price != null ? price * shares : null;
+    const dayPnl =
+      price != null && previous != null ? (price - previous) * shares : null;
+    const totalPnl =
+      price != null && avgPrice != null ? (price - avgPrice) * shares : null;
+    const totalPnlPercent =
+      totalPnl != null && cost > 0 ? (totalPnl / cost) * 100 : null;
+    return {
+      code: p.code,
+      currency,
+      shares,
+      avgPrice,
+      cost,
+      price,
+      marketValue,
+      dayPnl,
+      totalPnl,
+      totalPnlPercent,
+    };
+  });
+  const totals: CurrencyTotal[] = [];
+  for (const currency of ["TWD", "USD"] as Currency[]) {
+    const mine = rows.filter((r) => r.currency === currency);
+    if (!mine.length) continue;
+    const priced = mine.filter((r) => r.marketValue != null);
+    const marketValue = priced.length
+      ? priced.reduce((n, r) => n + r.marketValue!, 0)
+      : null;
+    const withDay = mine.filter((r) => r.dayPnl != null);
+    const dayPnl = withDay.length
+      ? withDay.reduce((n, r) => n + r.dayPnl!, 0)
+      : null;
+    const prevValue = withDay.reduce(
+      (n, r) => n + quotesByCode[r.code]!.previous! * r.shares,
+      0,
+    );
+    const dayPnlPercent =
+      dayPnl != null && prevValue !== 0 ? (dayPnl / prevValue) * 100 : null;
+    const totalPnl = priced.length
+      ? priced.reduce((n, r) => n + (r.totalPnl ?? 0), 0)
+      : null;
+    const pricedCost = priced.reduce((n, r) => n + r.cost, 0);
+    const totalPnlPercent =
+      totalPnl != null && pricedCost > 0 ? (totalPnl / pricedCost) * 100 : null;
+    totals.push({
+      currency,
+      marketValue,
+      dayPnl,
+      dayPnlPercent,
+      totalPnl,
+      totalPnlPercent,
+    });
+  }
+  return { positions: rows, totals };
+}
+/**
+ * Parses pasted position lots, one per line: `CODE, DATE, PRICE, SHARES` with
+ * the date optional (three fields read as CODE, PRICE, SHARES); separators may
+ * be commas, tabs or spaces. Mirrors the core's import_positions line rules so
+ * the browser preview behaves like the desktop core. Codes are only lightly
+ * normalized here (trim + uppercase); the core canonicalizes for real.
+ */
+export function parsePositionsImport(text: string): {
+  lots: { code: string; lot: Lot }[];
+  failedLines: number[];
+} {
+  const lots: { code: string; lot: Lot }[] = [];
+  const failedLines: number[] = [];
+  const validDate = (s: string) => {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+    const d = new Date(`${s}T00:00:00Z`);
+    return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
+  };
+  text.split(/\r?\n/).forEach((line, i) => {
+    if (!line.trim()) return;
+    const fields = line
+      .split(/[,，\t]/)
+      .flatMap((part) => part.split(/\s+/))
+      .filter(Boolean);
+    const [code, a, b, c] =
+      fields.length === 4
+        ? [fields[0], fields[1], fields[2], fields[3]]
+        : fields.length === 3
+          ? [fields[0], "", fields[1], fields[2]]
+          : [undefined, undefined, undefined, undefined];
+    const price = Number(b),
+      shares = Number(c);
+    if (
+      !code ||
+      (a !== "" && !validDate(a!)) ||
+      !/^[A-Za-z0-9.^=]+$/.test(code) ||
+      !Number.isFinite(price) ||
+      price <= 0 ||
+      !Number.isFinite(shares) ||
+      shares <= 0
+    ) {
+      failedLines.push(i + 1);
+      return;
+    }
+    lots.push({
+      code: code.toUpperCase(),
+      lot: { date: a ?? "", price, shares },
+    });
+  });
+  return { lots, failedLines };
+}
 const METRIC_LABEL: Record<string, string> = {
   price: "成交價",
   changePercent: "漲跌幅",

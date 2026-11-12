@@ -1,10 +1,12 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import type { Snapshot, DailyView } from "./model.ts";
+import { parsePositionsImport } from "./model.ts";
 export const desktop = isTauri();
 let preview: Snapshot = {
   watchlist: ["t00", "2330", "0050"],
   groups: [{ name: "自選1", codes: ["t00", "2330", "0050"] }],
   activeGroup: 0,
+  positions: [],
   dailySummaries: {},
   intraday: {},
   settings: {
@@ -45,6 +47,43 @@ export async function request(
   if (desktop) return invoke<Snapshot>("core_request", { tool, args });
   preview.groups ??= [{ name: "自選1", codes: [...preview.watchlist] }];
   preview.activeGroup ??= 0;
+  preview.positions ??= [];
+  if (tool !== "import_positions") delete preview.positionsImport;
+  if (tool === "add_lot") {
+    const code = String(args.code ?? "")
+      .trim()
+      .toUpperCase();
+    const lot = {
+      date: String(args.date ?? ""),
+      price: Number(args.price),
+      shares: Number(args.shares),
+    };
+    const found = preview.positions.find((p) => p.code === code);
+    if (found) found.lots.push(lot);
+    else preview.positions.push({ code, lots: [lot] });
+  }
+  if (tool === "delete_lot") {
+    const p = preview.positions.find((p) => p.code === args.code);
+    if (p) {
+      p.lots.splice(args.index as number, 1);
+      if (!p.lots.length)
+        preview.positions = preview.positions.filter((x) => x !== p);
+    }
+  }
+  if (tool === "delete_position")
+    preview.positions = preview.positions.filter((p) => p.code !== args.code);
+  if (tool === "import_positions") {
+    const parsed = parsePositionsImport(String(args.text ?? ""));
+    for (const { code, lot } of parsed.lots) {
+      const found = preview.positions.find((p) => p.code === code);
+      if (found) found.lots.push(lot);
+      else preview.positions.push({ code, lots: [lot] });
+    }
+    preview.positionsImport = {
+      added: parsed.lots.length,
+      failedLines: parsed.failedLines,
+    };
+  }
   if (tool === "set_settings") Object.assign(preview.settings, args);
   if (tool === "set_watchlist") {
     preview.watchlist = args.symbols as string[];
@@ -84,7 +123,13 @@ export async function request(
     preview.rules = preview.rules.filter((r) => r.id !== args.id);
   preview.now = Date.now();
   if (tool !== "get_status") preview.revision++;
-  for (const [i, c] of preview.watchlist.entries()) {
+  const quoteCodes = [
+    ...new Set([
+      ...preview.watchlist,
+      ...preview.positions.map((p) => p.code),
+    ]),
+  ];
+  for (const [i, c] of quoteCodes.entries()) {
     const base = c === "t00" ? 24180 : c === "0050" ? 62.4 : 1040;
     const p = base + (i - 1) * 0.2;
     preview.quotes[c] = {

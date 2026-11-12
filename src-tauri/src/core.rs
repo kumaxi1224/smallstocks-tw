@@ -504,6 +504,27 @@ pub struct WatchGroup {
 }
 pub const MAX_WATCH_GROUPS: usize = 10;
 pub const MAX_GROUP_SYMBOLS: usize = 30;
+/// One purchase lot of a held position: when it was bought (YYYY-MM-DD, may be
+/// empty when the user did not record it), the per-share price paid, and how
+/// many shares. Shares are fractional-capable (US fractional shares, e.g. 9.43).
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Lot {
+    #[serde(default)]
+    pub date: String,
+    pub price: f64,
+    pub shares: f64,
+}
+/// A held position: one symbol and its purchase lots, in entry order. Position
+/// codes join the monitoring union (see Saved::all_codes) so a holding that is
+/// not in any watch group still gets quotes for its valuation.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Position {
+    pub code: String,
+    #[serde(default)]
+    pub lots: Vec<Lot>,
+}
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Saved {
@@ -523,6 +544,9 @@ pub struct Saved {
     pub groups: Vec<WatchGroup>,
     #[serde(default)]
     pub active_group: usize,
+    /// Held positions with their purchase lots; empty on pre-positions saves.
+    #[serde(default)]
+    pub positions: Vec<Position>,
     #[serde(default)]
     pub settings: Settings,
     #[serde(default)]
@@ -558,8 +582,10 @@ impl Saved {
             .map(|g| g.codes.clone())
             .unwrap_or_default();
     }
-    /// Every watched code across all groups, in group order, duplicates removed:
-    /// the set polling fetches and ingest judges rules against.
+    /// Every watched code across all groups plus every held position, in group
+    /// order then position order, duplicates removed: the set polling fetches
+    /// and ingest judges rules against. A holding outside every group is still
+    /// monitored so the portfolio page can value it.
     pub fn all_codes(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         for g in &self.groups {
@@ -569,10 +595,16 @@ impl Saved {
                 }
             }
         }
+        for p in &self.positions {
+            if !out.contains(&p.code) {
+                out.push(p.code.clone());
+            }
+        }
         out
     }
     pub fn watches(&self, code: &str) -> bool {
         self.groups.iter().any(|g| g.codes.iter().any(|c| c == code))
+            || self.positions.iter().any(|p| p.code == code)
     }
     fn default_group_name(&self) -> String {
         (1..)
@@ -599,6 +631,62 @@ fn group_name(args: &Value) -> Result<String, String> {
         return Err("分組名稱最多 20 字".into());
     }
     Ok(name.to_string())
+}
+/// A lot date the user typed: strict YYYY-MM-DD shape and a real calendar day.
+fn valid_lot_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b.iter()
+            .enumerate()
+            .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
+        && chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok()
+}
+/// The optional `date` argument of add_lot: absent or blank means unrecorded.
+fn lot_date(args: &Value) -> Result<String, String> {
+    let Some(v) = args.get("date") else {
+        return Ok(String::new());
+    };
+    let s = v.as_str().ok_or("日期格式錯誤")?.trim();
+    if s.is_empty() {
+        return Ok(String::new());
+    }
+    if !valid_lot_date(s) {
+        return Err("日期需為 YYYY-MM-DD".into());
+    }
+    Ok(s.to_string())
+}
+/// One line of a pasted positions import: `CODE, DATE, PRICE, SHARES`, with the
+/// date optional (three fields read as CODE, PRICE, SHARES). Fields may be
+/// separated by commas, tabs or spaces. None when the line does not parse.
+fn parse_import_line(line: &str) -> Option<(String, Lot)> {
+    let fields: Vec<&str> = line
+        .split(|c| c == ',' || c == '\t' || c == '，')
+        .flat_map(|part| part.split_whitespace())
+        .collect();
+    let (raw_code, date, raw_price, raw_shares) = match fields.as_slice() {
+        [code, date, price, shares] => (*code, *date, *price, *shares),
+        [code, price, shares] => (*code, "", *price, *shares),
+        _ => return None,
+    };
+    if !date.is_empty() && !valid_lot_date(date) {
+        return None;
+    }
+    let code = symbol(raw_code)?;
+    let price: f64 = raw_price.parse().ok()?;
+    let shares: f64 = raw_shares.parse().ok()?;
+    if !price.is_finite() || price <= 0. || !shares.is_finite() || shares <= 0. {
+        return None;
+    }
+    Some((
+        code,
+        Lot {
+            date: date.to_string(),
+            price,
+            shares,
+        },
+    ))
 }
 #[derive(Clone)]
 pub struct Core {
@@ -751,9 +839,16 @@ impl Core {
     }
     pub fn snapshot(&self) -> Value {
         let months = daily::months(now());
-        let summaries: HashMap<String, Value> = self
-            .saved
-            .watchlist
+        // Daily summaries cover the visible watchlist plus Taiwan holdings, so
+        // the portfolio page can show official closes for held codes that are
+        // in no watch group.
+        let mut summary_codes = self.saved.watchlist.clone();
+        for p in &self.saved.positions {
+            if is_tw_symbol(&p.code) && !summary_codes.contains(&p.code) {
+                summary_codes.push(p.code.clone());
+            }
+        }
+        let summaries: HashMap<String, Value> = summary_codes
             .iter()
             .map(|c| (c.clone(), self.daily_view(c, &months)))
             .collect();
@@ -763,7 +858,7 @@ impl Core {
             .iter()
             .map(|c| (c.clone(), self.intraday_view(c)))
             .collect();
-        json!({"watchlist":self.saved.watchlist,"groups":self.saved.groups,"activeGroup":self.saved.active_group,"settings":self.saved.settings,"privacyShortcutError":self.privacy_shortcut_error,"rules":self.saved.rules,"events":self.saved.events,"quotes":self.quotes,"demo":self.demo,"error":self.error,"sourceNote":self.source_note,"lastFetch":self.last_fetch,"nextPoll":self.next_poll,"marketOpen":self.market_open(now()),"marketClosedReason":self.closed_reason(now()),"calendar":self.calendar_view(),"revision":self.revision,"now":now(),"dailySummaries":summaries,"intraday":intraday})
+        json!({"watchlist":self.saved.watchlist,"groups":self.saved.groups,"activeGroup":self.saved.active_group,"positions":self.saved.positions,"settings":self.saved.settings,"privacyShortcutError":self.privacy_shortcut_error,"rules":self.saved.rules,"events":self.saved.events,"quotes":self.quotes,"demo":self.demo,"error":self.error,"sourceNote":self.source_note,"lastFetch":self.last_fetch,"nextPoll":self.next_poll,"marketOpen":self.market_open(now()),"marketClosedReason":self.closed_reason(now()),"calendar":self.calendar_view(),"revision":self.revision,"now":now(),"dailySummaries":summaries,"intraday":intraday})
     }
     pub fn queue_intraday(&mut self, code: &str) {
         let at = now();
@@ -910,7 +1005,15 @@ impl Core {
             }
             if !self.market_open(now()) || self.demo {
                 let months = daily::months(now());
-                for c in self.saved.watchlist.clone() {
+                // Held Taiwan codes need their official closes too, even when
+                // they sit in no watch group.
+                let mut daily_codes = self.saved.watchlist.clone();
+                for p in &self.saved.positions {
+                    if is_tw_symbol(&p.code) && !daily_codes.contains(&p.code) {
+                        daily_codes.push(p.code.clone());
+                    }
+                }
+                for c in daily_codes {
                     if is_tw_symbol(&c) {
                         for m in &months {
                             self.queue_daily(&c, m)
@@ -957,6 +1060,9 @@ impl Core {
         }
         let mut next = self.clone();
         next.saved.normalize_groups();
+        // Set by import_positions so its added/failed tally rides the returned
+        // snapshot; every other command leaves it empty.
+        let mut import_report: Option<Value> = None;
         match tool {
             "set_watchlist" => {
                 let raw = args["symbols"].as_array().ok_or("需要 symbols 陣列")?;
@@ -1063,6 +1169,87 @@ impl Core {
                 let idx = group_index(&args, next.saved.groups.len())?;
                 next.saved.active_group = idx;
                 next.saved.sync_watchlist();
+            }
+            "add_lot" => {
+                let code = args["code"]
+                    .as_str()
+                    .and_then(symbol)
+                    .ok_or("代號格式不正確")?;
+                let date = lot_date(&args)?;
+                let price = args["price"]
+                    .as_f64()
+                    .filter(|n| n.is_finite() && *n > 0.)
+                    .ok_or("購入價必須大於零")?;
+                let shares = args["shares"]
+                    .as_f64()
+                    .filter(|n| n.is_finite() && *n > 0.)
+                    .ok_or("股數必須大於零")?;
+                let lot = Lot {
+                    date,
+                    price,
+                    shares,
+                };
+                match next.saved.positions.iter_mut().find(|p| p.code == code) {
+                    Some(p) => p.lots.push(lot),
+                    None => next.saved.positions.push(Position {
+                        code,
+                        lots: vec![lot],
+                    }),
+                }
+                next.next_poll = 0;
+            }
+            "delete_lot" => {
+                let code = args["code"]
+                    .as_str()
+                    .and_then(symbol)
+                    .ok_or("代號格式不正確")?;
+                let idx = args["index"].as_u64().ok_or("需要批次編號")? as usize;
+                let Some(pi) = next.saved.positions.iter().position(|p| p.code == code)
+                else {
+                    return Err("找不到持股".into());
+                };
+                if idx >= next.saved.positions[pi].lots.len() {
+                    return Err("找不到批次".into());
+                }
+                next.saved.positions[pi].lots.remove(idx);
+                if next.saved.positions[pi].lots.is_empty() {
+                    next.saved.positions.remove(pi);
+                }
+            }
+            "delete_position" => {
+                let code = args["code"]
+                    .as_str()
+                    .and_then(symbol)
+                    .ok_or("代號格式不正確")?;
+                if !next.saved.positions.iter().any(|p| p.code == code) {
+                    return Err("找不到持股".into());
+                }
+                next.saved.positions.retain(|p| p.code != code);
+            }
+            "import_positions" => {
+                let text = args["text"].as_str().ok_or("需要匯入文字")?;
+                let mut added = 0usize;
+                let mut failed_lines: Vec<usize> = Vec::new();
+                for (i, line) in text.lines().enumerate() {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    match parse_import_line(line) {
+                        Some((code, lot)) => {
+                            match next.saved.positions.iter_mut().find(|p| p.code == code) {
+                                Some(p) => p.lots.push(lot),
+                                None => next.saved.positions.push(Position {
+                                    code,
+                                    lots: vec![lot],
+                                }),
+                            }
+                            added += 1;
+                        }
+                        None => failed_lines.push(i + 1),
+                    }
+                }
+                import_report = Some(json!({"added": added, "failedLines": failed_lines}));
+                next.next_poll = 0;
             }
             "set_settings" => {
                 if let Some(v) = args.get("alwaysOnTop") {
@@ -1218,7 +1405,11 @@ impl Core {
         next.config_revision += 1;
         next.persist()?;
         *self = next;
-        Ok(self.snapshot())
+        let mut snap = self.snapshot();
+        if let Some(report) = import_report {
+            snap["positionsImport"] = report;
+        }
+        Ok(snap)
     }
     pub fn reset_baselines(&mut self) {
         for r in &mut self.saved.rules {
@@ -2215,6 +2406,138 @@ mod tests {
         c.ingest(vec![q(Some(100.), t)], t);
         let events = c.ingest(vec![q(Some(106.), t + 5000)], t + 5000);
         assert_eq!(events.len(), 1, "rules fire regardless of the visible tab");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn position_commands_add_merge_validate_and_delete() {
+        let dir =
+            std::env::temp_dir().join(format!("smallstocks-positions-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = Core::load(dir.join("state.json"), true).unwrap();
+        assert!(c.saved.positions.is_empty());
+        c.execute(
+            "add_lot",
+            json!({"code":"2330","date":"2026-11-10","price":2395.0,"shares":64}),
+        )
+        .unwrap();
+        // A second lot for the same code appends to the same position.
+        c.execute("add_lot", json!({"code":"2330","price":2300.0,"shares":36}))
+            .unwrap();
+        assert_eq!(c.saved.positions.len(), 1);
+        assert_eq!(c.saved.positions[0].lots.len(), 2);
+        assert_eq!(c.saved.positions[0].lots[1].date, "");
+        // US fractional shares and Yahoo normalization ride the same path.
+        c.execute("add_lot", json!({"code":"nvda","price":168.8,"shares":9.43}))
+            .unwrap();
+        assert_eq!(c.saved.positions[1].code, "NVDA");
+        // Validation: bad code, bad date, non-positive numbers all refuse.
+        assert!(c
+            .execute("add_lot", json!({"code":"!!","price":1,"shares":1}))
+            .is_err());
+        assert!(c
+            .execute(
+                "add_lot",
+                json!({"code":"0050","date":"2026-13-01","price":100,"shares":1})
+            )
+            .is_err());
+        assert!(c
+            .execute(
+                "add_lot",
+                json!({"code":"0050","date":"2026-1-05","price":100,"shares":1})
+            )
+            .is_err());
+        assert!(c
+            .execute("add_lot", json!({"code":"0050","price":0,"shares":1}))
+            .is_err());
+        assert!(c
+            .execute("add_lot", json!({"code":"0050","price":100,"shares":-2}))
+            .is_err());
+        assert_eq!(c.saved.positions.len(), 2, "refused lots change nothing");
+        // Deleting the last lot of a position removes the position itself.
+        c.execute("delete_lot", json!({"code":"NVDA","index":0})).unwrap();
+        assert_eq!(c.saved.positions.len(), 1);
+        assert!(c
+            .execute("delete_lot", json!({"code":"NVDA","index":0}))
+            .is_err());
+        assert!(c
+            .execute("delete_lot", json!({"code":"2330","index":9}))
+            .is_err());
+        c.execute("delete_position", json!({"code":"2330"})).unwrap();
+        assert!(c.saved.positions.is_empty());
+        assert!(c.execute("delete_position", json!({"code":"2330"})).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn import_positions_parses_lines_and_reports_failures() {
+        let dir =
+            std::env::temp_dir().join(format!("smallstocks-import-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let mut c = Core::load(path.clone(), true).unwrap();
+        let text = "2330, 2026-11-10, 2395, 64\n\
+                    0050\t100.95\t1524\n\
+                    NVDA 168.8 9.43\n\
+                    \n\
+                    BAD!!, 2026-11-10, 10, 10\n\
+                    006208, 2026-02-30, 231.95, 3375\n\
+                    006208, 231.95, -3\n\
+                    006208, 231.95, 3375";
+        let snap = c.execute("import_positions", json!({"text": text})).unwrap();
+        assert_eq!(snap["positionsImport"]["added"], 4);
+        assert_eq!(snap["positionsImport"]["failedLines"], json!([5, 6, 7]));
+        assert_eq!(c.saved.positions.len(), 4);
+        let tsm = c
+            .saved
+            .positions
+            .iter()
+            .find(|p| p.code == "2330")
+            .unwrap();
+        assert_eq!(tsm.lots[0].date, "2026-11-10");
+        let etf = c
+            .saved
+            .positions
+            .iter()
+            .find(|p| p.code == "0050")
+            .unwrap();
+        assert_eq!(etf.lots[0].date, "", "three fields read as code, price, shares");
+        // One save for the whole batch: a reload sees every imported lot.
+        let reloaded = Core::load(path, true).unwrap();
+        assert_eq!(reloaded.saved.positions.len(), 4);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn positions_join_the_monitoring_union() {
+        let dir =
+            std::env::temp_dir().join(format!("smallstocks-posunion-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = Core::load(dir.join("state.json"), true).unwrap();
+        let t = ts();
+        // 6488 is held but in no watch group; its quotes must still land.
+        c.execute("add_lot", json!({"code":"6488","price":900.0,"shares":100}))
+            .unwrap();
+        assert_eq!(c.saved.all_codes(), vec!["t00", "2330", "0050", "6488"]);
+        assert!(c.saved.watches("6488"));
+        let mut held = q(Some(950.), t);
+        held.symbol = "6488".into();
+        c.ingest(vec![held], t);
+        assert_eq!(c.quotes["6488"].price, Some(950.));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn a_save_without_positions_still_loads() {
+        let dir =
+            std::env::temp_dir().join(format!("smallstocks-oldsave-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let mut c = Core::load(path.clone(), true).unwrap();
+        c.persist().unwrap();
+        drop(c);
+        // Simulate a pre-positions state file by dropping the key entirely.
+        let mut v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("positions");
+        std::fs::write(&path, v.to_string()).unwrap();
+        let reloaded = Core::load(path, true).unwrap();
+        assert!(reloaded.saved.positions.is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]

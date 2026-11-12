@@ -7,8 +7,9 @@ import {
   ruleText,
   latestCloseDate,
   livePrice,
+  portfolioSummary,
 } from "../src/model.ts";
-import type { Quote, Rule, Snapshot } from "../src/model.ts";
+import type { Quote, Rule, Snapshot, Position } from "../src/model.ts";
 describe("display truthfulness", () => {
   it("uses the actual newest watched close date, even when it is not today", () => {
     const state = {
@@ -266,5 +267,79 @@ describe("window opacity", () => {
     expect(shellOpacity(0.1)).toBe(0.4);
     expect(shellOpacity(0)).toBe(0.4);
     expect(shellOpacity(2)).toBe(1);
+  });
+});
+
+describe("portfolio summary", () => {
+  const tsm: Position = {
+    code: "2330",
+    lots: [
+      { date: "2026-11-10", price: 1000, shares: 100 },
+      { date: "", price: 1100, shares: 50 },
+    ],
+  };
+  it("weights the average price across lots and values the position", () => {
+    const s = portfolioSummary([tsm], {
+      "2330": { price: 1200, previous: 1150 },
+    });
+    const r = s.positions[0]!;
+    expect(r.shares).toBe(150);
+    expect(r.cost).toBe(155_000);
+    expect(r.avgPrice).toBeCloseTo(155_000 / 150);
+    expect(r.marketValue).toBe(180_000);
+    expect(r.dayPnl).toBe(7_500);
+    expect(r.totalPnl).toBeCloseTo(25_000);
+    expect(r.totalPnlPercent).toBeCloseTo((25_000 / 155_000) * 100);
+    const twd = s.totals[0]!;
+    expect(twd.currency).toBe("TWD");
+    expect(twd.marketValue).toBe(180_000);
+    expect(twd.dayPnl).toBe(7_500);
+    expect(twd.dayPnlPercent).toBeCloseTo((7_500 / (1150 * 150)) * 100);
+    expect(twd.totalPnlPercent).toBeCloseTo((25_000 / 155_000) * 100);
+  });
+  it("handles fractional US shares", () => {
+    const s = portfolioSummary(
+      [{ code: "NVDA", lots: [{ date: "", price: 168.8, shares: 9.43 }] }],
+      { NVDA: { price: 180, previous: 175 } },
+    );
+    const r = s.positions[0]!;
+    expect(r.currency).toBe("USD");
+    expect(r.marketValue).toBeCloseTo(180 * 9.43);
+    expect(r.dayPnl).toBeCloseTo(5 * 9.43);
+    expect(r.totalPnl).toBeCloseTo((180 - 168.8) * 9.43);
+  });
+  it("leaves day P&L null when the previous close is unknown, and everything null without a price", () => {
+    const s = portfolioSummary([tsm, { code: "0050", lots: [{ date: "", price: 100, shares: 10 }] }], {
+      "2330": { price: 1200, previous: null },
+    });
+    expect(s.positions[0]!.dayPnl).toBeNull();
+    expect(s.positions[0]!.totalPnl).toBeCloseTo(25_000);
+    expect(s.positions[1]!.price).toBeNull();
+    expect(s.positions[1]!.marketValue).toBeNull();
+    expect(s.positions[1]!.totalPnl).toBeNull();
+    const twd = s.totals[0]!;
+    expect(twd.dayPnl).toBeNull();
+    expect(twd.marketValue).toBe(180_000);
+    expect(twd.totalPnl).toBeCloseTo(25_000);
+    expect(twd.totalPnlPercent).toBeCloseTo((25_000 / 155_000) * 100);
+  });
+  it("totals TWD and USD separately, never summed together", () => {
+    const s = portfolioSummary(
+      [
+        tsm,
+        { code: "VOO", lots: [{ date: "", price: 600, shares: 6.3 }] },
+      ],
+      {
+        "2330": { price: 1200, previous: 1150 },
+        VOO: { price: 690, previous: 680 },
+      },
+    );
+    expect(s.totals.map((t) => t.currency)).toEqual(["TWD", "USD"]);
+    expect(s.totals[0]!.marketValue).toBe(180_000);
+    expect(s.totals[1]!.marketValue).toBeCloseTo(690 * 6.3);
+    expect(s.totals[1]!.dayPnl).toBeCloseTo(10 * 6.3);
+  });
+  it("reports no totals for an empty portfolio", () => {
+    expect(portfolioSummary([], {})).toEqual({ positions: [], totals: [] });
   });
 });
