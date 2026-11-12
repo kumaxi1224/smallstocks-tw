@@ -1,5 +1,5 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
-import type { Snapshot, DailyView } from "./model.ts";
+import type { Snapshot, DailyView, Position } from "./model.ts";
 import { parsePositionsImport } from "./model.ts";
 export const desktop = isTauri();
 let preview: Snapshot = {
@@ -161,6 +161,16 @@ export async function request(
       c,
       new Date().toISOString().slice(0, 7),
     );
+  }
+  // Synthetic minute series cover held codes too, so the portfolio day
+  // chart has something to aggregate in the preview.
+  const intradayCodes = [
+    ...new Set([
+      ...preview.watchlist,
+      ...preview.positions.map((p) => p.code),
+    ]),
+  ];
+  for (const c of intradayCodes) {
     const start = new Date(preview.now);
     start.setHours(9, 0, 0, 0);
     const base = preview.quotes[c]!.price!;
@@ -181,6 +191,68 @@ export async function request(
       demo: true,
     };
   }
+  localStorage.setItem("smallstocks-preview", JSON.stringify(preview));
+  return structuredClone(preview);
+}
+/** The export_data payload as a JSON string (desktop core or preview). */
+export async function exportData(): Promise<string> {
+  if (desktop)
+    return invoke<string>("core_request", { tool: "export_data", args: {} });
+  return JSON.stringify(
+    {
+      app: "smallstocks-tw",
+      version: 1,
+      groups: preview.groups ?? [],
+      activeGroup: preview.activeGroup ?? 0,
+      positions: preview.positions ?? [],
+    },
+    null,
+    2,
+  );
+}
+/**
+ * Applies an export_data JSON string through import_data. The desktop core
+ * validates and tallies; the preview checks the envelope and applies the
+ * file as-is. Rejects with the same messages the core would give.
+ */
+export async function importData(jsonText: string): Promise<Snapshot> {
+  if (desktop)
+    return invoke<Snapshot>("core_request", {
+      tool: "import_data",
+      args: { json: jsonText },
+    });
+  let v: {
+    app?: string;
+    version?: number;
+    groups?: Snapshot["groups"];
+    activeGroup?: number;
+    positions?: Position[];
+  };
+  try {
+    v = JSON.parse(jsonText);
+  } catch {
+    throw new Error("匯入檔案不是有效的 JSON");
+  }
+  if (v?.app !== "smallstocks-tw")
+    throw new Error("這不是 SmallStocks TW 的匯出檔案");
+  if (v?.version !== 1) throw new Error("不支援的匯出檔案版本");
+  if (!Array.isArray(v.groups) || !v.groups.length)
+    throw new Error("匯出檔案沒有任何分組");
+  preview.groups = v.groups;
+  preview.activeGroup = Math.min(
+    Math.max(0, v.activeGroup ?? 0),
+    v.groups.length - 1,
+  );
+  preview.watchlist = [...(v.groups[preview.activeGroup]?.codes ?? [])];
+  preview.positions = Array.isArray(v.positions) ? v.positions : [];
+  preview.dataImport = {
+    groups: v.groups.length,
+    positions: preview.positions.length,
+    lots: preview.positions.reduce((n, p) => n + p.lots.length, 0),
+    skippedSymbols: [],
+    skippedLots: 0,
+  };
+  preview.revision++;
   localStorage.setItem("smallstocks-preview", JSON.stringify(preview));
   return structuredClone(preview);
 }

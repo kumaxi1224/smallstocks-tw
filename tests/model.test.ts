@@ -4,10 +4,13 @@ import {
   stale,
   change,
   shellOpacity,
+  shouldKeepScroll,
   ruleText,
   latestCloseDate,
   livePrice,
   portfolioSummary,
+  portfolioIntradaySeries,
+  formatMoney,
 } from "../src/model.ts";
 import type { Quote, Rule, Snapshot, Position } from "../src/model.ts";
 describe("display truthfulness", () => {
@@ -270,6 +273,22 @@ describe("window opacity", () => {
   });
 });
 
+describe("scroll place on re-render", () => {
+  it("keeps the scroll place when the same view re-renders", () => {
+    expect(shouldKeepScroll("settings", "settings", false)).toBe(true);
+    expect(shouldKeepScroll("positions", "positions", false)).toBe(true);
+  });
+  it("starts at the top on a view switch or before the first render", () => {
+    expect(shouldKeepScroll("watch", "settings", false)).toBe(false);
+    expect(shouldKeepScroll("manage", "watch", false)).toBe(false);
+    expect(shouldKeepScroll(null, "watch", false)).toBe(false);
+  });
+  it("starts at the top when a navigation action asked for a reset", () => {
+    expect(shouldKeepScroll("watch", "watch", true)).toBe(false);
+    expect(shouldKeepScroll("rules", "rules", true)).toBe(false);
+  });
+});
+
 describe("portfolio summary", () => {
   const tsm: Position = {
     code: "2330",
@@ -288,6 +307,7 @@ describe("portfolio summary", () => {
     expect(r.avgPrice).toBeCloseTo(155_000 / 150);
     expect(r.marketValue).toBe(180_000);
     expect(r.dayPnl).toBe(7_500);
+    expect(r.dayPnlPercent).toBeCloseTo((7_500 / (1150 * 150)) * 100);
     expect(r.totalPnl).toBeCloseTo(25_000);
     expect(r.totalPnlPercent).toBeCloseTo((25_000 / 155_000) * 100);
     const twd = s.totals[0]!;
@@ -306,6 +326,7 @@ describe("portfolio summary", () => {
     expect(r.currency).toBe("USD");
     expect(r.marketValue).toBeCloseTo(180 * 9.43);
     expect(r.dayPnl).toBeCloseTo(5 * 9.43);
+    expect(r.dayPnlPercent).toBeCloseTo((5 / 175) * 100);
     expect(r.totalPnl).toBeCloseTo((180 - 168.8) * 9.43);
   });
   it("leaves day P&L null when the previous close is unknown, and everything null without a price", () => {
@@ -313,8 +334,10 @@ describe("portfolio summary", () => {
       "2330": { price: 1200, previous: null },
     });
     expect(s.positions[0]!.dayPnl).toBeNull();
+    expect(s.positions[0]!.dayPnlPercent).toBeNull();
     expect(s.positions[0]!.totalPnl).toBeCloseTo(25_000);
     expect(s.positions[1]!.price).toBeNull();
+    expect(s.positions[1]!.dayPnlPercent).toBeNull();
     expect(s.positions[1]!.marketValue).toBeNull();
     expect(s.positions[1]!.totalPnl).toBeNull();
     const twd = s.totals[0]!;
@@ -341,5 +364,101 @@ describe("portfolio summary", () => {
   });
   it("reports no totals for an empty portfolio", () => {
     expect(portfolioSummary([], {})).toEqual({ positions: [], totals: [] });
+  });
+});
+describe("portfolio intraday series", () => {
+  const t0 = 1_700_000_000_000 - (1_700_000_000_000 % 60000);
+  const min = (n: number) => t0 + n * 60000;
+  it("forward-fills each leg across its own gaps and weights by shares", () => {
+    const s = portfolioIntradaySeries(
+      [
+        { code: "2330", lots: [{ date: "", price: 1000, shares: 100 }] },
+        { code: "0050", lots: [{ date: "", price: 50, shares: 50 }] },
+      ],
+      {
+        // 2330 samples at minute 0 and 2 only; minute 1 must reuse 10.
+        "2330": [
+          { at: min(0), price: 10 },
+          { at: min(2), price: 12 },
+        ],
+        // 0050 first trades at minute 1; before that it counts at its
+        // previous close of 20.
+        "0050": [{ at: min(1), price: 22 }],
+      },
+      { "2330": 10, "0050": 20 },
+    );
+    expect(s.points).toEqual([
+      { at: min(0), value: 100 * 10 + 50 * 20 },
+      { at: min(1), value: 100 * 10 + 50 * 22 },
+      { at: min(2), value: 100 * 12 + 50 * 22 },
+    ]);
+    expect(s.previousTotal).toBe(2000);
+    expect(s.high).toBe(2300);
+    expect(s.low).toBe(2000);
+    expect(s.lastValue).toBe(2300);
+    expect(s.firstAt).toBe(min(0));
+    expect(s.lastAt).toBe(min(2));
+  });
+  it("counts a leg with no samples at all at its previous close throughout", () => {
+    const s = portfolioIntradaySeries(
+      [
+        { code: "2330", lots: [{ date: "", price: 1000, shares: 10 }] },
+        { code: "0050", lots: [{ date: "", price: 50, shares: 5 }] },
+      ],
+      { "2330": [{ at: min(0), price: 110 }], "0050": [] },
+      { "2330": 100, "0050": 60 },
+    );
+    expect(s.points).toEqual([{ at: min(0), value: 10 * 110 + 5 * 60 }]);
+    expect(s.previousTotal).toBe(10 * 100 + 5 * 60);
+  });
+  it("has no points before any price is known, and excludes USD positions", () => {
+    const s = portfolioIntradaySeries(
+      [
+        { code: "2330", lots: [{ date: "", price: 1000, shares: 2.5 }] },
+        { code: "VOO", lots: [{ date: "", price: 600, shares: 6.3 }] },
+      ],
+      {
+        "2330": [
+          { at: min(0), price: null },
+          { at: min(1), price: 40 },
+        ],
+        VOO: [{ at: min(0), price: 690 }],
+      },
+      { "2330": null, VOO: 680 },
+    );
+    // Minute 0: the only TWD leg has neither a sample price nor a previous
+    // close, so no aggregate is invented for it; VOO never counts at all.
+    expect(s.points).toEqual([{ at: min(1), value: 100 }]);
+    expect(s.previousTotal).toBeNull();
+  });
+  it("returns an empty series for an empty or USD-only portfolio", () => {
+    expect(portfolioIntradaySeries([], {}, {})).toEqual({
+      points: [],
+      previousTotal: null,
+      firstAt: null,
+      lastAt: null,
+      lastValue: null,
+      high: null,
+      low: null,
+    });
+    const usd = portfolioIntradaySeries(
+      [{ code: "VOO", lots: [{ date: "", price: 600, shares: 6.3 }] }],
+      { VOO: [{ at: min(0), price: 690 }] },
+      { VOO: 680 },
+    );
+    expect(usd.points).toEqual([]);
+    expect(usd.previousTotal).toBeNull();
+  });
+});
+describe("money formatting", () => {
+  it("rounds TWD amounts to whole dollars and keeps USD at two decimals", () => {
+    expect(formatMoney(6495466.53, "TWD")).toBe("6,495,467");
+    expect(formatMoney(-148818.99, "TWD", true)).toBe("-148,819");
+    expect(formatMoney(1234.5, "TWD", true)).toBe("+1,235");
+    expect(formatMoney(15436.12, "USD")).toBe("15,436.12");
+    expect(formatMoney(371850, "USD")).toBe("371,850.00");
+    expect(formatMoney(63, "USD", true)).toBe("+63.00");
+    expect(formatMoney(null, "TWD")).toBe("—");
+    expect(formatMoney(0, "TWD", true)).toBe("0");
   });
 });

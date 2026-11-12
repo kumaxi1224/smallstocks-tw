@@ -85,6 +85,14 @@ export interface Snapshot {
   positions?: Position[];
   /** Tally of the import_positions call that produced this snapshot, if any. */
   positionsImport?: { added: number; failedLines: number[] };
+  /** Tally of the import_data call that produced this snapshot, if any. */
+  dataImport?: {
+    groups: number;
+    positions: number;
+    lots: number;
+    skippedSymbols: string[];
+    skippedLots: number;
+  };
   settings: {
     alwaysOnTop?: boolean;
     appearance: Appearance;
@@ -149,9 +157,37 @@ export const change = (n: number | null | undefined) =>
 /** A signed point change, e.g. +12.5 / -3.25, trimmed the same way as `number`. */
 export const points = (n: number | null | undefined) =>
   n == null ? "—" : `${n > 0 ? "+" : ""}${number(n)}`;
+/**
+ * Formats a money amount by currency convention: TWD amounts are whole
+ * dollars (rounded to the nearest dollar — Taiwan share settlements have no
+ * cents), USD amounts keep two decimals. `signed` prefixes a "+" for gains,
+ * matching `points`. Prices are not money in this sense and keep `number`.
+ */
+export function formatMoney(
+  n: number | null | undefined,
+  currency: Currency,
+  signed = false,
+): string {
+  if (n == null || !Number.isFinite(n)) return "—";
+  const digits = currency === "TWD" ? 0 : 2;
+  const body = new Intl.NumberFormat("en-US", {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  }).format(n);
+  return signed && n > 0 ? `+${body}` : body;
+}
 /** Shell background opacity, clamped to the range the core accepts (0.4–1). */
 export const shellOpacity = (v: number | null | undefined) =>
   v == null || !Number.isFinite(v) ? 1 : Math.min(1, Math.max(0.4, v));
+/** Whether re-rendering the view already on screen keeps its scroll place.
+ * Poll ticks and background refreshes re-render the same view and must not
+ * fling the user back to the top; a view switch — or an explicit reset from
+ * a deliberate navigation action — starts at the top instead. */
+export const shouldKeepScroll = (
+  renderedTab: string | null,
+  tab: string,
+  resetPending: boolean,
+) => !resetPending && renderedTab !== null && renderedTab === tab;
 export const time = (n: number | null | undefined) =>
   n
     ? new Date(n).toLocaleTimeString("zh-TW", {
@@ -302,6 +338,8 @@ export interface PositionSummary {
   marketValue: number | null;
   /** (price − previous) × shares; null when price or previous is unknown. */
   dayPnl: number | null;
+  /** dayPnl as a percent of yesterday's value (previous × shares). */
+  dayPnlPercent: number | null;
   /** (price − avgPrice) × shares; null when there is no price. */
   totalPnl: number | null;
   /** totalPnl as a percent of cost; null when there is no price. */
@@ -346,6 +384,11 @@ export function portfolioSummary(
     const marketValue = price != null ? price * shares : null;
     const dayPnl =
       price != null && previous != null ? (price - previous) * shares : null;
+    const prevValue = previous != null ? previous * shares : null;
+    const dayPnlPercent =
+      dayPnl != null && prevValue != null && prevValue !== 0
+        ? (dayPnl / prevValue) * 100
+        : null;
     const totalPnl =
       price != null && avgPrice != null ? (price - avgPrice) * shares : null;
     const totalPnlPercent =
@@ -359,6 +402,7 @@ export function portfolioSummary(
       price,
       marketValue,
       dayPnl,
+      dayPnlPercent,
       totalPnl,
       totalPnlPercent,
     };
@@ -397,6 +441,109 @@ export function portfolioSummary(
     });
   }
   return { positions: rows, totals };
+}
+/** One minute of the portfolio's aggregate value on the session grid. */
+export interface PortfolioValuePoint {
+  at: number;
+  value: number;
+}
+export interface PortfolioIntraday {
+  /** Aggregate values per sampled minute, oldest first. Minutes where no
+   * held code had any known price are omitted, never invented. */
+  points: PortfolioValuePoint[];
+  /** Σ shares × previous close over the TWD positions whose previous close
+   * is known; null when none is. The dashed baseline of the day chart. */
+  previousTotal: number | null;
+  firstAt: number | null;
+  lastAt: number | null;
+  lastValue: number | null;
+  high: number | null;
+  low: number | null;
+}
+/**
+ * Aggregates the day's minute samples of the TWD holdings into one total
+ * market-value series — the portfolio equivalent of Google Finance's 1D
+ * chart. Display-only: samples come from the intraday (Yahoo minute) path
+ * and the result never feeds rules or events.
+ *
+ * Each code's price on the shared minute grid is its latest sample at or
+ * before that minute (forward-fill across gaps in its own samples); before
+ * its first sample it counts at its previous close, so the total starts at
+ * the previous-close baseline. A code with neither a sample yet nor a known
+ * previous close contributes nothing at that minute, and a minute where no
+ * code contributes is left out. USD (Yahoo-routed) positions are excluded:
+ * the chart is the TWD book only.
+ */
+export function portfolioIntradaySeries(
+  positions: Position[],
+  samplesByCode: Record<string, IntradayPoint[] | null | undefined>,
+  previousByCode: Record<string, number | null | undefined>,
+): PortfolioIntraday {
+  const empty: PortfolioIntraday = {
+    points: [],
+    previousTotal: null,
+    firstAt: null,
+    lastAt: null,
+    lastValue: null,
+    high: null,
+    low: null,
+  };
+  const legs = positions
+    .filter((p) => !isYahooSymbol(p.code))
+    .map((p) => ({
+      shares: p.lots.reduce((n, l) => n + l.shares, 0),
+      previous: previousByCode[p.code] ?? null,
+      samples: (samplesByCode[p.code] ?? [])
+        .filter((pt) => pt.price != null && Number.isFinite(pt.price))
+        .map((pt) => ({
+          minute: Math.floor(pt.at / 60000) * 60000,
+          price: pt.price!,
+        }))
+        .sort((a, b) => a.minute - b.minute),
+    }))
+    .filter((l) => l.shares > 0);
+  if (!legs.length) return empty;
+  const withPrev = legs.filter((l) => l.previous != null);
+  const previousTotal = withPrev.length
+    ? withPrev.reduce((n, l) => n + l.previous! * l.shares, 0)
+    : null;
+  const grid = [
+    ...new Set(legs.flatMap((l) => l.samples.map((s) => s.minute))),
+  ].sort((a, b) => a - b);
+  const points: PortfolioValuePoint[] = [];
+  const cursor = legs.map(() => 0);
+  const known: (number | null)[] = legs.map((l) => l.previous);
+  for (const minute of grid) {
+    legs.forEach((leg, i) => {
+      while (
+        cursor[i]! < leg.samples.length &&
+        leg.samples[cursor[i]!]!.minute <= minute
+      ) {
+        known[i] = leg.samples[cursor[i]!]!.price;
+        cursor[i]!++;
+      }
+    });
+    let total = 0,
+      any = false;
+    legs.forEach((leg, i) => {
+      if (known[i] != null) {
+        total += known[i]! * leg.shares;
+        any = true;
+      }
+    });
+    if (any) points.push({ at: minute, value: total });
+  }
+  if (!points.length) return { ...empty, previousTotal };
+  const values = points.map((p) => p.value);
+  return {
+    points,
+    previousTotal,
+    firstAt: points[0]!.at,
+    lastAt: points.at(-1)!.at,
+    lastValue: points.at(-1)!.value,
+    high: Math.max(...values),
+    low: Math.min(...values),
+  };
 }
 /**
  * Parses pasted position lots, one per line: `CODE, DATE, PRICE, SHARES` with

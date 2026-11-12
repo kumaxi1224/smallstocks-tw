@@ -852,9 +852,11 @@ impl Core {
             .iter()
             .map(|c| (c.clone(), self.daily_view(c, &months)))
             .collect();
-        let intraday: HashMap<String, Value> = self
-            .saved
-            .watchlist
+        // Intraday views cover the same codes as the daily summaries: the
+        // watchlist plus held Taiwan codes, so the portfolio page can chart
+        // positions that sit in no watch group. Display only — queueing a
+        // fetch stays with get_status / get_intraday_history.
+        let intraday: HashMap<String, Value> = summary_codes
             .iter()
             .map(|c| (c.clone(), self.intraday_view(c)))
             .collect();
@@ -1058,11 +1060,27 @@ impl Core {
         if tool == "list_rules" {
             return Ok(json!(self.saved.rules));
         }
+        if tool == "export_data" {
+            // One JSON string packing the watch groups and the positions —
+            // settings and rules deliberately stay out (see import_data).
+            let payload = json!({
+                "app": "smallstocks-tw",
+                "version": 1,
+                "groups": self.saved.groups,
+                "activeGroup": self.saved.active_group,
+                "positions": self.saved.positions,
+            });
+            let text = serde_json::to_string_pretty(&payload)
+                .map_err(|e| format!("匯出序列化失敗：{e}"))?;
+            return Ok(Value::String(text));
+        }
         let mut next = self.clone();
         next.saved.normalize_groups();
         // Set by import_positions so its added/failed tally rides the returned
         // snapshot; every other command leaves it empty.
         let mut import_report: Option<Value> = None;
+        // Same idea for import_data's groups/positions/lots tally.
+        let mut data_report: Option<Value> = None;
         match tool {
             "set_watchlist" => {
                 let raw = args["symbols"].as_array().ok_or("需要 symbols 陣列")?;
@@ -1251,6 +1269,149 @@ impl Core {
                 import_report = Some(json!({"added": added, "failedLines": failed_lines}));
                 next.next_poll = 0;
             }
+            "import_data" => {
+                // Whole-file replace of the watch groups and positions from
+                // an export_data file. Anything that would silently lose
+                // data (bad envelope, over-cap groups, broken group names,
+                // an enabled rule losing its symbol) rejects the whole file
+                // and changes nothing; individual bad symbols or lots are
+                // skipped and tallied, mirroring import_positions.
+                let text = args["json"].as_str().ok_or("需要匯入 JSON")?;
+                let v: Value = serde_json::from_str(text)
+                    .map_err(|_| "匯入檔案不是有效的 JSON".to_string())?;
+                if v["app"].as_str() != Some("smallstocks-tw") {
+                    return Err("這不是 SmallStocks TW 的匯出檔案".into());
+                }
+                if v["version"].as_u64() != Some(1) {
+                    return Err("不支援的匯出檔案版本".into());
+                }
+                let raw_groups = v["groups"].as_array().ok_or("匯出檔案缺少分組資料")?;
+                if raw_groups.is_empty() {
+                    return Err("匯出檔案沒有任何分組".into());
+                }
+                if raw_groups.len() > MAX_WATCH_GROUPS {
+                    return Err("分組超過 10 個上限，檔案未匯入".into());
+                }
+                let mut skipped_symbols: Vec<String> = Vec::new();
+                let mut new_groups: Vec<WatchGroup> = Vec::new();
+                for g in raw_groups {
+                    let name = g["name"].as_str().map(str::trim).unwrap_or("");
+                    if name.is_empty() || name.chars().count() > 20 {
+                        return Err("分組名稱空白或超過 20 字，檔案未匯入".into());
+                    }
+                    if new_groups.iter().any(|x| x.name == name) {
+                        return Err(format!("分組名稱重複：{name}，檔案未匯入"));
+                    }
+                    let raw_codes = g["codes"].as_array().ok_or("分組缺少代號清單")?;
+                    let mut codes: Vec<String> = Vec::new();
+                    for s in raw_codes {
+                        match s.as_str().and_then(symbol) {
+                            Some(c) => {
+                                if !codes.contains(&c) {
+                                    codes.push(c)
+                                }
+                            }
+                            None => skipped_symbols.push(
+                                s.as_str().map(str::to_string).unwrap_or_else(|| s.to_string()),
+                            ),
+                        }
+                    }
+                    if codes.len() > MAX_GROUP_SYMBOLS {
+                        return Err(format!("分組「{name}」超過 30 檔上限，檔案未匯入"));
+                    }
+                    new_groups.push(WatchGroup {
+                        name: name.to_string(),
+                        codes,
+                    });
+                }
+                let raw_positions = v["positions"].as_array().ok_or("匯出檔案缺少持股資料")?;
+                let mut new_positions: Vec<Position> = Vec::new();
+                let mut skipped_lots = 0usize;
+                for p in raw_positions {
+                    let Some(code) = p["code"].as_str().and_then(symbol) else {
+                        skipped_symbols.push(
+                            p["code"]
+                                .as_str()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| p["code"].to_string()),
+                        );
+                        continue;
+                    };
+                    let Some(raw_lots) = p["lots"].as_array() else {
+                        continue;
+                    };
+                    let mut lots: Vec<Lot> = Vec::new();
+                    for l in raw_lots {
+                        let date = l["date"].as_str().unwrap_or("").trim();
+                        let valid = l["price"]
+                            .as_f64()
+                            .is_some_and(|n| n.is_finite() && n > 0.)
+                            && l["shares"]
+                                .as_f64()
+                                .is_some_and(|n| n.is_finite() && n > 0.)
+                            && (date.is_empty() || valid_lot_date(date));
+                        if valid {
+                            lots.push(Lot {
+                                date: date.to_string(),
+                                price: l["price"].as_f64().unwrap(),
+                                shares: l["shares"].as_f64().unwrap(),
+                            });
+                        } else {
+                            skipped_lots += 1;
+                        }
+                    }
+                    if lots.is_empty() {
+                        continue;
+                    }
+                    match new_positions.iter_mut().find(|x| x.code == code) {
+                        Some(x) => x.lots.extend(lots),
+                        None => new_positions.push(Position { code, lots }),
+                    }
+                }
+                // An enabled rule must keep its symbol in the monitoring
+                // union, exactly as set_watchlist guards it.
+                let mut union: Vec<String> = Vec::new();
+                for g in &new_groups {
+                    for c in &g.codes {
+                        if !union.contains(c) {
+                            union.push(c.clone());
+                        }
+                    }
+                }
+                for p in &new_positions {
+                    if !union.contains(&p.code) {
+                        union.push(p.code.clone());
+                    }
+                }
+                if next
+                    .saved
+                    .rules
+                    .iter()
+                    .any(|r| r.enabled && !union.contains(&r.symbol))
+                {
+                    return Err("匯入後將有啟用中的規則失去監看代號，檔案未匯入；請先停用或刪除相關規則".into());
+                }
+                let lot_total: usize = new_positions.iter().map(|p| p.lots.len()).sum();
+                data_report = Some(json!({
+                    "groups": new_groups.len(),
+                    "positions": new_positions.len(),
+                    "lots": lot_total,
+                    "skippedSymbols": skipped_symbols,
+                    "skippedLots": skipped_lots,
+                }));
+                next.saved.groups = new_groups;
+                next.saved.active_group = (v["activeGroup"].as_u64().unwrap_or(0) as usize)
+                    .min(next.saved.groups.len() - 1);
+                next.saved.positions = new_positions;
+                next.saved.sync_watchlist();
+                next.saved
+                    .intraday_cache
+                    .retain(|c, _| union.contains(c));
+                next.saved.local_intraday.retain(|c, _| union.contains(c));
+                next.last_fetch = None;
+                next.quotes.retain(|c, _| union.contains(c));
+                next.next_poll = 0;
+            }
             "set_settings" => {
                 if let Some(v) = args.get("alwaysOnTop") {
                     next.saved.settings.always_on_top = v.as_bool().ok_or("置頂格式錯誤")?;
@@ -1408,6 +1569,9 @@ impl Core {
         let mut snap = self.snapshot();
         if let Some(report) = import_report {
             snap["positionsImport"] = report;
+        }
+        if let Some(report) = data_report {
+            snap["dataImport"] = report;
         }
         Ok(snap)
     }
@@ -2828,6 +2992,162 @@ mod tests {
             us_market_open(night)
         )
         .is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn snapshot_intraday_covers_held_taiwan_codes_outside_the_watchlist() {
+        let dir =
+            std::env::temp_dir().join(format!("smallstocks-pfchart-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = Core::load(dir.join("state.json"), true).unwrap();
+        // 00685L is held but sits in no watch group; the portfolio day chart
+        // still needs its intraday view in every snapshot.
+        c.execute(
+            "add_lot",
+            json!({"code":"00685L","date":"2026-11-10","price":10.24,"shares":37000}),
+        )
+        .unwrap();
+        let snap = c.snapshot();
+        let intraday = snap["intraday"].as_object().unwrap();
+        assert!(intraday.contains_key("00685L"));
+        assert!(intraday["00685L"]["series"].is_null() || intraday["00685L"]["series"].is_object());
+        // A USD holding gets no Taiwan intraday view.
+        c.execute(
+            "add_lot",
+            json!({"code":"VOO","date":"2026-11-10","price":600,"shares":6.3}),
+        )
+        .unwrap();
+        let snap = c.snapshot();
+        assert!(!snap["intraday"].as_object().unwrap().contains_key("VOO"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn export_import_data_round_trips_groups_and_positions() {
+        let dir =
+            std::env::temp_dir().join(format!("smallstocks-export-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = Core::load(dir.join("state.json"), true).unwrap();
+        c.execute("set_watchlist", json!({"symbols":["2330","0050"]}))
+            .unwrap();
+        c.execute("add_watch_group", json!({"name":"美股"})).unwrap();
+        c.execute("set_watchlist", json!({"symbols":["VOO"]})).unwrap();
+        c.execute("set_active_group", json!({"index":0})).unwrap();
+        c.execute(
+            "add_lot",
+            json!({"code":"2330","date":"2026-11-10","price":1487,"shares":64}),
+        )
+        .unwrap();
+        c.execute(
+            "add_lot",
+            json!({"code":"00685L","date":"2026-11-10","price":10.24,"shares":37000}),
+        )
+        .unwrap();
+        c.execute(
+            "add_lot",
+            json!({"code":"00685L","date":"2026-11-12","price":10.05,"shares":1000}),
+        )
+        .unwrap();
+        let text = c
+            .execute("export_data", json!({}))
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        let parsed: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["app"], "smallstocks-tw");
+        assert_eq!(parsed["version"], 1);
+
+        let dir2 =
+            std::env::temp_dir().join(format!("smallstocks-import-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir2).unwrap();
+        let mut c2 = Core::load(dir2.join("state.json"), true).unwrap();
+        let snap = c2.execute("import_data", json!({"json": text})).unwrap();
+        assert_eq!(snap["dataImport"]["groups"], 2);
+        assert_eq!(snap["dataImport"]["positions"], 2);
+        assert_eq!(snap["dataImport"]["lots"], 3);
+        assert_eq!(snap["dataImport"]["skippedSymbols"], json!([]));
+        assert_eq!(snap["dataImport"]["skippedLots"], 0);
+        assert_eq!(c2.saved.groups.len(), 2);
+        assert_eq!(c2.saved.groups[0].codes, vec!["2330", "0050"]);
+        assert_eq!(c2.saved.groups[1].name, "美股");
+        assert_eq!(c2.saved.groups[1].codes, vec!["VOO"]);
+        assert_eq!(c2.saved.active_group, 0);
+        assert_eq!(c2.saved.watchlist, vec!["2330", "0050"]);
+        let lev = c2
+            .saved
+            .positions
+            .iter()
+            .find(|p| p.code == "00685L")
+            .unwrap();
+        assert_eq!(lev.lots.len(), 2);
+        assert_eq!(lev.lots[1].shares, 1000.);
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(dir2).unwrap();
+    }
+    #[test]
+    fn import_data_rejects_bad_envelopes_and_skips_bad_rows() {
+        let dir =
+            std::env::temp_dir().join(format!("smallstocks-imp2-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = Core::load(dir.join("state.json"), true).unwrap();
+        c.execute("set_watchlist", json!({"symbols":["2330"]}))
+            .unwrap();
+        assert!(c.execute("import_data", json!({"json": "not json"})).is_err());
+        assert!(
+            c.execute("import_data", json!({"json": "{\"app\":\"other\",\"version\":1,\"groups\":[],\"positions\":[]}"}))
+                .is_err()
+        );
+        assert!(
+            c.execute("import_data", json!({"json": "{\"app\":\"smallstocks-tw\",\"version\":2,\"groups\":[],\"positions\":[]}"}))
+                .is_err()
+        );
+        // Rejections changed nothing.
+        assert_eq!(c.saved.groups[0].codes, vec!["2330"]);
+
+        let mixed = json!({
+            "app": "smallstocks-tw",
+            "version": 1,
+            "activeGroup": 9,
+            "groups": [
+                {"name": "指數", "codes": ["IX0001", "!!bad", "0050", "0050"]},
+            ],
+            "positions": [
+                {"code": "2330", "lots": [
+                    {"date": "2026-11-10", "price": 1487, "shares": 64},
+                    {"date": "2026-13-01", "price": 1500, "shares": 10},
+                    {"date": "", "price": -1, "shares": 10},
+                ]},
+                {"code": "??", "lots": [{"date": "", "price": 1, "shares": 1}]},
+            ],
+        })
+        .to_string();
+        let snap = c.execute("import_data", json!({"json": mixed})).unwrap();
+        assert_eq!(snap["dataImport"]["groups"], 1);
+        assert_eq!(snap["dataImport"]["positions"], 1);
+        assert_eq!(snap["dataImport"]["lots"], 1);
+        assert_eq!(snap["dataImport"]["skippedLots"], 2);
+        assert_eq!(
+            snap["dataImport"]["skippedSymbols"],
+            json!(["!!bad", "??"])
+        );
+        // The previous group content is gone (whole-file replace), the bad
+        // lots were dropped, the duplicate code collapsed, and an
+        // out-of-range activeGroup clamped to the last group.
+        assert_eq!(c.saved.groups.len(), 1);
+        assert_eq!(c.saved.groups[0].codes, vec!["^TWII", "0050"]);
+        assert_eq!(c.saved.active_group, 0);
+        assert_eq!(c.saved.positions.len(), 1);
+        assert_eq!(c.saved.positions[0].lots.len(), 1);
+
+        // Over the group cap the file is refused outright.
+        let many = json!({
+            "app": "smallstocks-tw", "version": 1,
+            "groups": (0..11).map(|i| json!({"name": format!("G{i}"), "codes": []})).collect::<Vec<_>>(),
+            "positions": [],
+        })
+        .to_string();
+        assert!(c.execute("import_data", json!({"json": many})).is_err());
+        assert_eq!(c.saved.groups.len(), 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

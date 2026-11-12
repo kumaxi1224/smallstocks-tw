@@ -20,13 +20,14 @@ import { findNewer, installNewer } from "./updates.ts";
 import { mcpSetup } from "./mcp-setup.ts";
 import type { McpKind } from "./mcp-setup.ts";
 import type { Newer } from "./updates.ts";
-import { desktop, request, search, daily } from "./client.ts";
+import { desktop, request, search, daily, exportData, importData } from "./client.ts";
 import {
   esc,
   number,
   change,
   points,
   shellOpacity,
+  shouldKeepScroll,
   time,
   stale,
   ruleText,
@@ -38,10 +39,12 @@ import {
   aging,
   oldestDataAt,
   portfolioSummary,
+  portfolioIntradaySeries,
+  formatMoney,
   BOOK_NOTE,
 } from "./model.ts";
 import { historyBody } from "./daily-view.ts";
-import { trendCell } from "./inline-trend.ts";
+import { trendCell, portfolioChart } from "./inline-trend.ts";
 import { disguiseMarkup, bindDisguise, updateDisguise } from "./disguise.ts";
 import {
   minimalMarkup,
@@ -62,6 +65,11 @@ document.body.dataset.platform = isMac ? "macos" : "windows";
 const app = document.querySelector<HTMLDivElement>("#app")!;
 let state: Snapshot;
 let tab = "watch";
+/** The view render() last painted, and a one-shot reset request from a
+ * deliberate navigation action (group switch, rule edit). Same-view
+ * re-renders keep the scroll place; view switches start at the top. */
+let renderedTab: string | null = null;
+let scrollResetPending = false;
 let editing: Rule | undefined;
 let busy = false;
 let searchVersion = 0;
@@ -525,10 +533,48 @@ function groupTabs() {
 let expandedPosition: string | null = null;
 /** Outcome line of the last positions import, kept across re-renders. */
 let positionsMessage = "";
+/** Outcome line of the last data export/import on the settings page. */
+let dataMessage = "";
 /** Prices the portfolio page was last rendered with; the poll compares
  * against it so the page follows live quotes without a full tab re-render
  * policy of its own. */
 let positionsSig = "";
+/** Last time the positions page asked the core to fetch minute samples for
+ * held Taiwan codes; the ask is throttled to the core's own 60-second
+ * intraday freshness window so sitting on the page never hammers Yahoo. */
+let lastIntradayAsk = 0;
+/** Aggregated points behind the portfolio day chart currently on screen,
+ * kept for the hover readout; the readout's resting text beside it. */
+let pfHover: {
+  points: { at: number; value: number }[];
+  baseline: number | null;
+} | null = null;
+let pfReadoutDefault = "";
+const hm = (at: number) =>
+  new Date(at).toLocaleTimeString("zh-TW", {
+    hour12: false,
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZone: "Asia/Taipei",
+  });
+/**
+ * Asks the core to queue minute-sample fetches for every held Taiwan code —
+ * the only trigger for the portfolio day chart's data. Display-only: the
+ * samples ride the existing intraday queue (never the alert path), the
+ * core's 60-second freshness check dedupes repeat asks, and each response
+ * is discarded here — fresh series arrive with the next poll's snapshot.
+ */
+function ensurePositionIntraday() {
+  const at = Date.now();
+  if (at - lastIntradayAsk < 60_000) return;
+  const codes = (state.positions ?? [])
+    .map((p) => p.code)
+    .filter((c) => !isYahooSymbol(c));
+  if (!codes.length) return;
+  lastIntradayAsk = at;
+  for (const c of codes)
+    void request("get_intraday_history", { symbol: c }).catch(() => {});
+}
 /**
  * Price inputs for every held code, from the same sources the watch rows use:
  * live quotes while the market runs; after the Taiwan close, Taiwan codes use
@@ -565,12 +611,75 @@ function positionsSignature() {
       p.code,
       quotes[p.code]?.price ?? null,
       quotes[p.code]?.previous ?? null,
+      // The day chart follows the minute samples too: a refetched series
+      // (new fetchedAt / more points) re-renders the page like a price move.
+      state.intraday[p.code]?.series?.fetchedAt ?? 0,
+      state.intraday[p.code]?.series?.points.length ?? 0,
     ]),
   ]);
 }
+/**
+ * The portfolio day-chart card (TWD book only): the aggregate minute-value
+ * line from model.portfolioIntradaySeries over the intraday samples the
+ * snapshot carries, drawn by inline-trend.portfolioChart. The headline
+ * figures deliberately repeat the TWD summary card (live/close pricing),
+ * while the line itself aggregates the Yahoo minute samples — the two can
+ * differ by a sample's delay, and the card says samples may lag.
+ */
+function portfolioChartSection(
+  summary: ReturnType<typeof portfolioSummary>,
+  quotes: Record<string, PositionQuote>,
+) {
+  pfHover = null;
+  const twd = summary.totals.find((t) => t.currency === "TWD");
+  if (!twd) return "";
+  const held = (state.positions ?? []).filter((p) => !isYahooSymbol(p.code));
+  const samples: Record<string, { at: number; price: number | null }[]> = {};
+  const previous: Record<string, number | null> = {};
+  let uncovered = 0;
+  for (const p of held) {
+    const pts = state.intraday[p.code]?.series?.points ?? null;
+    samples[p.code] = pts ?? [];
+    previous[p.code] = quotes[p.code]?.previous ?? null;
+    if (!pts?.some((pt) => pt.price != null) && previous[p.code] == null)
+      uncovered++;
+  }
+  const agg = portfolioIntradaySeries(state.positions ?? [], samples, previous);
+  const sign =
+    twd.dayPnl == null || twd.dayPnl === 0
+      ? "flat"
+      : twd.dayPnl > 0
+        ? "up"
+        : "down";
+  const head = `<div class="pf-head"><h2>組合總值走勢（台幣）</h2><span class="pf-now pos-num ${sign}">${formatMoney(twd.marketValue, "TWD")}${twd.dayPnl != null ? `　${formatMoney(twd.dayPnl, "TWD", true)}${twd.dayPnlPercent != null ? `（${change(twd.dayPnlPercent)}）` : ""}` : ""}</span></div>`;
+  if (agg.points.length < 2) {
+    pfReadoutDefault =
+      agg.previousTotal != null
+        ? `昨收 ${formatMoney(agg.previousTotal, "TWD")} · 尚無今日走勢`
+        : "尚無今日走勢";
+    return `<div class="pf-card">${head}<p class="pf-empty">${pfReadoutDefault}（分時資料取得後自動更新）</p></div>`;
+  }
+  pfHover = { points: agg.points, baseline: agg.previousTotal };
+  const meta = [
+    agg.previousTotal != null
+      ? `昨收 ${formatMoney(agg.previousTotal, "TWD")}`
+      : "",
+    `高 ${formatMoney(agg.high, "TWD")}`,
+    `低 ${formatMoney(agg.low, "TWD")}`,
+    `${hm(agg.firstAt!)}–${hm(agg.lastAt!)}`,
+    uncovered ? `${uncovered} 檔尚無資料，未計入` : "",
+    "分時樣本可能延遲",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  pfReadoutDefault = meta;
+  const label = `台幣持股組合總值日內走勢，目前 ${formatMoney(agg.lastValue, "TWD")}${agg.previousTotal != null ? `，昨收 ${formatMoney(agg.previousTotal, "TWD")}` : ""}`;
+  return `<div class="pf-card">${head}<div class="pf-chart-wrap">${portfolioChart(agg.points, agg.previousTotal, sign, label)}</div><p class="pf-readout">${esc(meta)}</p></div>`;
+}
 function positionsPage() {
   const positions = state.positions ?? [];
-  const summary = portfolioSummary(positions, positionQuotes());
+  const quotes = positionQuotes();
+  const summary = portfolioSummary(positions, quotes);
   const today = new Date(state.now).toLocaleDateString("sv-SE", {
     timeZone: "Asia/Taipei",
   });
@@ -578,27 +687,39 @@ function positionsPage() {
     n == null || n === 0 ? "flat" : n > 0 ? "up" : "down";
   const cards = summary.totals
     .map(
-      (t) => `<div class="pos-card"><h2>${t.currency === "TWD" ? "新台幣" : "美元"} 持股</h2><div class="pos-line"><span>總市值</span><span class="pos-total">${t.marketValue == null ? "—" : number(t.marketValue)}</span></div><div class="pos-line"><span>今日損益</span><span class="pos-num ${sign(t.dayPnl)}">${t.dayPnl == null ? "—" : points(t.dayPnl)}${t.dayPnlPercent != null ? `（${change(t.dayPnlPercent)}）` : ""}</span></div><div class="pos-line"><span>總損益</span><span class="pos-num ${sign(t.totalPnl)}">${t.totalPnl == null ? "—" : points(t.totalPnl)}${t.totalPnlPercent != null ? `（${change(t.totalPnlPercent)}）` : ""}</span></div></div>`,
+      (t) => `<div class="pos-card"><h2>${t.currency === "TWD" ? "新台幣" : "美元"} 持股</h2><div class="pos-line"><span>總市值</span><span class="pos-total">${t.marketValue == null ? "—" : formatMoney(t.marketValue, t.currency)}</span></div><div class="pos-line"><span>今日損益</span><span class="pos-num ${sign(t.dayPnl)}">${t.dayPnl == null ? "—" : formatMoney(t.dayPnl, t.currency, true)}${t.dayPnlPercent != null ? `（${change(t.dayPnlPercent)}）` : ""}</span></div><div class="pos-line"><span>總損益</span><span class="pos-num ${sign(t.totalPnl)}">${t.totalPnl == null ? "—" : formatMoney(t.totalPnl, t.currency, true)}${t.totalPnlPercent != null ? `（${change(t.totalPnlPercent)}）` : ""}</span></div></div>`,
     )
     .join("");
   const byCode = new Map(summary.positions.map((r) => [r.code, r]));
-  const rowsHtml = positions
-    .map((p) => {
-      const r = byCode.get(p.code)!;
-      const name = state.quotes[p.code]?.name ?? "";
-      const expanded = expandedPosition === p.code;
-      const lots = expanded
-        ? `<div class="pos-lots">${p.lots
-            .map(
-              (l, i) =>
-                `<div class="pos-lot"><span>${esc(l.date || "未記錄日期")}</span><span>購入價 ${number(l.price)}</span><span>${number(l.shares)} 股</span><button type="button" data-del-lot="${esc(p.code)}:${i}">刪除</button></div>`,
-            )
-            .join("")}<div class="pos-lot-actions"><button type="button" class="secondary" data-add-lot="${esc(p.code)}">＋ 加一筆</button><button type="button" class="secondary" data-del-position="${esc(p.code)}">刪除整檔持股</button></div></div>`
-        : "";
-      return `<div class="pos-row-wrap"><div class="pos-row" data-expand="${esc(p.code)}" title="點擊展開購入批次"><span class="pos-name"><span class="stock-code">${esc(displaySymbol(p.code))}</span><strong>${esc(name)}</strong></span><span class="pos-cell">${number(r.shares)}</span><span class="pos-cell">${number(r.avgPrice)}</span><span class="pos-cell">${number(r.price)}</span><span class="pos-cell">${number(r.marketValue)}</span><span class="pos-cell pos-num ${sign(r.dayPnl)}">${r.dayPnl == null ? "—" : points(r.dayPnl)}</span><span class="pos-cell pos-num ${sign(r.totalPnl)}">${r.totalPnlPercent == null ? "—" : change(r.totalPnlPercent)}</span></div>${lots}</div>`;
+  const rowFor = (p: (typeof positions)[number]) => {
+    const r = byCode.get(p.code)!;
+    const name = state.quotes[p.code]?.name ?? "";
+    const expanded = expandedPosition === p.code;
+    const lots = expanded
+      ? `<div class="pos-lots">${p.lots
+          .map(
+            (l, i) =>
+              `<div class="pos-lot"><span>${esc(l.date || "未記錄日期")}</span><span>購入價 ${number(l.price)}</span><span>${number(l.shares)} 股</span><button type="button" data-del-lot="${esc(p.code)}:${i}">刪除</button></div>`,
+          )
+          .join("")}<div class="pos-lot-actions"><button type="button" class="secondary" data-add-lot="${esc(p.code)}">＋ 加一筆</button><button type="button" class="secondary" data-del-position="${esc(p.code)}">刪除整檔持股</button></div></div>`
+      : "";
+    return `<div class="pos-row-wrap"><div class="pos-row" data-expand="${esc(p.code)}" title="點擊展開購入批次"><span class="pos-name"><span class="stock-code">${esc(displaySymbol(p.code))}</span><strong>${esc(name)}</strong></span><span class="pos-cell">${number(r.shares)}</span><span class="pos-cell">${number(r.avgPrice)}</span><span class="pos-cell">${number(r.price)}</span><span class="pos-cell">${formatMoney(r.marketValue, r.currency)}</span><span class="pos-cell pos-pnl pos-num ${sign(r.dayPnl)}"><span>${r.dayPnl == null ? "—" : formatMoney(r.dayPnl, r.currency, true)}</span><span class="pos-pct">${r.dayPnlPercent == null ? "—" : `(${change(r.dayPnlPercent)})`}</span></span><span class="pos-cell pos-pnl pos-num ${sign(r.totalPnl)}"><span>${r.totalPnl == null ? "—" : formatMoney(r.totalPnl, r.currency, true)}</span><span class="pos-pct">${r.totalPnlPercent == null ? "—" : `(${change(r.totalPnlPercent)})`}</span></span></div>${lots}</div>`;
+  };
+  // Positions are sectioned by market — Taiwan (TWD) first, then US (USD) —
+  // matching how the summary cards split by currency. A market with no
+  // holdings renders no section at all; order inside a section is the
+  // recorded order.
+  const sections = (["TWD", "USD"] as const)
+    .map((currency) => {
+      const mine = positions.filter(
+        (p) => byCode.get(p.code)!.currency === currency,
+      );
+      if (!mine.length) return "";
+      const total = summary.totals.find((t) => t.currency === currency);
+      return `<div class="pos-section"><div class="pos-section-head"><h2>${currency === "TWD" ? "台股" : "美股"}</h2><span class="pos-section-total">${formatMoney(total?.marketValue ?? null, currency)}</span></div><div class="pos-table"><div class="pos-head"><span>代號 · 名稱</span><span>股數</span><span>均價</span><span>現價</span><span>市值</span><span>今日損益</span><span>總損益</span></div>${mine.map(rowFor).join("")}</div></div>`;
     })
     .join("");
-  return `<div class="pane"><h1>你的投資組合</h1><p class="intro">記錄每檔的購入批次，市值與損益用目前報價自動計算；台股收盤後以官方收盤計。台幣與美元分開彙總，不相加。</p>${positions.length ? `<div class="pos-summary">${cards}</div>` : ""}<form id="lot-form"><div class="form-grid"><label>代號<input name="code" id="lot-code" required placeholder="2330 或 VOO"></label><label>購入日期<input name="date" type="date" value="${today}"></label><label>購入價（每股）<input name="price" type="number" step="any" required placeholder="例如 2395"></label><label>股數<input name="shares" type="number" step="any" required placeholder="例如 64，可含碎股"></label></div><button class="primary" type="submit">新增一筆</button></form><div class="pos-import"><h2>貼上匯入</h2><p class="note">一行一筆：代號, 日期, 購入價, 股數；日期可省略（代號, 購入價, 股數）。分隔可用逗號、Tab 或空白，價格不要加千分位逗號。</p><textarea id="import-text" rows="4" placeholder="2330, 2026-11-10, 2395, 64"></textarea><button id="import-btn" class="secondary" type="button">匯入</button>${positionsMessage ? `<p class="note">${esc(positionsMessage)}</p>` : ""}</div>${positions.length ? `<div class="positions-list"><div class="pos-table"><div class="pos-head"><span>代號 · 名稱</span><span>股數</span><span>均價</span><span>現價</span><span>市值</span><span>今日損益</span><span>總損益%</span></div>${rowsHtml}</div></div>` : '<div class="empty">還沒有持股紀錄。用上方表單新增一筆，或用「貼上匯入」一次貼上多筆，組合市值與每日損益就會自動計算。</div>'}</div>`;
+  return `<div class="pane"><h1>你的投資組合</h1><p class="intro">記錄每檔的購入批次，市值與損益用目前報價自動計算；台股收盤後以官方收盤計。台幣與美元分開彙總，不相加。</p>${positions.length ? `<div class="pos-summary">${cards}</div>${portfolioChartSection(summary, quotes)}` : ""}<form id="lot-form"><div class="form-grid"><label>代號<input name="code" id="lot-code" required placeholder="2330 或 VOO"></label><label>購入日期<input name="date" type="date" value="${today}"></label><label>購入價（每股）<input name="price" type="number" step="any" required placeholder="例如 2395"></label><label>股數<input name="shares" type="number" step="any" required placeholder="例如 64，可含碎股"></label></div><button class="primary" type="submit">新增一筆</button></form><div class="pos-import"><h2>貼上匯入</h2><p class="note">一行一筆：代號, 日期, 購入價, 股數；日期可省略（代號, 購入價, 股數）。分隔可用逗號、Tab 或空白，價格不要加千分位逗號。</p><textarea id="import-text" rows="4" placeholder="2330, 2026-11-10, 2395, 64"></textarea><button id="import-btn" class="secondary" type="button">匯入</button>${positionsMessage ? `<p class="note">${esc(positionsMessage)}</p>` : ""}</div>${positions.length ? `<div class="positions-list">${sections}</div>` : '<div class="empty">還沒有持股紀錄。用上方表單新增一筆，或用「貼上匯入」一次貼上多筆，組合市值與每日損益就會自動計算。</div>'}</div>`;
 }
 function watch() {
   const a = state.settings.appearance;
@@ -615,7 +736,14 @@ function render() {
   document.body.dataset.page = tab;
   apply();
   content.onkeydown = null;
-  content.scrollTop = 0;
+  // Same-view re-renders (poll ticks, background refreshes, setting toggles)
+  // keep the scroll place; only a view switch — or an explicit reset from a
+  // navigation action — goes back to the top.
+  const savedScrollTop = shouldKeepScroll(renderedTab, tab, scrollResetPending)
+    ? content.scrollTop
+    : 0;
+  scrollResetPending = false;
+  renderedTab = tab;
   document
     .querySelectorAll("[data-tab]")
     .forEach((e) =>
@@ -625,6 +753,7 @@ function render() {
   if (tab === "positions") {
     content.innerHTML = positionsPage();
     positionsSig = positionsSignature();
+    ensurePositionIntraday();
   }
   if (tab === "daily") dailyPage();
   if (tab === "settings")
@@ -648,7 +777,7 @@ function render() {
       )
       .join(
         "",
-      )}</div><div class="setting-row"><label>顯示內容<select id="display-mode"><option value="numbers" ${state.settings.rowDisplay === "numbers" || !state.settings.rowDisplay ? "selected" : ""}>純數字</option><option value="trend" ${state.settings.rowDisplay === "trend" ? "selected" : ""}>單行走勢</option><option value="minimal" ${state.settings.rowDisplay === "minimal" ? "selected" : ""}>極簡：方向與名稱</option></select></label><label class="setting-check"><input id="show-codes" type="checkbox" ${state.settings.showCodes ? "checked" : ""}> 顯示代號</label><label class="setting-check"><input id="hide-names" type="checkbox" ${state.settings.hideNames ? "checked" : ""}> 只顯示代號（隱藏名稱）</label><label class="setting-check"><input id="show-change-points" type="checkbox" ${state.settings.showChangePoints !== false ? "checked" : ""}> 顯示漲跌點數</label></div><div class="note density-note">極簡方向為當日漲跌；— 平盤，○ 資料未確認。名稱尚未取得時會使用代號。</div><div class="setting-row"><label class="setting-check"><input id="always-on-top" type="checkbox" ${state.settings.alwaysOnTop !== false ? "checked" : ""}> 視窗保持置頂</label></div><div class="setting-row"><div><strong>視窗透明度</strong><small>只讓主視窗背景變透明，文字與數字維持不透明。</small></div><span class="opacity-control"><input id="window-opacity" type="range" min="40" max="100" step="5" value="${Math.round(shellOpacity(state.settings.windowOpacity) * 100)}"><output id="window-opacity-value">${Math.round(shellOpacity(state.settings.windowOpacity) * 100)}%</output></span></div><div class="setting-row"><div><strong>監看狀態</strong><small>隱藏視窗仍會監看，暫停則停止判定。</small></div><button id="pause" class="secondary">${state.settings.paused ? "繼續監看" : "暫停監看"}</button></div>${desktop ? `<div class="setting-row"><div><strong>程式</strong><small>找不到系統匣時，從這裡重新啟動或結束。結束後就不再監看。</small></div><span class="update-actions"><button id="restart-app" class="secondary">重新啟動</button><button id="quit-app" class="secondary">結束程式</button></span></div>` : ""}<label class="setting-row">更新間隔（秒）<input id="refresh" type="number" min="5" max="300" value="${state.settings.refreshSeconds}"></label><button id="save-refresh" class="secondary">儲存更新間隔</button><div class="setting-row"><label>行情來源<select id="quote-source"><option value="mis" ${state.settings.quoteSource !== "shioaji" ? "selected" : ""}>證交所 MIS（快照，約 1–2 分鐘）</option><option value="shioaji" ${state.settings.quoteSource === "shioaji" ? "selected" : ""}>永豐 Shioaji（即時逐筆）</option></select></label><label>sidecar 連接埠<input id="sidecar-port" type="number" min="1024" max="65535" value="${state.settings.sidecarPort ?? 18765}"></label></div><div class="note">Shioaji 需先完成永豐 API 開通並在本機啟動 sidecar（見 sidecar/README）；sidecar 無回應或缺檔時自動退回 MIS，頁尾會註明。${state.sourceNote ? `<br>目前狀態：${esc(state.sourceNote)}` : ""}</div>${desktop ? `<div class="setting-row"><label class="setting-check"><input id="update-check" type="checkbox" ${state.settings.updateCheck !== false ? "checked" : ""}> 啟動時檢查新版本</label></div><div class="setting-row"><div><strong>版本 ${esc(appVersion)}</strong><small id="update-status">${esc(updateMessage || "只會連到 GitHub 詢問有沒有新版本")}</small></div><span class="update-actions"><button id="check-update" class="secondary" ${updateBusy ? "disabled" : ""}>檢查更新</button>${newer ? (newer.update ? `<button id="install-update" class="primary">更新並重新啟動</button>` : `<button id="open-release" class="secondary">前往下載頁</button>`) : ""}</span></div>` : ""}${desktop ? `<div class="setting-row"><div><strong>agent（MCP，選配）</strong><small id="mcp-status">${esc(mcpMessage || "複製後貼到 Claude、Codex、Gemini 或其他支援本機 MCP 的程式；基本監看不需要它")}</small></div><span class="update-actions"><button id="mcp-json" class="secondary">複製 JSON 設定</button><button id="mcp-claude" class="secondary">Claude Code 指令</button><button id="mcp-codex" class="secondary">Codex 指令</button><button id="mcp-gemini" class="secondary">Gemini 指令</button></span></div>` : ""}<div class="note">所有外觀預設無聲。灰階通知跟隨外觀。<br>${privacyShortcutLabel} 隱藏全部視窗，從系統匣恢復。<br>${state.privacyShortcutError ? esc(state.privacyShortcutError) + "<br>" : ""}資料：TWSE MIS；來源時間與取得時間分開顯示。<br>更新檢查只向 GitHub 詢問版本，不傳送任何使用資料；要更新時由你按下按鈕才會下載安裝。<br>首次觀測只建立基準；過期或缺少成交價時不觸發。<br>${desktop ? "agent：上方按鈕複製連接設定，說明見 README。" : "瀏覽器僅顯示合成預覽；桌面版才會實際監看與提供 MCP。"}</div></div>`;
+      )}</div><div class="setting-row"><label>顯示內容<select id="display-mode"><option value="numbers" ${state.settings.rowDisplay === "numbers" || !state.settings.rowDisplay ? "selected" : ""}>純數字</option><option value="trend" ${state.settings.rowDisplay === "trend" ? "selected" : ""}>單行走勢</option><option value="minimal" ${state.settings.rowDisplay === "minimal" ? "selected" : ""}>極簡：方向與名稱</option></select></label><label class="setting-check"><input id="show-codes" type="checkbox" ${state.settings.showCodes ? "checked" : ""}> 顯示代號</label><label class="setting-check"><input id="hide-names" type="checkbox" ${state.settings.hideNames ? "checked" : ""}> 只顯示代號（隱藏名稱）</label><label class="setting-check"><input id="show-change-points" type="checkbox" ${state.settings.showChangePoints !== false ? "checked" : ""}> 顯示漲跌點數</label></div><div class="note density-note">極簡方向為當日漲跌；— 平盤，○ 資料未確認。名稱尚未取得時會使用代號。</div><div class="setting-row"><label class="setting-check"><input id="always-on-top" type="checkbox" ${state.settings.alwaysOnTop !== false ? "checked" : ""}> 視窗保持置頂</label></div><div class="setting-row"><div><strong>視窗透明度</strong><small>只讓主視窗背景變透明，文字與數字維持不透明。</small></div><span class="opacity-control"><input id="window-opacity" type="range" min="40" max="100" step="5" value="${Math.round(shellOpacity(state.settings.windowOpacity) * 100)}"><output id="window-opacity-value">${Math.round(shellOpacity(state.settings.windowOpacity) * 100)}%</output></span></div><div class="setting-row"><div><strong>監看狀態</strong><small>隱藏視窗仍會監看，暫停則停止判定。</small></div><button id="pause" class="secondary">${state.settings.paused ? "繼續監看" : "暫停監看"}</button></div>${desktop ? `<div class="setting-row"><div><strong>程式</strong><small>找不到系統匣時，從這裡重新啟動或結束。結束後就不再監看。</small></div><span class="update-actions"><button id="restart-app" class="secondary">重新啟動</button><button id="quit-app" class="secondary">結束程式</button></span></div>` : ""}<label class="setting-row">更新間隔（秒）<input id="refresh" type="number" min="5" max="300" value="${state.settings.refreshSeconds}"></label><button id="save-refresh" class="secondary">儲存更新間隔</button><div class="setting-row"><label>行情來源<select id="quote-source"><option value="mis" ${state.settings.quoteSource !== "shioaji" ? "selected" : ""}>證交所 MIS（快照，約 1–2 分鐘）</option><option value="shioaji" ${state.settings.quoteSource === "shioaji" ? "selected" : ""}>永豐 Shioaji（即時逐筆）</option></select></label><label>sidecar 連接埠<input id="sidecar-port" type="number" min="1024" max="65535" value="${state.settings.sidecarPort ?? 18765}"></label></div><div class="note">Shioaji 需先完成永豐 API 開通並在本機啟動 sidecar（見 sidecar/README）；sidecar 無回應或缺檔時自動退回 MIS，頁尾會註明。${state.sourceNote ? `<br>目前狀態：${esc(state.sourceNote)}` : ""}</div>${desktop ? `<div class="setting-row"><label class="setting-check"><input id="update-check" type="checkbox" ${state.settings.updateCheck !== false ? "checked" : ""}> 啟動時檢查新版本</label></div><div class="setting-row"><div><strong>版本 ${esc(appVersion)}</strong><small id="update-status">${esc(updateMessage || "只會連到 GitHub 詢問有沒有新版本")}</small></div><span class="update-actions"><button id="check-update" class="secondary" ${updateBusy ? "disabled" : ""}>檢查更新</button>${newer ? (newer.update ? `<button id="install-update" class="primary">更新並重新啟動</button>` : `<button id="open-release" class="secondary">前往下載頁</button>`) : ""}</span></div>` : ""}${desktop ? `<div class="setting-row"><div><strong>agent（MCP，選配）</strong><small id="mcp-status">${esc(mcpMessage || "複製後貼到 Claude、Codex、Gemini 或其他支援本機 MCP 的程式；基本監看不需要它")}</small></div><span class="update-actions"><button id="mcp-json" class="secondary">複製 JSON 設定</button><button id="mcp-claude" class="secondary">Claude Code 指令</button><button id="mcp-codex" class="secondary">Codex 指令</button><button id="mcp-gemini" class="secondary">Gemini 指令</button></span></div>` : ""}<div class="setting-row"><div><strong>自選與持股資料</strong><small>把自選分組與持股（全部購入批次）匯出成一份 JSON 備份，設定與規則不包含在內；匯入會整份覆蓋目前的自選分組與持股。</small></div><span class="update-actions"><button id="export-data" class="secondary">匯出自選與持股</button><button id="import-data-btn" class="secondary">匯入自選與持股</button><input id="import-file" type="file" accept=".json,application/json" hidden></span></div>${dataMessage ? `<div class="note">${esc(dataMessage)}</div>` : ""}<div class="note">所有外觀預設無聲。灰階通知跟隨外觀。<br>${privacyShortcutLabel} 隱藏全部視窗，從系統匣恢復。<br>${state.privacyShortcutError ? esc(state.privacyShortcutError) + "<br>" : ""}資料：TWSE MIS；來源時間與取得時間分開顯示。<br>更新檢查只向 GitHub 詢問版本，不傳送任何使用資料；要更新時由你按下按鈕才會下載安裝。<br>首次觀測只建立基準；過期或缺少成交價時不觸發。<br>${desktop ? "agent：上方按鈕複製連接設定，說明見 README。" : "瀏覽器僅顯示合成預覽；桌面版才會實際監看與提供 MCP。"}</div></div>`;
   if (tab === "rules")
     content.innerHTML = `<div class="pane"><h1>只在你在意的時候</h1><p class="intro">首次觀測建立基準，之後跨過門檻才提醒。</p><form id="rule-form"><div class="form-grid"><label>股票代號<input name="symbol" required placeholder="2330" value="${esc(editing?.symbol ?? state.watchlist.find((c) => c !== "t00") ?? "2330")}"></label><label>觀測項目<select name="metric"><option value="price">成交價（元）</option><option value="changePercent" ${editing?.metric === "changePercent" ? "selected" : ""}>漲跌幅（成交價，%）</option><option value="mid" ${editing?.metric === "mid" ? "selected" : ""}>買賣中間價（委託價，元）</option><option value="midChangePercent" ${editing?.metric === "midChangePercent" ? "selected" : ""}>漲跌幅（買賣中間價，%）</option></select></label><label>方向<select name="direction"><option value="above">由下往上跨過</option><option value="below" ${editing?.direction === "below" ? "selected" : ""}>由上往下跨過</option></select></label><label>門檻<input name="threshold" type="number" step="any" required placeholder="例如 1000" value="${editing?.threshold ?? ""}"></label><label>通知<select name="channel">${[
       ["strip", "細條"],
@@ -666,6 +795,7 @@ function render() {
   if (tab === "history")
     content.innerHTML = `<div class="pane"><h1>發生過的事</h1><p class="intro">最多保留 500 則，時間為資料來源的台灣時間。</p>${state.events.map((e) => `<div class="event"><time>${time(e.sourceAt)}</time><div><strong>${esc(e.text)}</strong><small>偵測於 ${time(e.detectedAt)} · 規則 ${esc(e.ruleId.slice(0, 8))}</small></div></div>`).join("") || '<div class="empty">目前還沒有符合規則的事件。<br>不必一直盯著，有事會告訴你。</div>'}</div>`;
 
+  content.scrollTop = savedScrollTop;
   if (
     tab === "watch" &&
     ["terminal", "txt"].includes(state.settings.appearance)
@@ -684,6 +814,7 @@ function render() {
 }
 function manage() {
   document.body.dataset.page = "manage";
+  renderedTab = "manage";
   apply();
   const groups = viewGroups(),
     active = viewActive();
@@ -766,6 +897,94 @@ function manage() {
   });
 }
 function bind() {
+  // Portfolio day chart hover: swap the readout line for the aggregate
+  // value at the hovered session minute (latest point at or before it),
+  // restoring the resting summary on leave.
+  const pfWrap = document.querySelector<HTMLElement>(".pf-chart-wrap");
+  const pfReadout = document.querySelector<HTMLElement>(".pf-readout");
+  if (pfWrap && pfReadout && pfHover?.points.length) {
+    const data = pfHover;
+    pfWrap.addEventListener("mousemove", (e) => {
+      const rect = pfWrap.getBoundingClientRect();
+      if (!rect.width) return;
+      const frac = Math.max(
+        0,
+        Math.min(1, (e.clientX - rect.left) / rect.width),
+      );
+      const first = data.points[0]!.at;
+      const dayStart =
+        Math.floor((first + 28800000) / 86400000) * 86400000 - 28800000;
+      const target = dayStart + 9 * 3600000 + frac * 4.5 * 3600000;
+      let pt = data.points[0]!;
+      for (const p of data.points) {
+        if (p.at <= target) pt = p;
+        else break;
+      }
+      const pct =
+        data.baseline != null && data.baseline !== 0
+          ? `（${change((pt.value / data.baseline - 1) * 100)}）`
+          : "";
+      pfReadout.textContent = `${hm(pt.at)} 總值 ${formatMoney(pt.value, "TWD")}${pct}`;
+    });
+    pfWrap.addEventListener("mouseleave", () => {
+      pfReadout.textContent = pfReadoutDefault;
+    });
+  }
+  // Settings-page data export/import: the export downloads the core's JSON
+  // string as a file; the import replaces groups and positions wholesale,
+  // so it confirms first and reports the core's tally afterwards.
+  document.querySelector("#export-data")?.addEventListener("click", () => {
+    void (async () => {
+      try {
+        const text = await exportData();
+        const day = new Date(state.now)
+          .toLocaleDateString("sv-SE", { timeZone: "Asia/Taipei" })
+          .replaceAll("-", "");
+        const url = URL.createObjectURL(
+          new Blob([text], { type: "application/json" }),
+        );
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `smallstocks-data-${day}.json`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 5000);
+        dataMessage = "已匯出自選與持股（JSON 備份檔）。";
+      } catch (e) {
+        dataMessage = `匯出失敗：${String(e)}`;
+      }
+      render();
+    })();
+  });
+  const importFile =
+    document.querySelector<HTMLInputElement>("#import-file");
+  document
+    .querySelector("#import-data-btn")
+    ?.addEventListener("click", () => importFile?.click());
+  importFile?.addEventListener("change", () => {
+    const file = importFile.files?.[0];
+    importFile.value = "";
+    if (!file) return;
+    void (async () => {
+      try {
+        const text = await file.text();
+        if (
+          !confirm(
+            "匯入會覆蓋目前的自選分組與持股（設定與規則不受影響），確定要匯入這份備份？",
+          )
+        )
+          return;
+        state = await importData(text);
+        const r = state.dataImport;
+        dataMessage = r
+          ? `匯入完成：${r.groups} 個分組、${r.positions} 檔持股、${r.lots} 筆購入批次${r.skippedSymbols.length ? `；跳過無效代號 ${r.skippedSymbols.join("、")}` : ""}${r.skippedLots ? `；跳過 ${r.skippedLots} 筆不合法的批次` : ""}。`
+          : "匯入完成。";
+        apply();
+      } catch (e) {
+        dataMessage = `匯入失敗：${String(e)}`;
+      }
+      render();
+    })();
+  });
   document
     .querySelector(".minimal-grip")
     ?.addEventListener("pointerdown", hideDetail);
@@ -907,12 +1126,19 @@ function bind() {
   });
   document.querySelectorAll<HTMLButtonElement>("[data-group]").forEach(
     (b) =>
-      (b.onclick = () =>
-        void mutate("set_active_group", { index: Number(b.dataset.group) })),
+      (b.onclick = () => {
+        // Switching groups swaps the list wholesale: start it at the top
+        // instead of keeping the previous group's scroll place.
+        scrollResetPending = true;
+        void mutate("set_active_group", { index: Number(b.dataset.group) });
+      }),
   );
   document
     .querySelector("[data-group-add]")
-    ?.addEventListener("click", () => void mutate("add_watch_group", {}));
+    ?.addEventListener("click", () => {
+      scrollResetPending = true;
+      void mutate("add_watch_group", {});
+    });
   if (
     tab === "watch" &&
     state.settings.rowDisplay === "minimal" &&
@@ -954,6 +1180,7 @@ function bind() {
   );
   document.querySelector("#cancel-edit")?.addEventListener("click", () => {
     editing = undefined;
+    scrollResetPending = true;
     render();
   });
   document.querySelector("#rule-form")?.addEventListener("submit", (e) => {
@@ -973,6 +1200,8 @@ function bind() {
     (b) =>
       (b.onclick = () => {
         editing = state.rules.find((r) => r.id === b.dataset.edit);
+        // The populated form sits at the top of the pane: go to it.
+        scrollResetPending = true;
         render();
       }),
   );
@@ -1183,7 +1412,8 @@ async function poll() {
     } else if (tab === "positions") {
       // The portfolio page follows live quotes: re-render when the valued
       // prices move (or the state revision does), but never while the user is
-      // typing in the lot form or the import box, and keep the scroll place.
+      // typing in the lot form or the import box. render() itself keeps the
+      // scroll place for same-view re-renders.
       const el = document.activeElement as HTMLElement | null;
       const typing =
         !!el &&
@@ -1193,11 +1423,8 @@ async function poll() {
         !typing &&
         (previous.revision !== state.revision ||
           positionsSignature() !== positionsSig)
-      ) {
-        const top = content.scrollTop;
+      )
         render();
-        content.scrollTop = top;
-      }
     } else if (
       previous.revision !== state.revision &&
       !content.contains(document.activeElement)

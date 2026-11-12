@@ -73,3 +73,56 @@ export function trendCell(
     title,
   };
 }
+/**
+ * The portfolio day chart: one aggregate TWD value line over the 09:00–13:30
+ * session with a soft area fill and the previous-close total as a dashed
+ * baseline. Pure geometry like `line` — the caller (the positions page)
+ * supplies the aggregated points from model.portfolioIntradaySeries plus the
+ * direction class, and renders all labels as HTML around the SVG so nothing
+ * is distorted by the stretched viewBox.
+ */
+export function portfolioChart(
+  pts: { at: number; value: number }[],
+  baseline: number | null,
+  signClass: "up" | "down" | "flat",
+  label: string,
+): string {
+  if (pts.length < 2) return "";
+  const w = 320,
+    h = 148,
+    padX = 2,
+    padTop = 8,
+    padBottom = 6;
+  const first = pts[0]!.at;
+  const dayStart =
+    Math.floor((first + 28800000) / 86400000) * 86400000 - 28800000;
+  const x0 = dayStart + 9 * 3600000,
+    x1 = dayStart + 13.5 * 3600000;
+  const values = pts.map((p) => p.value);
+  let low = Math.min(...values),
+    high = Math.max(...values);
+  if (baseline != null) {
+    low = Math.min(low, baseline);
+    high = Math.max(high, baseline);
+  }
+  const span = high - low || Math.max(1, high * 0.001);
+  low -= span * 0.08;
+  high += span * 0.08;
+  const X = (at: number) =>
+    padX + Math.max(0, Math.min(1, (at - x0) / (x1 - x0))) * (w - 2 * padX);
+  const Y = (v: number) =>
+    padTop + (1 - (v - low) / (high - low)) * (h - padTop - padBottom);
+  const coords = pts.map(
+    (p) => [X(p.at), Y(p.value)] as [number, number],
+  );
+  const path = coords
+    .map(([x, y], i) => `${i ? "L" : "M"}${x.toFixed(1)},${y.toFixed(1)}`)
+    .join(" ");
+  const area = `${path} L${coords.at(-1)![0].toFixed(1)},${h - padBottom} L${coords[0]![0].toFixed(1)},${h - padBottom} Z`;
+  const baseLine =
+    baseline != null
+      ? `<line class="pf-base" x1="${padX}" x2="${w - padX}" y1="${Y(baseline).toFixed(1)}" y2="${Y(baseline).toFixed(1)}"/>`
+      : "";
+  const last = coords.at(-1)!;
+  return `<svg class="pf-chart ${signClass}" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="${esc(label)}"><title>${esc(label)}</title>${baseLine}<path class="pf-area" d="${area}"/><path class="pf-line" d="${path}"/><circle class="pf-dot" cx="${last[0].toFixed(1)}" cy="${last[1].toFixed(1)}" r="2.2"/></svg>`;
+}

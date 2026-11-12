@@ -294,6 +294,112 @@ nav .gear {
 .pos-num.down {
   color: var(--down);
 }
+/* Portfolio day chart card: aggregate TWD value line over the session,
+   dashed previous-close baseline, Google-Finance style. */
+.pf-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+}
+.pf-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.pf-head h2 {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--muted);
+  margin: 0;
+}
+.pf-head .pf-now {
+  font: 12px var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+.pf-chart {
+  width: 100%;
+  height: 140px;
+  display: block;
+  overflow: visible;
+}
+.pf-chart .pf-line {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+}
+.pf-chart .pf-area {
+  fill: currentColor;
+  fill-opacity: 0.13;
+  stroke: none;
+}
+.pf-chart .pf-dot {
+  fill: currentColor;
+}
+.pf-chart .pf-base {
+  stroke: var(--muted);
+  stroke-width: 1;
+  stroke-dasharray: 4 3;
+  vector-effect: non-scaling-stroke;
+  opacity: 0.75;
+}
+.pf-chart.up {
+  color: var(--up);
+}
+.pf-chart.down {
+  color: var(--down);
+}
+.pf-chart.flat {
+  color: var(--text);
+}
+.pf-readout,
+.pf-empty {
+  font: 10px var(--mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  margin: 4px 0 0;
+  min-height: 13px;
+}
+/* Position list sections split by market (台股 TWD first, then 美股 USD);
+   each carries its own subtotal header over the shared column grid. */
+.pos-section + .pos-section {
+  margin-top: 12px;
+}
+.pos-section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.pos-section-head h2 {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text);
+  margin: 0;
+}
+.pos-section-total {
+  font: 11px var(--mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+/* P&L cells stack amount over percent, Google-Finance style; both lines keep
+   the row's up/down color, the percent line a step smaller. */
+.pos-row .pos-pnl {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  line-height: 1.4;
+}
+.pos-pnl .pos-pct {
+  font-size: 10px;
+}
 .pos-import {
   margin: 12px 0;
 }
@@ -314,7 +420,7 @@ nav .gear {
 .pos-head,
 .pos-row {
   display: grid;
-  grid-template-columns: minmax(76px, 1fr) 56px 62px 62px 84px 76px 56px;
+  grid-template-columns: minmax(76px, 1fr) 56px 62px 62px 84px 88px 88px;
   gap: 6px;
   align-items: baseline;
   font-variant-numeric: tabular-nums;
