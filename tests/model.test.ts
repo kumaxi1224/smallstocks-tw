@@ -16,6 +16,8 @@ import {
   nextPositionSort,
   sortedPositions,
   formatMoney,
+  formatWan,
+  axisTicks,
 } from "../src/model.ts";
 import type {
   Quote,
@@ -603,6 +605,24 @@ describe("money formatting", () => {
     expect(formatMoney(63, "USD", true)).toBe("+63.00");
     expect(formatMoney(null, "TWD")).toBe("—");
     expect(formatMoney(0, "TWD", true)).toBe("0");
+  });
+  it("shortens axis amounts in 萬 with at most one decimal", () => {
+    expect(formatWan(6402819)).toBe("640萬");
+    expect(formatWan(6295000)).toBe("630萬");
+    expect(formatWan(12300)).toBe("1.2萬");
+    expect(formatWan(10000)).toBe("1萬");
+    expect(formatWan(9500)).toBe("9500");
+    expect(formatWan(0)).toBe("0");
+  });
+  it("picks nice axis ticks inside the span", () => {
+    expect(axisTicks(6200000, 6500000, 4)).toEqual([
+      6200000, 6300000, 6400000, 6500000,
+    ]);
+    const t = axisTicks(95, 108, 4);
+    expect(t.length).toBeGreaterThanOrEqual(2);
+    expect(t.every((v) => v >= 95 && v <= 108)).toBe(true);
+    expect(axisTicks(100, 100)).toEqual([100]);
+    expect(axisTicks(0, 3, 4)).toEqual([0, 1, 2, 3]);
   });
 });
 describe("combined TWD totals", () => {

@@ -649,13 +649,22 @@ let positionsSig = "";
  * held Taiwan codes; the ask is throttled to the core's own 60-second
  * intraday freshness window so sitting on the page never hammers Yahoo. */
 let lastIntradayAsk = 0;
-/** Aggregated points behind the portfolio day chart currently on screen,
- * kept for the hover readout; the readout's resting text beside it. */
+/** Aggregated points behind the portfolio chart currently on screen, kept
+ * for the hover readout, with the X domain the hover maps fractions onto
+ * (the session hours for 1D, the points' own span for the date ranges);
+ * the readout's resting text beside it. */
 let pfHover: {
   points: { at: number; value: number }[];
   baseline: number | null;
+  domain: [number, number];
+  mode: "time" | "date";
 } | null = null;
 let pfReadoutDefault = "";
+/** Range tab of the portfolio chart; 1D is the intraday aggregation, the
+ * rest ride the core's portfolioHistory. Kept across re-renders. */
+const PF_RANGES = ["1D", "5D", "1M", "6M", "YTD", "1Y", "5Y", "MAX"] as const;
+type PfRange = (typeof PF_RANGES)[number];
+let pfRange: PfRange = "1D";
 const hm = (at: number) =>
   new Date(at).toLocaleTimeString("zh-TW", {
     hour12: false,
@@ -663,6 +672,10 @@ const hm = (at: number) =>
     minute: "2-digit",
     timeZone: "Asia/Taipei",
   });
+const ymd = (at: number) =>
+  new Date(at)
+    .toLocaleDateString("sv-SE", { timeZone: "Asia/Taipei" })
+    .replaceAll("-", "/");
 /**
  * Asks the core to queue minute-sample fetches for every held Taiwan code —
  * the only trigger for the portfolio day chart's data. Display-only: the
@@ -680,6 +693,22 @@ function ensurePositionIntraday() {
   lastIntradayAsk = at;
   for (const c of codes)
     void request("get_intraday_history", { symbol: c }).catch(() => {});
+}
+/** Last time the positions page asked the core to fetch daily closes for
+ * the held Taiwan codes (the range chart's history); throttled like the
+ * intraday ask — the core's own 30-minute freshness check does the rest. */
+let lastHistoryAsk = 0;
+/**
+ * Asks the core to queue Yahoo daily-close fetches for every held Taiwan
+ * code so the range tabs have aggregates ready. Display-only like the
+ * intraday ask: the response is discarded, results arrive on the snapshot.
+ */
+function ensurePortfolioHistory() {
+  const at = Date.now();
+  if (at - lastHistoryAsk < 60_000) return;
+  if (!(state.positions ?? []).some((p) => !isYahooSymbol(p.code))) return;
+  lastHistoryAsk = at;
+  void request("ensure_portfolio_history", {}).catch(() => {});
 }
 /**
  * Price inputs for every held code, from the same sources the watch rows use:
@@ -713,6 +742,13 @@ function positionsSignature() {
   const quotes = positionQuotes();
   return JSON.stringify([
     state.marketOpen,
+    // The range chart follows its tab and the core's history aggregates: a
+    // finished fetch (more points, pending cleared) re-renders the page.
+    pfRange,
+    ...PF_RANGES.slice(1).map((r) => {
+      const e = state.portfolioHistory?.[r];
+      return e ? `${e.points.length}:${e.pending ? 1 : 0}` : "-";
+    }),
     (state.positions ?? []).map((p) => [
       p.code,
       quotes[p.code]?.price ?? null,
@@ -725,12 +761,14 @@ function positionsSignature() {
   ]);
 }
 /**
- * The portfolio day-chart card (TWD book only): the aggregate minute-value
- * line from model.portfolioIntradaySeries over the intraday samples the
- * snapshot carries, drawn by inline-trend.portfolioChart. The headline
- * figures deliberately repeat the TWD summary card (live/close pricing),
- * while the line itself aggregates the Yahoo minute samples — the two can
- * differ by a sample's delay, and the card says samples may lag.
+ * The portfolio chart card (TWD book only), with the range tabs above the
+ * chart. 1D is the day chart: the aggregate minute-value line from
+ * model.portfolioIntradaySeries over the intraday samples the snapshot
+ * carries, drawn by inline-trend.portfolioChart; its headline figures
+ * deliberately repeat the TWD summary card (live/close pricing), while the
+ * line itself aggregates the Yahoo minute samples — the two can differ by a
+ * sample's delay, and the card says samples may lag. The other ranges come
+ * from the core's portfolioHistory backcast (see pfHistorySection).
  */
 function portfolioChartSection(
   summary: ReturnType<typeof portfolioSummary>,
@@ -739,6 +777,8 @@ function portfolioChartSection(
   pfHover = null;
   const twd = summary.totals.find((t) => t.currency === "TWD");
   if (!twd) return "";
+  const tabs = `<div class="pf-ranges" role="tablist" aria-label="走勢範圍">${PF_RANGES.map((r) => `<button type="button" role="tab" aria-selected="${r === pfRange}" class="pf-range${r === pfRange ? " active" : ""}" data-pf-range="${r}">${r}</button>`).join("")}</div>`;
+  if (pfRange !== "1D") return pfHistorySection(twd, tabs);
   const held = (state.positions ?? []).filter((p) => !isYahooSymbol(p.code));
   const samples: Record<string, { at: number; price: number | null }[]> = {};
   const previous: Record<string, number | null> = {};
@@ -763,9 +803,17 @@ function portfolioChartSection(
       agg.previousTotal != null
         ? `昨收 ${formatMoney(agg.previousTotal, "TWD")} · 尚無今日走勢`
         : "尚無今日走勢";
-    return `<div class="pf-card">${head}<p class="pf-empty">${pfReadoutDefault}（分時資料取得後自動更新）</p></div>`;
+    return `<div class="pf-card">${head}${tabs}<p class="pf-empty">${pfReadoutDefault}（分時資料取得後自動更新）</p></div>`;
   }
-  pfHover = { points: agg.points, baseline: agg.previousTotal };
+  const firstPt = agg.points[0]!.at;
+  const pfDayStart =
+    Math.floor((firstPt + 28800000) / 86400000) * 86400000 - 28800000;
+  pfHover = {
+    points: agg.points,
+    baseline: agg.previousTotal,
+    domain: [pfDayStart + 9 * 3600000, pfDayStart + 13.5 * 3600000],
+    mode: "time",
+  };
   const meta = [
     agg.previousTotal != null
       ? `昨收 ${formatMoney(agg.previousTotal, "TWD")}`
@@ -780,7 +828,51 @@ function portfolioChartSection(
     .join(" · ");
   pfReadoutDefault = meta;
   const label = `台幣持股組合總值日內走勢，目前 ${formatMoney(agg.lastValue, "TWD")}${agg.previousTotal != null ? `，昨收 ${formatMoney(agg.previousTotal, "TWD")}` : ""}`;
-  return `<div class="pf-card">${head}<div class="pf-chart-wrap">${portfolioChart(agg.points, agg.previousTotal, sign, label)}</div><p class="pf-readout">${esc(meta)}</p></div>`;
+  return `<div class="pf-card">${head}${tabs}<div class="pf-chart-wrap">${portfolioChart(agg.points, agg.previousTotal, sign, label, "time")}</div><p class="pf-readout">${esc(meta)}</p></div>`;
+}
+/**
+ * The portfolio chart card on a multi-day range: the core's backcast
+ * aggregate for the chosen range (see history.rs — current holdings over
+ * Yahoo daily closes). The headline switches from the day P/L to the range
+ * change against the range's first point, the chart's dashed baseline.
+ */
+function pfHistorySection(
+  twd: { marketValue: number | null },
+  tabs: string,
+) {
+  const entry = state.portfolioHistory?.[pfRange];
+  const head = (right: string, signClass = "flat") =>
+    `<div class="pf-head"><h2>組合總值走勢（台幣）</h2><span class="pf-now pos-num ${signClass}">${right}</span></div>`;
+  if (!entry || entry.points.length < 2) {
+    const msg =
+      !entry || entry.pending ? "歷史資料取得中…" : "區間資料不足";
+    return `<div class="pf-card">${head(twd.marketValue != null ? formatMoney(twd.marketValue, "TWD") : "")}${tabs}<p class="pf-empty">${msg}</p></div>`;
+  }
+  const first = entry.points[0]!,
+    last = entry.points.at(-1)!;
+  const base = entry.baseline;
+  const delta = base != null ? last.value - base : null;
+  const pct =
+    base != null && base !== 0 && delta != null ? (delta / base) * 100 : null;
+  const signClass =
+    delta == null || delta === 0 ? "flat" : delta > 0 ? "up" : "down";
+  const right = `${formatMoney(last.value, "TWD")}　區間 ${delta != null ? formatMoney(delta, "TWD", true) : "—"}${pct != null ? `（${change(pct)}）` : ""}`;
+  pfHover = {
+    points: entry.points,
+    baseline: base,
+    domain: [first.at, last.at],
+    mode: "date",
+  };
+  const meta = [
+    `${ymd(first.at)}–${ymd(last.at)}`,
+    entry.uncovered ? `${entry.uncovered} 檔無歷史資料，未計入` : "",
+    "以目前持股回推 · 日線資料 Yahoo（僅供走勢參考）",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  pfReadoutDefault = meta;
+  const label = `台幣持股組合總值 ${pfRange} 走勢，目前 ${formatMoney(last.value, "TWD")}${base != null ? `，區間起點 ${formatMoney(base, "TWD")}` : ""}`;
+  return `<div class="pf-card">${head(right, signClass)}${tabs}<div class="pf-chart-wrap">${portfolioChart(entry.points, base, signClass, label, "date")}</div><p class="pf-readout">${esc(meta)}</p></div>`;
 }
 function positionsPage() {
   const positions = state.positions ?? [];
@@ -909,6 +1001,7 @@ function render() {
     content.innerHTML = positionsPage();
     positionsSig = positionsSignature();
     ensurePositionIntraday();
+    ensurePortfolioHistory();
   }
   if (tab === "daily") dailyPage();
   if (tab === "settings")
@@ -1066,10 +1159,8 @@ function bind() {
         0,
         Math.min(1, (e.clientX - rect.left) / rect.width),
       );
-      const first = data.points[0]!.at;
-      const dayStart =
-        Math.floor((first + 28800000) / 86400000) * 86400000 - 28800000;
-      const target = dayStart + 9 * 3600000 + frac * 4.5 * 3600000;
+      const target =
+        data.domain[0] + frac * (data.domain[1] - data.domain[0]);
       let pt = data.points[0]!;
       for (const p of data.points) {
         if (p.at <= target) pt = p;
@@ -1079,12 +1170,23 @@ function bind() {
         data.baseline != null && data.baseline !== 0
           ? `（${change((pt.value / data.baseline - 1) * 100)}）`
           : "";
-      pfReadout.textContent = `${hm(pt.at)} 總值 ${formatMoney(pt.value, "TWD")}${pct}`;
+      const when = data.mode === "time" ? hm(pt.at) : ymd(pt.at);
+      pfReadout.textContent = `${when} 總值 ${formatMoney(pt.value, "TWD")}${pct}`;
     });
     pfWrap.addEventListener("mouseleave", () => {
       pfReadout.textContent = pfReadoutDefault;
     });
   }
+  // Portfolio chart range tabs: switch the module state and re-render in
+  // place (same tab, so the scroll place survives per shouldKeepScroll).
+  document
+    .querySelectorAll<HTMLButtonElement>("[data-pf-range]")
+    .forEach((b) =>
+      b.addEventListener("click", () => {
+        pfRange = b.dataset.pfRange as PfRange;
+        render();
+      }),
+    );
   // Settings-page data export/import: on desktop the core writes the JSON
   // to a file itself (a Blob download is silently ignored by WebView2) and
   // the outcome line reports the path; the browser preview keeps the Blob

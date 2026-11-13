@@ -1,4 +1,4 @@
-import { esc } from "./model.ts";
+import { axisTicks, esc, formatWan } from "./model.ts";
 import type { IntradayPoint, Snapshot } from "./model.ts";
 export function line(
   points: IntradayPoint[],
@@ -74,18 +74,23 @@ export function trendCell(
   };
 }
 /**
- * The portfolio day chart: one aggregate TWD value line over the 09:00–13:30
- * session with a soft area fill and the previous-close total as a dashed
- * baseline. Pure geometry like `line` — the caller (the positions page)
- * supplies the aggregated points from model.portfolioIntradaySeries plus the
- * direction class, and renders all labels as HTML around the SVG so nothing
- * is distorted by the stretched viewBox.
+ * The portfolio chart, shared by every range: one aggregate TWD value line
+ * over the X domain with a soft area fill and a dashed baseline, plus axis
+ * furniture — horizontal gridlines on nice value ticks and tick labels on
+ * both axes, Google-Finance style. "time" mode is the 1D session chart
+ * (domain pinned to 09:00–13:30, ticks on the hour, baseline = previous
+ * close); "date" mode spans the points' own dates (baseline = the range's
+ * first point). Pure geometry like `line` — the caller (the positions page)
+ * supplies the aggregated points plus the direction class. Axis labels are
+ * HTML spans positioned over the stretched SVG (never SVG text, which the
+ * non-uniform viewBox scaling would distort); gridlines live in the SVG.
  */
 export function portfolioChart(
   pts: { at: number; value: number }[],
   baseline: number | null,
   signClass: "up" | "down" | "flat",
   label: string,
+  mode: "time" | "date" = "time",
 ): string {
   if (pts.length < 2) return "";
   const w = 320,
@@ -93,11 +98,18 @@ export function portfolioChart(
     padX = 2,
     padTop = 8,
     padBottom = 6;
-  const first = pts[0]!.at;
-  const dayStart =
-    Math.floor((first + 28800000) / 86400000) * 86400000 - 28800000;
-  const x0 = dayStart + 9 * 3600000,
+  let x0: number, x1: number;
+  if (mode === "time") {
+    const first = pts[0]!.at;
+    const dayStart =
+      Math.floor((first + 28800000) / 86400000) * 86400000 - 28800000;
+    x0 = dayStart + 9 * 3600000;
     x1 = dayStart + 13.5 * 3600000;
+  } else {
+    x0 = pts[0]!.at;
+    x1 = pts.at(-1)!.at;
+    if (x1 <= x0) x1 = x0 + 86400000;
+  }
   const values = pts.map((p) => p.value);
   let low = Math.min(...values),
     high = Math.max(...values);
@@ -124,5 +136,50 @@ export function portfolioChart(
       ? `<line class="pf-base" x1="${padX}" x2="${w - padX}" y1="${Y(baseline).toFixed(1)}" y2="${Y(baseline).toFixed(1)}"/>`
       : "";
   const last = coords.at(-1)!;
-  return `<svg class="pf-chart ${signClass}" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="${esc(label)}"><title>${esc(label)}</title>${baseLine}<path class="pf-area" d="${area}"/><path class="pf-line" d="${path}"/><circle class="pf-dot" cx="${last[0].toFixed(1)}" cy="${last[1].toFixed(1)}" r="2.2"/></svg>`;
+  const yTicks = axisTicks(low, high, 4);
+  const grid = yTicks
+    .map(
+      (t) =>
+        `<line class="pf-grid" x1="${padX}" x2="${w - padX}" y1="${Y(t).toFixed(1)}" y2="${Y(t).toFixed(1)}"/>`,
+    )
+    .join("");
+  const yLabels = yTicks
+    .map(
+      (t) =>
+        `<span class="pf-y-label" style="top:${((Y(t) / h) * 100).toFixed(2)}%">${esc(formatWan(t))}</span>`,
+    )
+    .join("");
+  let xTicks: { at: number; text: string }[];
+  if (mode === "time") {
+    xTicks = [0, 1, 2, 3, 4].map((i) => ({
+      at: x0 + i * 3600000,
+      text: `${String(9 + i).padStart(2, "0")}:00`,
+    }));
+  } else {
+    // Five evenly spaced points carry the date labels; spans over ~13
+    // months also carry the year so neighbouring labels stay distinct.
+    const long = x1 - x0 > 400 * 86400000;
+    const seen = new Set<number>();
+    xTicks = [];
+    for (const f of [0, 0.25, 0.5, 0.75, 1]) {
+      const i = Math.round(f * (pts.length - 1));
+      if (seen.has(i)) continue;
+      seen.add(i);
+      const d = new Date(pts[i]!.at).toLocaleDateString("sv-SE", {
+        timeZone: "Asia/Taipei",
+      });
+      xTicks.push({
+        at: pts[i]!.at,
+        text: long ? d.slice(0, 7).replace("-", "/") : d.slice(5).replace("-", "/"),
+      });
+    }
+  }
+  const xLabels = xTicks
+    .map((t, i) => {
+      const cls =
+        i === 0 ? " first" : i === xTicks.length - 1 ? " last" : "";
+      return `<span class="pf-x-label${cls}" style="left:${((X(t.at) / w) * 100).toFixed(2)}%">${esc(t.text)}</span>`;
+    })
+    .join("");
+  return `<svg class="pf-chart ${signClass}" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="${esc(label)}"><title>${esc(label)}</title>${grid}${baseLine}<path class="pf-area" d="${area}"/><path class="pf-line" d="${path}"/><circle class="pf-dot" cx="${last[0].toFixed(1)}" cy="${last[1].toFixed(1)}" r="2.2"/></svg>${yLabels}${xLabels}`;
 }

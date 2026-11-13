@@ -1,6 +1,7 @@
 mod calendar;
 mod core;
 mod daily;
+mod history;
 mod intraday;
 mod mcp;
 mod taifex;
@@ -220,8 +221,8 @@ fn show_main_window(app: &tauri::AppHandle) {
         let _ = w.set_focus();
     }
     // The PTT chat window comes back too, but only when its setting is on
-    // (sync also recreates it if it is somehow gone).
-    let _ = sync_chat_window(app);
+    // (the dispatched sync also recreates it if it is somehow gone).
+    sync_chat_window(app);
 }
 /// The privacy shortcut is a toggle: it hides everything, and brings the monitor back when the
 /// main window is hidden or minimized.
@@ -382,7 +383,9 @@ fn core_request(
         .execute(&tool, args)?;
     if tool == "set_settings" {
         sync_main_window(&app)?;
-        sync_chat_window(&app)?;
+        // Fire-and-forget: building the chat window must not happen in
+        // this synchronous handler's stack (see sync_chat_window).
+        sync_chat_window(&app);
     }
     Ok(result)
 }
@@ -405,10 +408,34 @@ fn sync_main_window(app: &tauri::AppHandle) -> Result<(), String> {
 /// gets no IPC access at all — it is a browser pane, nothing more.
 const CHAT_WINDOW_LABEL: &str = "ptt-chat";
 const CHAT_URL: &str = "https://t.me/s/ptt_stock_follow_chat";
-/// Make the chat window match the `chatWindow` setting: create and show it
-/// when the setting is on, close it when off. Called after every
-/// set_settings (UI and MCP alike) and once at startup.
-fn sync_chat_window(app: &tauri::AppHandle) -> Result<(), String> {
+/// Ask for the chat window to be reconciled with the `chatWindow`
+/// setting. This never touches a window itself: building a WebviewWindow
+/// runs WebView2 controller setup, which needs the main-thread message
+/// loop to make progress, and most callers — the synchronous
+/// `core_request` command above all — sit inside that loop's call stack.
+/// Building there wedged the half-created window (blank, its close box
+/// dead) and every command queued behind the handler. So the real work
+/// is posted to the event loop from a throwaway thread — posting from
+/// another thread guarantees the closure is queued for the loop, never
+/// run inline in the caller's stack — and this returns immediately.
+/// Fire-and-forget: the worker (apply_chat_window) re-reads the setting
+/// when it runs, and failures land in the core's error field, where the
+/// settings page surfaces them. Called after every set_settings (UI and
+/// MCP alike), at startup, and when the main window is shown again.
+fn sync_chat_window(app: &tauri::AppHandle) {
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        let worker = handle.clone();
+        let _ = handle.run_on_main_thread(move || apply_chat_window(&worker));
+    });
+}
+/// The event-loop half of `sync_chat_window`: make the chat window match
+/// the setting as it reads *now* — create and show it when the setting
+/// is on, close it when off. Re-reading here (rather than trusting the
+/// value at request time) keeps a fast on-off-on from acting on a stale
+/// copy. Runs only as an event-loop callback, so WebView2 controller
+/// initialization can proceed.
+fn apply_chat_window(app: &tauri::AppHandle) {
     let enabled = app
         .state::<mcp::Shared>()
         .lock()
@@ -416,7 +443,7 @@ fn sync_chat_window(app: &tauri::AppHandle) -> Result<(), String> {
         .saved
         .settings
         .chat_window;
-    match app.get_webview_window(CHAT_WINDOW_LABEL) {
+    let result = match app.get_webview_window(CHAT_WINDOW_LABEL) {
         Some(w) if enabled => {
             let _ = w.show();
             let _ = w.unminimize();
@@ -424,20 +451,27 @@ fn sync_chat_window(app: &tauri::AppHandle) -> Result<(), String> {
             Ok(())
         }
         Some(w) => w.close().map_err(|e| e.to_string()),
-        None if enabled => {
-            let url = tauri::Url::parse(CHAT_URL).map_err(|_| "聊天視窗網址無效".to_string())?;
-            tauri::WebviewWindowBuilder::new(
-                app,
-                CHAT_WINDOW_LABEL,
-                tauri::WebviewUrl::External(url),
-            )
-            .title("PTT 股票閒聊")
-            .inner_size(440., 640.)
-            .build()
-            .map_err(|e| e.to_string())?;
-            Ok(())
-        }
+        None if enabled => tauri::Url::parse(CHAT_URL)
+            .map_err(|_| "聊天視窗網址無效".to_string())
+            .and_then(|url| {
+                tauri::WebviewWindowBuilder::new(
+                    app,
+                    CHAT_WINDOW_LABEL,
+                    tauri::WebviewUrl::External(url),
+                )
+                .title("PTT 股票閒聊")
+                .inner_size(440., 640.)
+                .build()
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+            }),
         None => Ok(()),
+    };
+    if let Err(e) = result {
+        app.state::<mcp::Shared>()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .error = Some(format!("聊天視窗開啟失敗：{e}"));
     }
 }
 #[tauri::command]
@@ -606,10 +640,10 @@ pub fn run() {
             }
             tray.build(app)?;
             // Restore the PTT chat window if its setting was left on.
-            if let Err(e) = sync_chat_window(app.handle()) {
-                setup_state.lock().unwrap_or_else(PoisonError::into_inner).error =
-                    Some(format!("聊天視窗開啟失敗：{e}"));
-            }
+            // Dispatched like every other sync point: the window is built
+            // from the event loop once it is running, and a failure lands
+            // in the core's error field (see apply_chat_window).
+            sync_chat_window(app.handle());
             // A long-running test instance must not take the user's own hide shortcut from them.
             let skip_shortcut = std::env::var_os("SMALLSTOCKS_NO_GLOBAL_SHORTCUT").is_some();
             let registered = if skip_shortcut {
@@ -900,6 +934,40 @@ pub fn run() {
                     s.revision += 1;
                 }
             });
+            let pf_history_state = setup_state.clone();
+            supervise(setup_state.clone(), "組合歷史佇列", move || {
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(Duration::from_secs(30))
+                    .user_agent("Mozilla/5.0 SmallStocks-TW")
+                    .build()
+                    .unwrap();
+                loop {
+                    std::thread::sleep(Duration::from_secs(2));
+                    let task = pf_history_state.lock().unwrap_or_else(PoisonError::into_inner).history_queue.pop_front();
+                    let Some(code) = task else { continue };
+                    let is_demo = pf_history_state.lock().unwrap_or_else(PoisonError::into_inner).demo;
+                    // Display-only data: the series lands in the in-memory
+                    // history cache and reaches the UI as aggregates on the
+                    // snapshot; it is never persisted and never ingested.
+                    let result = if is_demo {
+                        Ok(history::demo_series(&code))
+                    } else {
+                        history::fetch(&client, &code)
+                    };
+                    let mut s = pf_history_state.lock().unwrap_or_else(PoisonError::into_inner);
+                    s.history_pending.remove(&code);
+                    match result {
+                        Ok(series) => {
+                            s.history_cache.insert(code.clone(), series);
+                            s.history_errors.remove(&code);
+                        }
+                        Err(e) => {
+                            s.history_errors.insert(code, (e, now()));
+                        }
+                    }
+                    s.revision += 1;
+                }
+            });
             let calendar_state = setup_state.clone();
             supervise(setup_state.clone(), "休市日曆", move || {
                 let client = reqwest::blocking::Client::builder()
@@ -952,16 +1020,22 @@ pub fn run() {
                     // The user closed the chat window by hand: flip the
                     // setting off so state and screen agree (the next poll
                     // re-renders the settings page with the toggle off).
-                    // When sync_chat_window closes it programmatically the
-                    // setting is already false, so this stays a no-op.
+                    // When apply_chat_window closes it programmatically
+                    // the setting is already false, so this stays a no-op.
                     // Quitting the app destroys windows without a
                     // CloseRequested, so the setting survives a restart.
-                    let app = window.app_handle();
-                    let state = app.state::<mcp::Shared>();
-                    let mut core = state.lock().unwrap_or_else(PoisonError::into_inner);
-                    if core.saved.settings.chat_window {
-                        let _ = core.execute("set_settings", json!({"chatWindow": false}));
-                    }
+                    // The write-back runs on a throwaway thread: this
+                    // handler must return at once, never sit on the state
+                    // lock (and the persist it triggers) while the window
+                    // is mid-close.
+                    let app = window.app_handle().clone();
+                    std::thread::spawn(move || {
+                        let state = app.state::<mcp::Shared>();
+                        let mut core = state.lock().unwrap_or_else(PoisonError::into_inner);
+                        if core.saved.settings.chat_window {
+                            let _ = core.execute("set_settings", json!({"chatWindow": false}));
+                        }
+                    });
                 }
             }
         })

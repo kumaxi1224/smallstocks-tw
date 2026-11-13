@@ -11,6 +11,7 @@ let preview: Snapshot = {
   names: {},
   dailySummaries: {},
   intraday: {},
+  portfolioHistory: {},
   settings: {
     appearance: "small",
     paused: false,
@@ -224,6 +225,28 @@ export async function request(
       error: null,
       demo: true,
     };
+  }
+  // Synthetic aggregate history for the portfolio range tabs: one seeded
+  // walk, decimated per range, so the preview chart has dates to draw.
+  preview.portfolioHistory ??= {};
+  {
+    const walk: { at: number; value: number }[] = [];
+    let v = 880000;
+    for (let i = 260; i >= 0; i--) {
+      v *= 1 + Math.sin(i / 17) * 0.004 + 0.0012;
+      walk.push({ at: preview.now - i * 86400000, value: Math.round(v) });
+    }
+    for (const r of ["5D", "1M", "6M", "YTD", "1Y", "5Y", "MAX"]) {
+      const n = r === "5D" ? 5 : r === "1M" ? 22 : 48;
+      const step = Math.max(1, Math.floor(walk.length / n));
+      const pts = walk.filter((_, i) => i % step === 0).slice(-n);
+      preview.portfolioHistory[r] = {
+        points: pts,
+        baseline: pts[0]?.value ?? null,
+        uncovered: 0,
+        pending: false,
+      };
+    }
   }
   localStorage.setItem("smallstocks-preview", JSON.stringify(preview));
   return structuredClone(preview);

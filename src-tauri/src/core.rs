@@ -1,5 +1,6 @@
 use crate::calendar;
 use crate::daily;
+use crate::history;
 use crate::intraday;
 use chrono::{Datelike, FixedOffset, NaiveDateTime, TimeZone, Timelike, Utc};
 use serde::{Deserialize, Serialize};
@@ -873,6 +874,14 @@ pub struct Core {
     pub daily_queue: std::collections::VecDeque<(String, String)>,
     pub daily_pending: std::collections::HashSet<String>,
     pub daily_errors: HashMap<String, (String, i64)>,
+    /// Portfolio-history cache (Yahoo daily closes per held Taiwan code) and
+    /// its fetch queue, mirroring the intraday trio. In memory only: the
+    /// series are bulk display data, refetched on launch rather than carried
+    /// in state.json, and they never reach ingest (see history.rs).
+    pub history_cache: HashMap<String, history::Series>,
+    pub history_queue: std::collections::VecDeque<String>,
+    pub history_pending: std::collections::HashSet<String>,
+    pub history_errors: HashMap<String, (String, i64)>,
     pub calendar_errors: HashMap<i32, (String, i64)>,
     pub saved: Saved,
     pub quotes: HashMap<String, Quote>,
@@ -923,6 +932,10 @@ impl Core {
             daily_queue: Default::default(),
             daily_pending: Default::default(),
             daily_errors: Default::default(),
+            history_cache: Default::default(),
+            history_queue: Default::default(),
+            history_pending: Default::default(),
+            history_errors: Default::default(),
             calendar_errors: Default::default(),
             saved,
             quotes: HashMap::new(),
@@ -1151,7 +1164,7 @@ impl Core {
             .iter()
             .map(|c| (c.clone(), self.intraday_view(c)))
             .collect();
-        json!({"watchlist":self.saved.watchlist,"groups":self.saved.groups,"activeGroup":self.saved.active_group,"positions":self.saved.positions,"monthlySnapshots":self.saved.monthly_snapshots,"names":self.saved.names,"settings":self.settings_view(),"privacyShortcutError":self.privacy_shortcut_error,"rules":self.saved.rules,"events":self.saved.events,"quotes":self.quotes,"demo":self.demo,"error":self.error,"sourceNote":self.source_note,"lastBackupAt":self.last_backup_at.as_ref().map(|(at, path)| json!({"at":at,"path":path})),"lastBackupError":self.last_backup_error,"lastFetch":self.last_fetch,"nextPoll":self.next_poll,"marketOpen":self.market_open(now()),"marketClosedReason":self.closed_reason(now()),"calendar":self.calendar_view(),"revision":self.revision,"now":now(),"dailySummaries":summaries,"intraday":intraday})
+        json!({"watchlist":self.saved.watchlist,"groups":self.saved.groups,"activeGroup":self.saved.active_group,"positions":self.saved.positions,"monthlySnapshots":self.saved.monthly_snapshots,"names":self.saved.names,"settings":self.settings_view(),"privacyShortcutError":self.privacy_shortcut_error,"rules":self.saved.rules,"events":self.saved.events,"quotes":self.quotes,"demo":self.demo,"error":self.error,"sourceNote":self.source_note,"lastBackupAt":self.last_backup_at.as_ref().map(|(at, path)| json!({"at":at,"path":path})),"lastBackupError":self.last_backup_error,"lastFetch":self.last_fetch,"nextPoll":self.next_poll,"marketOpen":self.market_open(now()),"marketClosedReason":self.closed_reason(now()),"calendar":self.calendar_view(),"revision":self.revision,"now":now(),"dailySummaries":summaries,"intraday":intraday,"portfolioHistory":self.portfolio_history_view()})
     }
     pub fn queue_intraday(&mut self, code: &str) {
         let at = now();
@@ -1172,6 +1185,78 @@ impl Core {
             self.intraday_pending.insert(code.into());
             self.intraday_queue.push_back(code.into());
         }
+    }
+    /// Queues a Yahoo daily-close fetch for one code unless the cached
+    /// series is under 30 minutes old or a recent failure is cooling down —
+    /// the same discipline as queue_intraday, on history's slower clock.
+    pub fn queue_history(&mut self, code: &str) {
+        let at = now();
+        let fresh = self
+            .history_cache
+            .get(code)
+            .is_some_and(|s| at - s.fetched_at < 1_800_000);
+        let cooldown = self
+            .history_errors
+            .get(code)
+            .is_some_and(|(_, t)| at - t < 300_000);
+        if !fresh
+            && !cooldown
+            && !self.history_pending.contains(code)
+            && self.history_queue.len() < 32
+        {
+            self.history_pending.insert(code.into());
+            self.history_queue.push_back(code.into());
+        }
+    }
+    pub fn queue_portfolio_history(&mut self) {
+        let codes: Vec<String> = self
+            .saved
+            .positions
+            .iter()
+            .filter(|p| is_tw_symbol(&p.code))
+            .map(|p| p.code.clone())
+            .collect();
+        for c in codes {
+            self.queue_history(&c);
+        }
+    }
+    /// The aggregated portfolio history for every multi-day range, computed
+    /// from the cached daily closes and the CURRENT lot counts (the
+    /// backcast the chart promises). Only points ride out — never the raw
+    /// per-code series. Display data only.
+    pub fn portfolio_history_view(&self) -> Value {
+        let legs: Vec<history::Leg> = self
+            .saved
+            .positions
+            .iter()
+            .filter(|p| is_tw_symbol(&p.code))
+            .map(|p| {
+                (
+                    p.code.as_str(),
+                    p.lots.iter().map(|l| l.shares).sum::<f64>(),
+                )
+            })
+            .filter(|(_, shares)| *shares > 0.)
+            .map(|(code, shares)| history::Leg {
+                shares,
+                days: self.history_cache.get(code).map(|s| s.days.as_slice()),
+            })
+            .collect();
+        let pending = self
+            .saved
+            .positions
+            .iter()
+            .filter(|p| is_tw_symbol(&p.code))
+            .any(|p| self.history_pending.contains(&p.code));
+        let mut out = serde_json::Map::new();
+        for range in history::RANGES {
+            let agg = history::aggregate(&legs, range);
+            out.insert(
+                range.into(),
+                json!({"points":agg.points.iter().map(|(d, v)| json!({"at":history::date_ms(d),"value":v})).collect::<Vec<_>>(),"baseline":agg.baseline,"uncovered":agg.uncovered,"pending":pending}),
+            );
+        }
+        Value::Object(out)
     }
     pub fn intraday_view(&self, code: &str) -> Value {
         let date = intraday::day(now());
@@ -1329,6 +1414,13 @@ impl Core {
             }
             self.queue_intraday(&code);
             return Ok(self.intraday_view(&code));
+        }
+        if tool == "ensure_portfolio_history" {
+            // Display-only prefetch for the positions page's range chart:
+            // queues Yahoo daily-close fetches for every Taiwan holding; the
+            // aggregates ride out on the snapshot, never into ingest.
+            self.queue_portfolio_history();
+            return Ok(json!({"portfolioHistory": self.portfolio_history_view()}));
         }
         if tool == "get_daily_history" {
             let code = args["symbol"]

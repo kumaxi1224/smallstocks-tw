@@ -117,9 +117,23 @@ export function monthlyRows(
     };
   });
 }
+/** One range of the core's aggregated portfolio history (display only):
+ * current TWD holdings backcast over Yahoo daily closes. */
+export interface PortfolioHistoryEntry {
+  points: { at: number; value: number }[];
+  /** The first point's value — the dashed baseline of the range chart. */
+  baseline: number | null;
+  /** Held codes with no fetchable history, excluded from every point. */
+  uncovered: number;
+  /** A fetch for some held code is still queued or running. */
+  pending: boolean;
+}
 export interface Snapshot {
   intraday: Record<string, IntradayView>;
   dailySummaries: Record<string, DailyView>;
+  /** Aggregated portfolio history keyed by range ("5D"…"MAX"); absent on
+   * old states. The 1D chart never comes from here — it uses `intraday`. */
+  portfolioHistory?: Record<string, PortfolioHistoryEntry>;
   watchlist: string[];
   /** Watch groups; `watchlist` above is the active group's codes. */
   groups?: WatchGroup[];
@@ -238,6 +252,39 @@ export function formatMoney(
     maximumFractionDigits: digits,
   }).format(n);
   return signed && n > 0 ? `+${body}` : body;
+}
+/**
+ * Short axis form for portfolio values, in 萬 (ten-thousands) like Google
+ * Finance's Taiwan charts: 6,402,819 → "640萬", 12,300 → "1.2萬". Below one
+ * 萬 the plain rounded number stands.
+ */
+export function formatWan(v: number): string {
+  if (!Number.isFinite(v)) return "—";
+  const wan = v / 10000;
+  if (Math.abs(wan) < 1) return `${Math.round(v)}`;
+  const r = Math.abs(wan) >= 100 ? Math.round(wan) : Math.round(wan * 10) / 10;
+  return `${r}萬`;
+}
+/**
+ * Up to `count` "nice" axis ticks inside [low, high], on a 1/2/5×10ⁿ grid,
+ * so chart gridlines land on round numbers. Fewer ticks come back when the
+ * span is tight; a degenerate span yields the single value.
+ */
+export function axisTicks(low: number, high: number, count = 4): number[] {
+  if (!Number.isFinite(low) || !Number.isFinite(high) || count < 2) return [];
+  if (high <= low) return [low];
+  const raw = (high - low) / (count - 1);
+  const mag = 10 ** Math.floor(Math.log10(raw));
+  const norm = raw / mag;
+  const step = (norm < 1.5 ? 1 : norm < 3.5 ? 2 : norm < 7.5 ? 5 : 10) * mag;
+  const ticks: number[] = [];
+  for (
+    let v = Math.ceil(low / step) * step;
+    v <= high + step * 1e-6;
+    v += step
+  )
+    ticks.push(Number(v.toFixed(6)));
+  return ticks.length >= 2 ? ticks : [low, high];
 }
 /** Shell background opacity, clamped to the range the core accepts (0.4–1). */
 export const shellOpacity = (v: number | null | undefined) =>

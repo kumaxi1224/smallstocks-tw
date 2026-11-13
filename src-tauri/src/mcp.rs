@@ -29,6 +29,7 @@ fn compact_charts(mut v: Value) -> Value {
 pub fn tools() -> Value {
     json!([
     {"name":"get_intraday_history","description":"Read current-day one-minute chart for a watched Taiwan symbol. First response may be pending. Yahoo Finance minutes may be delayed; missing coverage can fall back to explicitly partial local MIS samples. Never use chart data to claim real-time execution or trigger rules. Do not treat an older session as today.","inputSchema":{"type":"object","properties":{"symbol":{"type":"string"}},"required":["symbol"],"additionalProperties":false}},
+    {"name":"ensure_portfolio_history","description":"Ask the core to fetch Yahoo daily closes for every Taiwan holding and read the aggregated portfolio history per range (5D/1M/6M/YTD/1Y/5Y/MAX): current holdings backcast over daily closes. First response may be pending while fetches run. Display only — never use it to claim real-time execution or trigger rules.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
     {"name":"get_daily_history","description":"Read official daily OHLC, close change and volume for a Taiwan stock or index by month (YYYY-MM). First call queues the fetch and returns pending=true; poll until complete. Historical data never triggers live alerts. Each row preserves its volume unit. Current-day data excluded before 15:00 Taipei. Raw prices are unadjusted.","inputSchema":{"type":"object","properties":{"symbol":{"type":"string"},"month":{"type":"string"}},"required":["symbol","month"],"additionalProperties":false}},
         {"name":"get_status","description":"Read local watchlist, quotes with source times, health and settings. marketOpen follows session hours and the official TWSE holiday calendar (marketClosedReason names the holiday; calendar says whether this year's table is loaded, otherwise only weekday hours apply). price is the last trade only and is null when the source gave none; mid (with midChangePercent) is the average of the best bid and ask: an order price, never a trade. Quotes older than three minutes are stale. Check demo and freshness before reporting. Does not fetch separately.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
         {"name":"list_events","description":"Read up to 500 recent locally detected events, newest first.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}},
@@ -125,11 +126,16 @@ pub fn serve(state: Shared, dir: &Path, app: tauri::AppHandle) -> Result<(), Str
                     })
                     .unwrap_or(json!({}));
                     if settings_changed && response["result"]["isError"] == false {
-                        if let Err(error) = crate::sync_main_window(&app)
-                            .and_then(|()| crate::sync_chat_window(&app))
-                        {
+                        if let Err(error) = crate::sync_main_window(&app) {
                             response["result"] =
                                 json!({"content":[{"type":"text","text":error}],"isError":true});
+                        } else {
+                            // Fire-and-forget dispatch (see lib.rs): the
+                            // chat window is reconciled from the event
+                            // loop, never built on this thread, and a
+                            // failure surfaces through the core error
+                            // field instead of this response.
+                            crate::sync_chat_window(&app);
                         }
                     }
                     response

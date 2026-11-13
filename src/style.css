@@ -392,6 +392,63 @@ nav .gear {
   display: block;
   overflow: visible;
 }
+/* Plot box of the portfolio chart: the left gutter holds the Y tick labels
+   and the strip below the X ones, so the plot block stands ~157px tall. */
+.pf-chart-wrap {
+  position: relative;
+  margin: 2px 0 17px 38px;
+}
+.pf-chart .pf-grid {
+  stroke: var(--border);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+  opacity: 0.6;
+}
+.pf-y-label {
+  position: absolute;
+  left: -38px;
+  width: 34px;
+  transform: translateY(-50%);
+  text-align: right;
+  font: 10px var(--mono);
+  color: var(--muted);
+}
+.pf-x-label {
+  position: absolute;
+  top: calc(100% + 3px);
+  transform: translateX(-50%);
+  font: 10px var(--mono);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.pf-x-label.first {
+  transform: none;
+}
+.pf-x-label.last {
+  transform: translateX(-100%);
+}
+/* Range tabs over the portfolio chart, mirroring the group tabs. */
+.pf-ranges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 2px 0 6px;
+}
+.pf-range {
+  font-size: 11px;
+  padding: 2px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+}
+.pf-range:hover {
+  background: #ffffff0e;
+}
+.pf-range.active {
+  background: var(--panel);
+  color: var(--text);
+  border-color: var(--accent);
+}
 .pf-chart .pf-line {
   fill: none;
   stroke: currentColor;
