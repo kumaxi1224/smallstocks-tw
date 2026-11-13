@@ -518,6 +518,12 @@ pub struct Settings {
     pub telegram_chat_id: String,
     #[serde(default)]
     pub telegram_bot_token: String,
+    /// Built-in held-position drop alerts: a card event the first time a
+    /// holding's daily change reaches −5% and again at −10% on a local
+    /// date. On by default because the feature is an explicit user request;
+    /// Telegram delivery still depends on the push settings above.
+    #[serde(default = "default_position_drop_alert")]
+    pub position_drop_alert: bool,
     /// Automatic state.json backups into a user-chosen folder (typically a
     /// cloud-synced one); see `maybe_backup`.
     #[serde(default)]
@@ -542,6 +548,9 @@ fn default_sidecar_port() -> u16 {
     DEFAULT_SIDECAR_PORT
 }
 fn default_always_on_top() -> bool {
+    true
+}
+fn default_position_drop_alert() -> bool {
     true
 }
 fn default_show_change_points() -> bool {
@@ -577,6 +586,7 @@ impl Default for Settings {
             telegram_enabled: false,
             telegram_chat_id: String::new(),
             telegram_bot_token: String::new(),
+            position_drop_alert: true,
             backup_enabled: false,
             backup_dir: String::new(),
             chat_window: false,
@@ -658,6 +668,18 @@ pub struct Position {
     #[serde(default)]
     pub lots: Vec<Lot>,
 }
+/// One built-in position-drop alert already emitted, kept only for the
+/// current local date so a restart cannot send the same level twice. The
+/// core prunes every older date as soon as a new date is evaluated.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PositionDropAlert {
+    /// Local date, YYYY-MM-DD.
+    pub date: String,
+    pub code: String,
+    /// Drop threshold, stored as a positive percent: 5 or 10.
+    pub level: u8,
+}
 /// One month's portfolio snapshot for the positions page's monthly tab:
 /// the combined total (TWD equivalent) the app computed the first time it
 /// ran that month with complete quotes, with the TWD/USD legs and the
@@ -700,6 +722,10 @@ pub struct Saved {
     /// Held positions with their purchase lots; empty on pre-positions saves.
     #[serde(default)]
     pub positions: Vec<Position>,
+    /// Position-drop alerts already emitted on the latest local date;
+    /// empty on pre-alert saves and pruned back to one date on evaluation.
+    #[serde(default)]
+    pub position_drop_alerts: Vec<PositionDropAlert>,
     /// Monthly portfolio snapshots (see MonthlySnapshot); empty on
     /// pre-monthly saves.
     #[serde(default)]
@@ -1031,7 +1057,7 @@ impl Core {
     /// Settings and rules stay out.
     fn export_text(&self) -> Result<String, String> {
         let payload = json!({
-            "app": "smallstocks-tw",
+            "app": "maxi-stocks",
             "version": 1,
             "groups": self.saved.groups,
             "activeGroup": self.saved.active_group,
@@ -1454,7 +1480,7 @@ impl Core {
             // WebView2, so the settings page's export button calls this and
             // reports the path it gets back.
             let text = self.export_text()?;
-            let file = format!("smallstocks-data-{}.json", local(now()).format("%Y%m%d"));
+            let file = format!("maxi-stocks-data-{}.json", local(now()).format("%Y%m%d"));
             let dest = self.export_dir().join(file);
             std::fs::write(&dest, text).map_err(|e| format!("匯出寫檔失敗：{e}"))?;
             return Ok(json!({"path": dest.to_string_lossy()}));
@@ -1762,8 +1788,10 @@ impl Core {
                 let text = args["json"].as_str().ok_or("需要匯入 JSON")?;
                 let v: Value = serde_json::from_str(text)
                     .map_err(|_| "匯入檔案不是有效的 JSON".to_string())?;
-                if v["app"].as_str() != Some("smallstocks-tw") {
-                    return Err("這不是 SmallStocks TW 的匯出檔案".into());
+                // Exports written before the v0.1.32 rebrand carry the
+                // legacy "smallstocks-tw" tag; both are this app's files.
+                if !matches!(v["app"].as_str(), Some("maxi-stocks") | Some("smallstocks-tw")) {
+                    return Err("這不是 Maxi stocks 的匯出檔案".into());
                 }
                 if v["version"].as_u64() != Some(1) {
                     return Err("不支援的匯出檔案版本".into());
@@ -2032,6 +2060,10 @@ impl Core {
                 if args.get("telegramClearToken").and_then(Value::as_bool) == Some(true) {
                     next.saved.settings.telegram_bot_token = String::new();
                 }
+                if let Some(v) = args.get("positionDropAlert") {
+                    next.saved.settings.position_drop_alert =
+                        v.as_bool().ok_or("持股跌幅警報需為布林值")?;
+                }
                 if let Some(v) = args.get("backupEnabled") {
                     next.saved.settings.backup_enabled =
                         v.as_bool().ok_or("自動備份需為布林值")?;
@@ -2156,10 +2188,108 @@ impl Core {
             r.last_low = None;
         }
     }
+    /// Built-in held-position drop alerts, evaluated beside the user rules
+    /// in `ingest`. A fresh quote whose daily change is at or below −5%
+    /// emits the level-5 card once per local date; reaching −10% emits the
+    /// stronger level-10 card as well. The emitted levels are latched in
+    /// Saved before the caller persists the batch, so neither a later poll
+    /// nor a restart can emit the same holding/level again that date.
+    fn position_drop_alert_events(
+        &mut self,
+        q: &Quote,
+        at: i64,
+        demo: bool,
+        open: bool,
+    ) -> Vec<Event> {
+        if !self.saved.settings.position_drop_alert
+            || !self.saved.positions.iter().any(|p| p.code == q.symbol)
+        {
+            return Vec::new();
+        }
+        let fresh = q.source_at <= at + 5_000
+            && at - q.source_at <= FRESH_MS
+            && q.date == local(at).format("%Y%m%d").to_string();
+        if !fresh || (!demo && !open) {
+            return Vec::new();
+        }
+        let Some(price) = q.price.filter(|v| v.is_finite() && *v > 0.) else {
+            return Vec::new();
+        };
+        if q.previous.is_none_or(|v| !v.is_finite() || v <= 0.) {
+            return Vec::new();
+        }
+        let Some(change) = q.change_percent.filter(|v| v.is_finite()) else {
+            return Vec::new();
+        };
+        let date = local(at).format("%Y-%m-%d").to_string();
+        self.saved
+            .position_drop_alerts
+            .retain(|sent| sent.date == date);
+        let name = if !q.name.is_empty() {
+            q.name.as_str()
+        } else {
+            self.saved
+                .names
+                .get(&q.symbol)
+                .map(String::as_str)
+                .unwrap_or("")
+        };
+        let who = if name.is_empty() {
+            display_symbol(&q.symbol).to_string()
+        } else {
+            format!("{} {}", display_symbol(&q.symbol), name)
+        };
+        let mut out = Vec::new();
+        for level in [5_u8, 10_u8] {
+            let threshold = -f64::from(level);
+            if change > threshold
+                || self
+                    .saved
+                    .position_drop_alerts
+                    .iter()
+                    .any(|sent| sent.code == q.symbol && sent.level == level)
+            {
+                continue;
+            }
+            self.saved.position_drop_alerts.push(PositionDropAlert {
+                date: date.clone(),
+                code: q.symbol.clone(),
+                level,
+            });
+            let text = if level == 10 {
+                format!(
+                    "🚨 持股重跌警報：{who} · 目前價 {price:.2} · 今日漲跌幅 {change:.2}%（跌破 -{level}%）"
+                )
+            } else {
+                format!(
+                    "持股跌幅警報：{who} · 目前價 {price:.2} · 今日漲跌幅 {change:.2}%（跌破 -{level}%）"
+                )
+            };
+            out.push(Event {
+                id: uuid::Uuid::new_v4().to_string(),
+                rule_id: "position-drop".into(),
+                symbol: q.symbol.clone(),
+                text,
+                source_at: q.source_at,
+                detected_at: at,
+                channel: "card".into(),
+                value: change,
+                threshold,
+                source: q.source.clone(),
+            });
+        }
+        out
+    }
     /// Applies a poll result. A failed save never discards live quotes or detected events:
     /// state stays in memory, the failure is surfaced in `error`, and saving is retried next poll.
     pub fn ingest(&mut self, quotes: Vec<Quote>, at: i64) -> Vec<Event> {
         let mut next = self.clone();
+        // The position-drop latch holds one local date only; a new date
+        // starts with a clean slate even before any quote is judged.
+        let alert_date = local(at).format("%Y-%m-%d").to_string();
+        next.saved
+            .position_drop_alerts
+            .retain(|sent| sent.date == alert_date);
         let open = next.market_open(at);
         let mut emitted = Vec::new();
         let mut names_changed = false;
@@ -2200,6 +2330,14 @@ impl Core {
                     next.saved.events.insert(0, e.clone());
                     emitted.push(e)
                 }
+            }
+            // Built-in holding alerts share the rules' session/freshness
+            // gate and their Event pipeline (local notices + the Telegram
+            // mirror in lib.rs), but their targets are the held positions,
+            // not the watchlist.
+            for e in next.position_drop_alert_events(&q, at, self.demo, quote_open) {
+                next.saved.events.insert(0, e.clone());
+                emitted.push(e);
             }
             // Learn the name any source reports (MIS, Shioaji and Yahoo all
             // carry one): quotes are runtime-only, so this persisted cache is
@@ -3257,6 +3395,169 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
+    fn position_drop_alert_setting_defaults_on_and_round_trips() {
+        let dir = std::env::temp_dir().join(format!(
+            "smallstocks-drop-setting-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let mut c = Core::load(path.clone(), true).unwrap();
+        // New saves and snapshots default the explicitly requested alert on.
+        assert!(c.saved.settings.position_drop_alert);
+        assert_eq!(c.snapshot()["settings"]["positionDropAlert"], json!(true));
+        c.execute("set_settings", json!({"positionDropAlert": false}))
+            .unwrap();
+        assert!(!c.saved.settings.position_drop_alert);
+        assert_eq!(c.snapshot()["settings"]["positionDropAlert"], json!(false));
+        // A non-boolean value is refused, leaving the setting alone.
+        assert!(c
+            .execute("set_settings", json!({"positionDropAlert": "yes"}))
+            .is_err());
+        assert!(!c.saved.settings.position_drop_alert);
+        // An old state file without the field loads with the alert on.
+        let mut v: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v["settings"]
+            .as_object_mut()
+            .unwrap()
+            .remove("positionDropAlert");
+        std::fs::write(&path, v.to_string()).unwrap();
+        let restored = Core::load(path, true).unwrap();
+        assert!(restored.saved.settings.position_drop_alert);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn position_drop_alerts_fire_once_per_level_per_day_and_survive_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "smallstocks-drop-alert-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let mut c = Core::load(path.clone(), true).unwrap();
+        c.execute(
+            "add_lot",
+            json!({"code":"2330","price":100.0,"shares":10}),
+        )
+        .unwrap();
+        let t = ts();
+        // −4.9% is above the first threshold: nothing fires or latches.
+        assert!(c.ingest(vec![q(Some(95.1), t)], t).is_empty());
+        assert!(c.saved.position_drop_alerts.is_empty());
+        // The first −5% breach emits one card with code, name, price and
+        // today's change; staying below that level does not repeat it.
+        let events = c.ingest(vec![q(Some(94.5), t + 5_000)], t + 5_000);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].channel, "card");
+        assert_eq!(events[0].threshold, -5.);
+        assert_eq!(events[0].value, -5.5);
+        assert!(events[0].text.contains("2330 台積電"));
+        assert!(events[0].text.contains("目前價 94.50"));
+        assert!(events[0].text.contains("今日漲跌幅 -5.50%"));
+        assert!(c
+            .ingest(vec![q(Some(94.2), t + 10_000)], t + 10_000)
+            .is_empty());
+        // Reaching −10% emits the stronger second alert, once.
+        let events = c.ingest(vec![q(Some(89.5), t + 15_000)], t + 15_000);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].threshold, -10.);
+        assert!(events[0].text.contains("🚨"));
+        assert!(events[0].text.contains("今日漲跌幅 -10.50%"));
+        assert!(c
+            .ingest(vec![q(Some(89.), t + 20_000)], t + 20_000)
+            .is_empty());
+        assert_eq!(c.saved.position_drop_alerts.len(), 2);
+        // The latches were persisted with the events: a rebuilt core does
+        // not re-emit either level for the same quote stream.
+        let mut restored = Core::load(path.clone(), true).unwrap();
+        assert_eq!(restored.saved.position_drop_alerts.len(), 2);
+        assert!(restored
+            .ingest(vec![q(Some(89.), t + 25_000)], t + 25_000)
+            .is_empty());
+        // The generated card is exactly what the existing Telegram mirror
+        // forwards once push is enabled and configured.
+        restored.saved.settings.telegram_enabled = true;
+        restored.saved.settings.telegram_chat_id = "42".into();
+        restored.saved.settings.telegram_bot_token = "123456:TESTTOKEN".into();
+        let tomorrow = t + 86_400_000;
+        let events = restored.ingest(vec![q(Some(94.5), tomorrow)], tomorrow);
+        assert_eq!(events.len(), 1, "a new local date re-arms the levels");
+        assert_eq!(restored.saved.position_drop_alerts.len(), 1);
+        assert_eq!(restored.saved.position_drop_alerts[0].date, "2026-11-07");
+        let alerts = telegram_alerts(&restored.saved.settings, &events);
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].1["text"]
+            .as_str()
+            .unwrap()
+            .contains("持股跌幅警報：2330 台積電"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn position_drop_alerts_require_a_fresh_complete_held_quote() {
+        let dir = std::env::temp_dir().join(format!(
+            "smallstocks-drop-gates-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = Core::load(dir.join("state.json"), true).unwrap();
+        c.execute(
+            "add_lot",
+            json!({"code":"2330","price":100.0,"shares":10}),
+        )
+        .unwrap();
+        let t = ts();
+        // A stale source timestamp cannot fire, even at −10%.
+        assert!(c
+            .ingest(vec![q(Some(90.), t)], t + FRESH_MS + 1)
+            .is_empty());
+        // No previous close, no change percent and no trade price each
+        // leave the quote incomplete for this alert.
+        let mut no_previous = q(Some(90.), t + 5_000);
+        no_previous.previous = None;
+        assert!(c.ingest(vec![no_previous], t + 5_000).is_empty());
+        let mut no_change = q(Some(90.), t + 10_000);
+        no_change.change_percent = None;
+        assert!(c.ingest(vec![no_change], t + 10_000).is_empty());
+        assert!(c.ingest(vec![q(None, t + 15_000)], t + 15_000).is_empty());
+        assert!(c.saved.position_drop_alerts.is_empty());
+        // A watched-but-not-held symbol is outside this alert's targets.
+        let mut watched_only = q(Some(90.), t + 20_000);
+        watched_only.symbol = "0050".into();
+        assert!(c.ingest(vec![watched_only], t + 20_000).is_empty());
+        // Turning the feature off suppresses even a fresh −10% held quote.
+        c.execute("set_settings", json!({"positionDropAlert": false}))
+            .unwrap();
+        assert!(c
+            .ingest(vec![q(Some(90.), t + 25_000)], t + 25_000)
+            .is_empty());
+        assert!(c.saved.position_drop_alerts.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn position_drop_alerts_cover_us_positions() {
+        let dir =
+            std::env::temp_dir().join(format!("smallstocks-drop-us-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = Core::load(dir.join("state.json"), true).unwrap();
+        c.execute(
+            "add_lot",
+            json!({"code":"nvda","price":100.0,"shares":2.5}),
+        )
+        .unwrap();
+        let t = ts();
+        let mut quote = q(Some(94.5), t);
+        quote.symbol = "NVDA".into();
+        quote.name = "NVIDIA".into();
+        quote.source = "Yahoo".into();
+        let events = c.ingest(vec![quote], t);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].symbol, "NVDA");
+        assert!(events[0].text.contains("NVDA NVIDIA"));
+        assert!(events[0].text.contains("今日漲跌幅 -5.50%"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn a_save_without_positions_still_loads() {
         let dir =
             std::env::temp_dir().join(format!("smallstocks-oldsave-{}", uuid::Uuid::new_v4()));
@@ -3644,7 +3945,7 @@ mod tests {
             .unwrap()
             .to_string();
         let parsed: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(parsed["app"], "smallstocks-tw");
+        assert_eq!(parsed["app"], "maxi-stocks");
         assert_eq!(parsed["version"], 1);
 
         let dir2 =
@@ -3673,6 +3974,31 @@ mod tests {
         assert_eq!(lev.lots[1].shares, 1000.);
         std::fs::remove_dir_all(dir).unwrap();
         std::fs::remove_dir_all(dir2).unwrap();
+    }
+    #[test]
+    fn import_data_accepts_the_legacy_smallstocks_envelope() {
+        // Export files written before the v0.1.32 rebrand are tagged
+        // "smallstocks-tw"; they must still import after the rename.
+        let dir =
+            std::env::temp_dir().join(format!("smallstocks-legacy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = Core::load(dir.join("state.json"), true).unwrap();
+        let legacy = json!({
+            "app": "smallstocks-tw",
+            "version": 1,
+            "activeGroup": 0,
+            "groups": [{"name": "自選1", "codes": ["2330"]}],
+            "positions": [
+                {"code": "2330", "lots": [{"date": "2026-11-10", "price": 1487, "shares": 64}]},
+            ],
+        })
+        .to_string();
+        let snap = c.execute("import_data", json!({"json": legacy})).unwrap();
+        assert_eq!(snap["dataImport"]["groups"], 1);
+        assert_eq!(snap["dataImport"]["positions"], 1);
+        assert_eq!(c.saved.groups[0].codes, vec!["2330"]);
+        assert_eq!(c.saved.positions.len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn import_data_rejects_bad_envelopes_and_skips_bad_rows() {
@@ -3805,7 +4131,7 @@ mod tests {
         // user it lands beside state.json (the temp dir either way here).
         assert!(
             path.ends_with(&format!(
-                "smallstocks-data-{}.json",
+                "maxi-stocks-data-{}.json",
                 local(now()).format("%Y%m%d")
             )),
             "unexpected export path: {path}"

@@ -175,6 +175,9 @@ export interface Snapshot {
     telegramEnabled?: boolean;
     telegramChatId?: string;
     telegramTokenSet?: boolean;
+    /** Built-in held-position drop alerts at −5% / −10% for the day.
+     * Absent on old states, where the core defaults it on. */
+    positionDropAlert?: boolean;
     /** Automatic state.json backups into a user-chosen folder. */
     backupEnabled?: boolean;
     backupDir?: string;

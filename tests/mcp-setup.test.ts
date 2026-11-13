@@ -2,14 +2,14 @@ import { describe, expect, it } from "vitest";
 import { mcpSetup } from "../src/mcp-setup.ts";
 
 const win =
-  "C:\\Users\\Ann Lee\\AppData\\Local\\SmallStocks TW\\smallstocks-tw.exe";
-const mac = "/Applications/SmallStocks TW.app/Contents/MacOS/smallstocks-tw";
+  "C:\\Users\\Ann Lee\\AppData\\Local\\MaxiStocks\\MaxiStocks.exe";
+const mac = "/Applications/MaxiStocks.app/Contents/MacOS/MaxiStocks";
 
 describe("MCP setup text", () => {
   it("makes JSON that a host can parse, with the real path and --mcp", () => {
     for (const exe of [win, mac]) {
       const parsed = JSON.parse(mcpSetup("json", exe));
-      expect(parsed.mcpServers["smallstocks-tw"]).toEqual({
+      expect(parsed.mcpServers["maxi-stocks"]).toEqual({
         command: exe,
         args: ["--mcp"],
       });
@@ -17,17 +17,17 @@ describe("MCP setup text", () => {
   });
   it("quotes paths with spaces in the one-line commands", () => {
     expect(mcpSetup("claude", mac)).toBe(
-      `claude mcp add smallstocks-tw -- "${mac}" --mcp`,
+      `claude mcp add maxi-stocks -- "${mac}" --mcp`,
     );
     expect(mcpSetup("codex", win)).toBe(
-      `codex mcp add smallstocks-tw -- "${win}" --mcp`,
+      `codex mcp add maxi-stocks -- "${win}" --mcp`,
     );
   });
   it("gives Gemini CLI the same JSON, plus the file to paste it into", () => {
     const text = mcpSetup("gemini", mac);
     expect(text).toContain("~/.gemini/settings.json");
     const parsed = JSON.parse(text.slice(text.indexOf("{")));
-    expect(parsed.mcpServers["smallstocks-tw"]).toEqual({
+    expect(parsed.mcpServers["maxi-stocks"]).toEqual({
       command: mac,
       args: ["--mcp"],
     });

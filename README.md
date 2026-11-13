@@ -1,12 +1,12 @@
-<img src="src-tauri/icons/128x128.png" width="88" height="88" alt="SmallStocks TW icon">
+<img src="src-tauri/icons/128x128.png" width="88" height="88" alt="MaxiStocks icon">
 
-# SmallStocks TW
+# MaxiStocks
 
-**Taiwan stocks, but small.**
+**Maxi stocks for the holdings you follow.**
 
 A quiet desktop watchlist for the stocks you want to follow while working.
 
-SmallStocks TW sits in a corner of your screen with a few Taiwan stocks, ETFs or market indices. Keep the numbers, switch to a tiny trend line, or show just a name and a triangular piece. When a price or percentage crosses a threshold you set, a short notice tells you. Choose the familiar small look, go grey, or turn the window into a terminal or a plain text report.
+Maxi stocks sits in a corner of your screen with a few Taiwan and US stocks, ETFs or market indices. Keep the numbers, switch to a tiny trend line, or show just a name and a triangular piece. When a price or percentage crosses a threshold you set, a short notice tells you. Choose the familiar small look, go grey, or turn the window into a terminal or a plain text report.
 
 It runs on its own. If you use an agent, an optional local MCP connection lets it read the same watchlist and set the same alerts in natural language.
 

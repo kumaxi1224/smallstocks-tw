@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shioaji quote sidecar for SmallStocks TW (prototype).
+"""Shioaji quote sidecar for Maxi stocks (prototype).
 
 Serves the latest SinoPac Shioaji quotes to the Tauri app over a
 token-protected loopback HTTP endpoint, in the same JSON shape as the

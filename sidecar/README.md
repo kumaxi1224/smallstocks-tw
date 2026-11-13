@@ -1,6 +1,6 @@
 # Shioaji sidecar（永豐即時行情）— 原型與整合設計
 
-目的：讓 SmallStocks TW 改用永豐金證券 Shioaji 的即時逐筆行情，
+目的：讓 Maxi stocks 改用永豐金證券 Shioaji 的即時逐筆行情，
 取代 TWSE MIS 快照（盤中約 1–2 分鐘才更新一次），股價更即時、更準確。
 只讀行情：不下載憑證、不啟用 CA、程式裡沒有任何下單呼叫，物理上無法成交。
 

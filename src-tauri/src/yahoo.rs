@@ -11,7 +11,7 @@ use crate::core::{index_name, local, now, Quote};
 use serde_json::Value;
 use std::collections::HashMap;
 
-const UA: &str = "Mozilla/5.0 SmallStocks-TW";
+const UA: &str = "Mozilla/5.0 MaxiStocks";
 
 fn num(v: &Value) -> Option<f64> {
     let n = v.as_f64().or_else(|| v.as_str()?.parse().ok())?;

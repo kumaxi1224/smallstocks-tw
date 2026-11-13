@@ -23,6 +23,35 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 fn demo() -> bool {
     std::env::args().any(|a| a == "--demo")
 }
+/// Files carried over when the data folder moved from %APPDATA%\SmallStocks-TW
+/// to %APPDATA%\MaxiStocks (the v0.1.32 rebrand): everything the app and the
+/// sidecar keep side by side in the data folder.
+const DATA_DIR_FILES: [&str; 4] = [
+    "state.json",
+    "windows.json",
+    "sidecar-token.txt",
+    "mcp-connection.json",
+];
+
+/// One-time copy of the data files from the legacy folder into the new one.
+/// Runs only while the new folder has no state.json yet and the legacy folder
+/// has one; the legacy folder is left untouched as a fallback, and nothing
+/// already in the new folder is ever overwritten.
+fn migrate_legacy_data_dir(new_dir: &std::path::Path, old_dir: &std::path::Path) {
+    if new_dir.join("state.json").exists() || !old_dir.join("state.json").is_file() {
+        return;
+    }
+    if std::fs::create_dir_all(new_dir).is_err() {
+        return;
+    }
+    for name in DATA_DIR_FILES {
+        let from = old_dir.join(name);
+        if from.is_file() {
+            let _ = std::fs::copy(&from, new_dir.join(name));
+        }
+    }
+}
+
 fn data_dir() -> PathBuf {
     if let Some(p) = std::env::var_os("SMALLSTOCKS_CONFIG_DIR") {
         return PathBuf::from(p);
@@ -34,11 +63,12 @@ fn data_dir() -> PathBuf {
         std::env::var_os("APPDATA").map(PathBuf::from)
     }
     .unwrap_or_else(std::env::temp_dir);
-    base.join(if demo() {
-        "SmallStocks-TW-demo"
-    } else {
-        "SmallStocks-TW"
-    })
+    if demo() {
+        return base.join("MaxiStocks-demo");
+    }
+    let dir = base.join("MaxiStocks");
+    migrate_legacy_data_dir(&dir, &base.join("SmallStocks-TW"));
+    dir
 }
 /// Runs a background worker for the life of the app. A panic must not leave the monitor
 /// silently dead: record it for the UI/MCP status and start the worker again.
@@ -614,7 +644,7 @@ pub fn run() {
                 "notify",
                 tauri::WebviewUrl::App("notify.html".into()),
             )
-            .title("SmallStocks TW notice")
+            .title("Maxi stocks notice")
             .inner_size(300., 56.)
             .decorations(false)
             .transparent(true)
@@ -624,11 +654,11 @@ pub fn run() {
             .skip_taskbar(true)
             .visible(false)
             .build()?;
-            let show = MenuItem::with_id(app, "show", "顯示 SmallStocks TW", true, None::<&str>)?;
+            let show = MenuItem::with_id(app, "show", "顯示 Maxi stocks", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "結束監看並離開", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show, &quit])?;
             let mut tray = TrayIconBuilder::new()
-                .tooltip("SmallStocks TW · 本機監看")
+                .tooltip("Maxi stocks · 本機監看")
                 .menu(&menu)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show" => show_main_window(app),
@@ -662,7 +692,7 @@ pub fn run() {
             supervise(setup_state.clone(), "行情輪詢", move || {
                 let client = reqwest::blocking::Client::builder()
                     .timeout(Duration::from_secs(15))
-                    .user_agent(concat!("SmallStocks-TW/", env!("CARGO_PKG_VERSION")))
+                    .user_agent(concat!("MaxiStocks/", env!("CARGO_PKG_VERSION")))
                     .build()
                     .unwrap();
                 // The sidecar is on loopback: fail fast so the MIS fallback is not delayed.
@@ -846,7 +876,7 @@ pub fn run() {
             supervise(setup_state.clone(), "分鐘線佇列", move || {
                 let client = reqwest::blocking::Client::builder()
                     .timeout(Duration::from_secs(15))
-                    .user_agent("Mozilla/5.0 SmallStocks-TW")
+                    .user_agent("Mozilla/5.0 MaxiStocks")
                     .build()
                     .unwrap();
                 loop {
@@ -892,7 +922,7 @@ pub fn run() {
             supervise(setup_state.clone(), "日資料佇列", move || {
                 let client = reqwest::blocking::Client::builder()
                     .timeout(Duration::from_secs(20))
-                    .user_agent(concat!("SmallStocks-TW/", env!("CARGO_PKG_VERSION")))
+                    .user_agent(concat!("MaxiStocks/", env!("CARGO_PKG_VERSION")))
                     .build()
                     .unwrap();
                 loop {
@@ -938,7 +968,7 @@ pub fn run() {
             supervise(setup_state.clone(), "組合歷史佇列", move || {
                 let client = reqwest::blocking::Client::builder()
                     .timeout(Duration::from_secs(30))
-                    .user_agent("Mozilla/5.0 SmallStocks-TW")
+                    .user_agent("Mozilla/5.0 MaxiStocks")
                     .build()
                     .unwrap();
                 loop {
@@ -972,7 +1002,7 @@ pub fn run() {
             supervise(setup_state.clone(), "休市日曆", move || {
                 let client = reqwest::blocking::Client::builder()
                     .timeout(Duration::from_secs(20))
-                    .user_agent(concat!("SmallStocks-TW/", env!("CARGO_PKG_VERSION")))
+                    .user_agent(concat!("MaxiStocks/", env!("CARGO_PKG_VERSION")))
                     .build()
                     .unwrap();
                 loop {
@@ -1041,4 +1071,87 @@ pub fn run() {
         })
         .run(context)
         .expect("desktop runtime failed");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::migrate_legacy_data_dir;
+    use std::path::PathBuf;
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "maxistocks-migrate-{tag}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn migration_copies_every_data_file_into_an_empty_new_dir() {
+        let root = temp_root("copy");
+        let new = root.join("MaxiStocks");
+        let old = root.join("SmallStocks-TW");
+        std::fs::create_dir_all(&old).unwrap();
+        for name in [
+            "state.json",
+            "windows.json",
+            "sidecar-token.txt",
+            "mcp-connection.json",
+        ] {
+            std::fs::write(old.join(name), format!("content of {name}")).unwrap();
+        }
+        migrate_legacy_data_dir(&new, &old);
+        for name in [
+            "state.json",
+            "windows.json",
+            "sidecar-token.txt",
+            "mcp-connection.json",
+        ] {
+            assert_eq!(
+                std::fs::read_to_string(new.join(name)).unwrap(),
+                format!("content of {name}")
+            );
+        }
+        // The legacy folder is left in place as a fallback.
+        assert!(old.join("state.json").is_file());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn migration_never_touches_a_new_dir_that_already_has_state() {
+        let root = temp_root("keep");
+        let new = root.join("MaxiStocks");
+        let old = root.join("SmallStocks-TW");
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(new.join("state.json"), "new state").unwrap();
+        std::fs::write(old.join("state.json"), "old state").unwrap();
+        std::fs::write(old.join("sidecar-token.txt"), "old token").unwrap();
+        migrate_legacy_data_dir(&new, &old);
+        assert_eq!(
+            std::fs::read_to_string(new.join("state.json")).unwrap(),
+            "new state"
+        );
+        // Not even the other files are copied once the new dir is in use.
+        assert!(!new.join("sidecar-token.txt").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn migration_is_a_noop_without_a_legacy_state() {
+        let root = temp_root("noop");
+        let new = root.join("MaxiStocks");
+        let old = root.join("SmallStocks-TW");
+        // Legacy folder missing entirely.
+        migrate_legacy_data_dir(&new, &old);
+        assert!(!new.join("state.json").exists());
+        // Legacy folder present but holding no state.json: nothing to carry.
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("windows.json"), "{}").unwrap();
+        migrate_legacy_data_dir(&new, &old);
+        assert!(!new.join("state.json").exists());
+        assert!(!new.join("windows.json").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }

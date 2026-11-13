@@ -25,6 +25,7 @@ let preview: Snapshot = {
     telegramEnabled: false,
     telegramChatId: "",
     telegramTokenSet: false,
+    positionDropAlert: true,
     backupEnabled: false,
     backupDir: "",
     chatWindow: false,
@@ -290,7 +291,7 @@ export async function exportData(): Promise<string> {
     return invoke<string>("core_request", { tool: "export_data", args: {} });
   return JSON.stringify(
     {
-      app: "smallstocks-tw",
+      app: "maxi-stocks",
       version: 1,
       groups: preview.groups ?? [],
       activeGroup: preview.activeGroup ?? 0,
@@ -325,8 +326,9 @@ export async function importData(jsonText: string): Promise<Snapshot> {
   } catch {
     throw new Error("匯入檔案不是有效的 JSON");
   }
-  if (v?.app !== "smallstocks-tw")
-    throw new Error("這不是 SmallStocks TW 的匯出檔案");
+  // Exports written before the v0.1.32 rebrand carry the legacy tag.
+  if (v?.app !== "maxi-stocks" && v?.app !== "smallstocks-tw")
+    throw new Error("這不是 Maxi stocks 的匯出檔案");
   if (v?.version !== 1) throw new Error("不支援的匯出檔案版本");
   if (!Array.isArray(v.groups) || !v.groups.length)
     throw new Error("匯出檔案沒有任何分組");

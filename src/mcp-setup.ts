@@ -7,11 +7,11 @@ const quote = (exe: string) => `"${exe.replaceAll('"', "")}"`;
 
 export function mcpSetup(kind: McpKind, exe: string): string {
   if (kind === "claude")
-    return `claude mcp add smallstocks-tw -- ${quote(exe)} --mcp`;
+    return `claude mcp add maxi-stocks -- ${quote(exe)} --mcp`;
   if (kind === "codex")
-    return `codex mcp add smallstocks-tw -- ${quote(exe)} --mcp`;
+    return `codex mcp add maxi-stocks -- ${quote(exe)} --mcp`;
   const json = JSON.stringify(
-    { mcpServers: { "smallstocks-tw": { command: exe, args: ["--mcp"] } } },
+    { mcpServers: { "maxi-stocks": { command: exe, args: ["--mcp"] } } },
     null,
     2,
   );

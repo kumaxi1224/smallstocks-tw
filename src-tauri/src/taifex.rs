@@ -13,7 +13,7 @@ use crate::core::{index_name, local, now, Quote};
 use chrono::{FixedOffset, NaiveDateTime, TimeZone, Timelike};
 use serde_json::Value;
 
-const UA: &str = "Mozilla/5.0 SmallStocks-TW";
+const UA: &str = "Mozilla/5.0 MaxiStocks";
 const API: &str = "https://mis.taifex.com.tw/futures/api/getQuoteList";
 
 /// Which MIS market a Taipei timestamp belongs to: "0" is the regular

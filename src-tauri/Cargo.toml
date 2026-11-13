@@ -1,8 +1,12 @@
 [package]
 name = "smallstocks-tw"
-version = "0.1.31"
+version = "0.1.33"
 description = "A quiet local Taiwan stock monitor"
 edition = "2021"
+
+[[bin]]
+name = "MaxiStocks"
+path = "src/main.rs"
 
 [lib]
 name = "smallstocks_lib"

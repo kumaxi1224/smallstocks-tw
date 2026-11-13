@@ -35,6 +35,6 @@ jobs:
         run: ./scripts/package-portable.ps1
       - uses: actions/upload-artifact@v4
         with:
-          name: SmallStocks-TW-windows-portable
-          path: releases/SmallStocks-TW-*-windows-x64.zip
+          name: MaxiStocks-windows-portable
+          path: releases/MaxiStocks-*-windows-x64.zip
           if-no-files-found: error
