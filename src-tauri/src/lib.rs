@@ -4,6 +4,7 @@ mod daily;
 mod history;
 mod intraday;
 mod mcp;
+mod sidecar_keys;
 mod taifex;
 mod yahoo;
 use core::{now, Core};
@@ -416,6 +417,10 @@ fn core_request(
         // Fire-and-forget: building the chat window must not happen in
         // this synchronous handler's stack (see sync_chat_window).
         sync_chat_window(&app);
+        // Bring the Shioaji sidecar up if the new settings call for it.
+        // Conditions, a liveness probe and an attempt budget inside
+        // ensure_sidecar keep this a cheap no-op when nothing applies.
+        let _ = ensure_sidecar(&app, false);
     }
     Ok(result)
 }
@@ -431,6 +436,131 @@ fn sync_main_window(app: &tauri::AppHandle) -> Result<(), String> {
         .get_webview_window("main")
         .ok_or("main window unavailable")?;
     window.set_always_on_top(enabled).map_err(|e| e.to_string())
+}
+/// The Shioaji keys are set only from the settings page, through these
+/// commands: nothing here is registered with MCP, and the key values are
+/// never returned — status reports two booleans, set/clear return
+/// nothing. The keys live in their own file (see sidecar_keys.rs),
+/// outside the core's state entirely.
+#[tauri::command]
+fn shioaji_keys_set(api_key: String, secret_key: String) -> Result<(), String> {
+    sidecar_keys::save(&data_dir(), &api_key, &secret_key)
+}
+#[tauri::command]
+fn shioaji_keys_status() -> Value {
+    sidecar_keys::status_json(&data_dir())
+}
+#[tauri::command]
+fn shioaji_keys_clear() -> Result<(), String> {
+    sidecar_keys::clear(&data_dir())
+}
+/// Manual trigger for the settings page's start button: same conditions
+/// and liveness probe as the automatic path, but it skips the retry
+/// interval (the per-run attempt cap still applies). The returned line
+/// says what happened, for the settings page to show.
+#[tauri::command]
+fn sidecar_start_now(app: tauri::AppHandle) -> Result<String, String> {
+    Ok(ensure_sidecar(&app, true))
+}
+/// Spawn-attempt bookkeeping for ensure_sidecar: how many times this run
+/// has tried to start the sidecar and when the last try happened. Shell
+/// state only — process management, like the chat-window sync — and
+/// deliberately not in the core, whose single ownership covers
+/// monitoring, rules, events and settings.
+#[derive(Default)]
+struct SidecarStartGate(Mutex<SidecarStartAttempts>);
+#[derive(Default)]
+struct SidecarStartAttempts {
+    attempts: u32,
+    last: Option<std::time::Instant>,
+}
+const SIDECAR_MAX_ATTEMPTS: u32 = 5;
+const SIDECAR_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+/// Bring the Shioaji sidecar up when every condition holds: the quote
+/// source is Shioaji, auto-start is on, both keys are stored, and the
+/// configured folder holds shioaji_sidecar.py. A sidecar that already
+/// answers on its port is left alone (the probe is a bare TCP connect —
+/// /health demands the token header, so it cannot serve as the probe).
+/// The sidecar is spawned as `python shioaji_sidecar.py` in its folder
+/// with the keys in its environment, exactly like run-sidecar.bat;
+/// python is a console program, so it gets its own console window with
+/// the listening line and its logs — nothing is hidden. Returns a line
+/// describing the outcome (the settings page shows it for the manual
+/// button); automatic callers ignore it, except that spawn failures and
+/// a spent attempt budget are also written into the core's error field,
+/// where the settings page surfaces errors.
+fn ensure_sidecar(app: &tauri::AppHandle, manual: bool) -> String {
+    let (quote_source, auto_start, sidecar_dir, sidecar_port) = {
+        let shared = app.state::<mcp::Shared>();
+        let s = shared.lock().unwrap_or_else(PoisonError::into_inner);
+        (
+            s.saved.settings.quote_source.clone(),
+            s.saved.settings.sidecar_auto_start,
+            s.saved.settings.sidecar_dir.clone(),
+            s.saved.settings.sidecar_port,
+        )
+    };
+    if quote_source != "shioaji" {
+        return "未啟動：行情來源不是永豐 Shioaji。".into();
+    }
+    if !auto_start {
+        return "未啟動：請先開啟 sidecar 自動啟動。".into();
+    }
+    let dir = data_dir();
+    let Some(keys) = sidecar_keys::load(&dir) else {
+        return "未啟動：Shioaji 金鑰尚未儲存。".into();
+    };
+    let folder = sidecar_dir.trim();
+    if folder.is_empty() {
+        return "未啟動：尚未設定 sidecar 資料夾路徑。".into();
+    }
+    if !std::path::Path::new(folder)
+        .join("shioaji_sidecar.py")
+        .is_file()
+    {
+        return "未啟動：sidecar 資料夾裡找不到 shioaji_sidecar.py。".into();
+    }
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], sidecar_port));
+    if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(400)).is_ok() {
+        return "sidecar 已在執行中。".into();
+    }
+    {
+        let gate = app.state::<SidecarStartGate>();
+        let mut g = gate.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if g.attempts >= SIDECAR_MAX_ATTEMPTS {
+            let msg = format!(
+                "sidecar 自動啟動已嘗試 {SIDECAR_MAX_ATTEMPTS} 次仍未連上，已停止嘗試；請確認 python 已安裝、sidecar 資料夾正確，重新啟動程式後再試"
+            );
+            app.state::<mcp::Shared>()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .error = Some(msg.clone());
+            return msg;
+        }
+        if !manual && g.last.is_some_and(|t| t.elapsed() < SIDECAR_RETRY_INTERVAL) {
+            return "sidecar 剛嘗試啟動過，節流中，稍後會再試。".into();
+        }
+        g.attempts += 1;
+        g.last = Some(std::time::Instant::now());
+    }
+    match std::process::Command::new("python")
+        .arg("shioaji_sidecar.py")
+        .current_dir(folder)
+        .env("SHIOAJI_API_KEY", &keys.api_key)
+        .env("SHIOAJI_SECRET_KEY", &keys.secret_key)
+        .env("SMALLSTOCKS_CONFIG_DIR", &dir)
+        .spawn()
+    {
+        Ok(_child) => "sidecar 已啟動，請看它自己的主控台視窗確認 listening 行。".into(),
+        Err(e) => {
+            let msg = format!("sidecar 自動啟動失敗：{e}");
+            app.state::<mcp::Shared>()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .error = Some(msg.clone());
+            msg
+        }
+    }
 }
 /// The PTT chat window: a plain decorated webview on the channel's public
 /// preview feed (t.me/s renders server-side, so no Telegram login is
@@ -610,6 +740,7 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_opener::init())
         .manage(state)
+        .manage(SidecarStartGate::default())
         .invoke_handler(tauri::generate_handler![
             mcp_exe,
             privacy_toggle,
@@ -620,7 +751,11 @@ pub fn run() {
             search_stocks,
             show_stock_detail,
             hide_stock_detail,
-            fit_minimal_height
+            fit_minimal_height,
+            shioaji_keys_set,
+            shioaji_keys_status,
+            shioaji_keys_clear,
+            sidecar_start_now
         ])
         .setup(move |app| {
             tauri::WebviewWindowBuilder::new(
@@ -687,6 +822,11 @@ pub fn run() {
             if let Err(e) = mcp::serve(setup_state.clone(), &dir, app.handle().clone()) {
                 setup_state.lock().unwrap_or_else(PoisonError::into_inner).error = Some(format!("MCP 啟動失敗：{e}"));
             }
+            // Auto-start the Shioaji sidecar when the saved settings and
+            // the locally stored keys call for it; a no-op otherwise,
+            // and failures land in the core's error field (see
+            // ensure_sidecar).
+            let _ = ensure_sidecar(app.handle(), false);
             let handle = app.handle().clone();
             let poll_state = setup_state.clone();
             supervise(setup_state.clone(), "行情輪詢", move || {

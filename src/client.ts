@@ -21,6 +21,8 @@ let preview: Snapshot = {
     showChangePoints: true,
     quoteSource: "mis",
     sidecarPort: 18765,
+    sidecarAutoStart: false,
+    sidecarDir: "",
     windowOpacity: 1,
     telegramEnabled: false,
     telegramChatId: "",
@@ -272,6 +274,41 @@ export async function exportDataFile(): Promise<string> {
 export async function telegramTest(): Promise<void> {
   if (!desktop) throw new Error("瀏覽器預覽無法發送 Telegram 訊息");
   await invoke("core_request", { tool: "telegram_test", args: {} });
+}
+/** Which of the locally stored Shioaji keys exist — booleans only. */
+export interface ShioajiKeysStatus {
+  apiKeySet: boolean;
+  secretKeySet: boolean;
+}
+/**
+ * Desktop only: the Shioaji keys live in their own file in the data
+ * folder, outside the core and its state. These wrappers are the only
+ * way in or out, and the values travel in exactly one direction (into
+ * shioajiKeysSet); the status reports existence, never a value.
+ */
+export async function shioajiKeysStatus(): Promise<ShioajiKeysStatus> {
+  if (!desktop) throw new Error("瀏覽器預覽沒有本機金鑰");
+  return invoke<ShioajiKeysStatus>("shioaji_keys_status");
+}
+export async function shioajiKeysSet(
+  apiKey: string,
+  secretKey: string,
+): Promise<void> {
+  if (!desktop) throw new Error("瀏覽器預覽無法儲存金鑰");
+  await invoke("shioaji_keys_set", { apiKey, secretKey });
+}
+export async function shioajiKeysClear(): Promise<void> {
+  if (!desktop) throw new Error("瀏覽器預覽無法清除金鑰");
+  await invoke("shioaji_keys_clear");
+}
+/**
+ * Desktop only: ask the shell to start the sidecar now (same conditions
+ * and probe as the automatic path). Returns a line describing the
+ * outcome for the settings page to show.
+ */
+export async function sidecarStartNow(): Promise<string> {
+  if (!desktop) throw new Error("瀏覽器預覽無法啟動 sidecar");
+  return invoke<string>("sidecar_start_now");
 }
 /**
  * Desktop only: writes a state backup into the configured folder right

@@ -4,6 +4,7 @@ import {
   stale,
   change,
   shellOpacity,
+  shioajiKeysLabel,
   shouldKeepScroll,
   sizeSignature,
   ruleText,
@@ -318,6 +319,20 @@ describe("window opacity", () => {
     expect(shellOpacity(0.1)).toBe(0.4);
     expect(shellOpacity(0)).toBe(0.4);
     expect(shellOpacity(2)).toBe(1);
+  });
+});
+
+describe("shioaji keys status label", () => {
+  it("names each key's existence and nothing more", () => {
+    expect(shioajiKeysLabel({ apiKeySet: true, secretKeySet: true })).toBe(
+      "API Key 已設定、Secret Key 已設定",
+    );
+    expect(shioajiKeysLabel({ apiKeySet: true, secretKeySet: false })).toBe(
+      "API Key 已設定、Secret Key 未設定",
+    );
+    expect(shioajiKeysLabel({ apiKeySet: false, secretKeySet: false })).toBe(
+      "API Key 未設定、Secret Key 未設定",
+    );
   });
 });
 

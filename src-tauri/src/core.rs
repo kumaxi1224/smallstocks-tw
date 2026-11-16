@@ -503,6 +503,16 @@ pub struct Settings {
     pub quote_source: String,
     #[serde(default = "default_sidecar_port")]
     pub sidecar_port: u16,
+    /// Start the Shioaji sidecar automatically (lib.rs's ensure_sidecar)
+    /// when the quote source is Shioaji. The API keys themselves are NOT
+    /// a setting: they live in their own file in the data folder (see
+    /// sidecar_keys.rs) and never enter Saved at all.
+    #[serde(default)]
+    pub sidecar_auto_start: bool,
+    /// Folder holding the user's copy of shioaji_sidecar.py (the sidecar
+    /// kit's folder); the shell spawns `python shioaji_sidecar.py` there.
+    #[serde(default)]
+    pub sidecar_dir: String,
     /// Opacity of the main window's shell background, 0.4–1.0 (1.0 = opaque).
     /// Only the background fades; text and numbers stay fully opaque.
     #[serde(default = "default_window_opacity")]
@@ -582,6 +592,8 @@ impl Default for Settings {
             refresh_seconds: 15,
             quote_source: default_quote_source(),
             sidecar_port: DEFAULT_SIDECAR_PORT,
+            sidecar_auto_start: false,
+            sidecar_dir: String::new(),
             window_opacity: 1.0,
             telegram_enabled: false,
             telegram_chat_id: String::new(),
@@ -2033,6 +2045,14 @@ impl Core {
                     };
                     next.saved.settings.sidecar_port = p as u16;
                 }
+                if let Some(v) = args.get("sidecarAutoStart") {
+                    next.saved.settings.sidecar_auto_start =
+                        v.as_bool().ok_or("sidecar 自動啟動需為布林值")?;
+                }
+                if let Some(v) = args.get("sidecarDir") {
+                    next.saved.settings.sidecar_dir =
+                        v.as_str().ok_or("sidecar 資料夾需為文字")?.trim().into();
+                }
                 if let Some(v) = args.get("windowOpacity") {
                     let v = v.as_f64().ok_or("視窗透明度需為數字")?;
                     next.saved.settings.window_opacity = clamp_window_opacity(v);
@@ -3022,6 +3042,9 @@ mod tests {
         .unwrap();
         assert_eq!(old.quote_source, "mis");
         assert_eq!(old.sidecar_port, DEFAULT_SIDECAR_PORT);
+        // Auto-start did not exist either: off, and no sidecar folder.
+        assert!(!old.sidecar_auto_start);
+        assert_eq!(old.sidecar_dir, "");
         let dir = std::env::temp_dir().join(format!("smallstocks-sidecar-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut c = Core::load(dir.join("state.json"), true).unwrap();
@@ -3031,6 +3054,25 @@ mod tests {
         assert_eq!(c.saved.settings.sidecar_port, 18766);
         assert!(c.execute("set_settings", json!({"quoteSource":"yahoo"})).is_err());
         assert!(c.execute("set_settings", json!({"sidecarPort":80})).is_err());
+        // The auto-start toggle and folder round-trip like other settings
+        // and surface in the snapshot (neither is a secret).
+        c.execute(
+            "set_settings",
+            json!({"sidecarAutoStart":true,"sidecarDir":" C:\\MaxiStocks-Sidecar "}),
+        )
+        .unwrap();
+        assert!(c.saved.settings.sidecar_auto_start);
+        assert_eq!(c.saved.settings.sidecar_dir, "C:\\MaxiStocks-Sidecar");
+        assert_eq!(c.snapshot()["settings"]["sidecarAutoStart"], json!(true));
+        assert_eq!(
+            c.snapshot()["settings"]["sidecarDir"],
+            json!("C:\\MaxiStocks-Sidecar")
+        );
+        assert!(c
+            .execute("set_settings", json!({"sidecarAutoStart": "yes"}))
+            .is_err());
+        assert!(c.saved.settings.sidecar_auto_start);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
     #[test]
     fn sidecar_token_is_read_trimmed_from_the_config_dir() {

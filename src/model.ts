@@ -168,6 +168,12 @@ export interface Snapshot {
     showChangePoints?: boolean;
     quoteSource?: "mis" | "shioaji";
     sidecarPort?: number;
+    /** Start the Shioaji sidecar automatically when the app launches.
+     * The API keys are not settings at all: they live in their own local
+     * file and only their existence is ever reported (shioajiKeysLabel). */
+    sidecarAutoStart?: boolean;
+    /** Folder holding the user's shioaji_sidecar.py (the sidecar kit). */
+    sidecarDir?: string;
     /** Shell background opacity, 0.4–1.0; absent means fully opaque. */
     windowOpacity?: number;
     /** Telegram alert push. The bot token itself never leaves the core:
@@ -292,6 +298,14 @@ export function axisTicks(low: number, high: number, count = 4): number[] {
 /** Shell background opacity, clamped to the range the core accepts (0.4–1). */
 export const shellOpacity = (v: number | null | undefined) =>
   v == null || !Number.isFinite(v) ? 1 : Math.min(1, Math.max(0.4, v));
+/** Settings-page label for the locally stored Shioaji keys. The status
+ * carries only which keys exist — never a value, not even a masked one —
+ * and this label is all the page ever shows about them. */
+export const shioajiKeysLabel = (status: {
+  apiKeySet: boolean;
+  secretKeySet: boolean;
+}) =>
+  `API Key ${status.apiKeySet ? "已設定" : "未設定"}、Secret Key ${status.secretKeySet ? "已設定" : "未設定"}`;
 /** Whether re-rendering the view already on screen keeps its scroll place.
  * Poll ticks and background refreshes re-render the same view and must not
  * fling the user back to the top; a view switch — or an explicit reset from
