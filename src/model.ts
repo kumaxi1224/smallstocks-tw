@@ -189,6 +189,9 @@ export interface Snapshot {
     backupDir?: string;
     /** Auxiliary PTT chat window (public t.me/s preview, no login). */
     chatWindow?: boolean;
+    /** Chat window zoom percent; one of 80/90/100/110/125/150.
+     * Absent on old states, where the core defaults it to 100. */
+    chatZoom?: number;
   };
   quotes: Record<string, Quote>;
   rules: Rule[];

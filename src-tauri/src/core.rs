@@ -546,9 +546,20 @@ pub struct Settings {
     /// to false, so the setting always says whether the window is up.
     #[serde(default)]
     pub chat_window: bool,
+    /// Zoom of the PTT chat window as an integer percent, one of
+    /// CHAT_ZOOM_LEVELS. The hosted webview ignores the browser's own
+    /// zoom shortcuts under Tauri, so lib.rs applies this through the
+    /// webview's native set_zoom whenever it reconciles the window.
+    #[serde(default = "default_chat_zoom")]
+    pub chat_zoom: u64,
 }
 fn default_row_display() -> String {
     "numbers".into()
+}
+/// The only zoom levels the PTT chat window offers (integer percents).
+pub const CHAT_ZOOM_LEVELS: [u64; 6] = [80, 90, 100, 110, 125, 150];
+fn default_chat_zoom() -> u64 {
+    100
 }
 fn default_quote_source() -> String {
     "mis".into()
@@ -602,6 +613,7 @@ impl Default for Settings {
             backup_enabled: false,
             backup_dir: String::new(),
             chat_window: false,
+            chat_zoom: 100,
         }
     }
 }
@@ -2095,6 +2107,13 @@ impl Core {
                 if let Some(v) = args.get("chatWindow") {
                     next.saved.settings.chat_window =
                         v.as_bool().ok_or("聊天視窗需為布林值")?;
+                }
+                if let Some(v) = args.get("chatZoom") {
+                    let v = v.as_u64().ok_or("聊天視窗縮放需為整數百分比")?;
+                    if !CHAT_ZOOM_LEVELS.contains(&v) {
+                        return Err("聊天視窗縮放需為 80、90、100、110、125 或 150".into());
+                    }
+                    next.saved.settings.chat_zoom = v;
                 }
                 next.next_poll = 0;
             }
@@ -4392,6 +4411,41 @@ mod tests {
         let mut c2 = restored;
         assert!(c2.execute("set_settings", json!({"chatWindow": "yes"})).is_err());
         assert!(c2.saved.settings.chat_window);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn chat_zoom_setting_validates_levels_and_defaults_to_100() {
+        // Absent from an old state file, the zoom defaults to 100.
+        let old: Settings = serde_json::from_str(
+            r#"{"alwaysOnTop":true,"showCodes":false,"appearance":"small","paused":false,"refreshSeconds":15}"#,
+        )
+        .unwrap();
+        assert_eq!(old.chat_zoom, 100);
+        let dir = std::env::temp_dir().join(format!(
+            "smallstocks-chatzoom-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let mut c = Core::load(path.clone(), true).unwrap();
+        assert_eq!(c.saved.settings.chat_zoom, 100);
+        assert_eq!(c.snapshot()["settings"]["chatZoom"], json!(100));
+        // Every offered level round-trips through the snapshot…
+        for z in CHAT_ZOOM_LEVELS {
+            c.execute("set_settings", json!({"chatZoom": z})).unwrap();
+            assert_eq!(c.saved.settings.chat_zoom, z);
+            assert_eq!(c.snapshot()["settings"]["chatZoom"], json!(z));
+        }
+        // …and the last one persists across a reload.
+        let restored = Core::load(path, true).unwrap();
+        assert_eq!(restored.saved.settings.chat_zoom, 150);
+        // Levels outside the set, and non-integer values, are refused
+        // and leave the setting alone.
+        let mut c2 = restored;
+        assert!(c2.execute("set_settings", json!({"chatZoom": 105})).is_err());
+        assert!(c2.execute("set_settings", json!({"chatZoom": "125"})).is_err());
+        assert!(c2.execute("set_settings", json!({"chatZoom": 12.5})).is_err());
+        assert_eq!(c2.saved.settings.chat_zoom, 150);
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]

@@ -591,23 +591,37 @@ fn sync_chat_window(app: &tauri::AppHandle) {
 }
 /// The event-loop half of `sync_chat_window`: make the chat window match
 /// the setting as it reads *now* — create and show it when the setting
-/// is on, close it when off. Re-reading here (rather than trusting the
-/// value at request time) keeps a fast on-off-on from acting on a stale
+/// is on, close it when off — and (re)apply the saved zoom level to the
+/// live window. Re-reading here (rather than trusting the value at
+/// request time) keeps a fast on-off-on from acting on a stale
 /// copy. Runs only as an event-loop callback, so WebView2 controller
 /// initialization can proceed.
 fn apply_chat_window(app: &tauri::AppHandle) {
-    let enabled = app
-        .state::<mcp::Shared>()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .saved
-        .settings
-        .chat_window;
+    let (enabled, chat_zoom) = {
+        let shared = app.state::<mcp::Shared>();
+        let core = shared.lock().unwrap_or_else(PoisonError::into_inner);
+        (
+            core.saved.settings.chat_window,
+            core.saved.settings.chat_zoom,
+        )
+    };
     let result = match app.get_webview_window(CHAT_WINDOW_LABEL) {
         Some(w) if enabled => {
             let _ = w.show();
             let _ = w.unminimize();
             let _ = w.set_focus();
+            // Bringing the window forward also refreshes the feed:
+            // the hosted page loads once and never pushes new
+            // messages in this webview host, so without a reload the
+            // user would keep reading the messages from when the
+            // window was opened. The feed anchors at the newest
+            // message, so no scroll position is worth preserving.
+            if let Err(e) = w.reload() {
+                app.state::<mcp::Shared>()
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .error = Some(format!("聊天視窗重新載入失敗：{e}"));
+            }
             Ok(())
         }
         Some(w) => w.close().map_err(|e| e.to_string()),
@@ -632,6 +646,61 @@ fn apply_chat_window(app: &tauri::AppHandle) {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .error = Some(format!("聊天視窗開啟失敗：{e}"));
+        return;
+    }
+    // The hosted page ignores the browser's zoom shortcuts, so the
+    // saved level goes through the webview's native zoom instead — on
+    // a freshly built window just as much as on a settings change
+    // against one that is already open (sync runs after every
+    // set_settings, so the new level lands without reopening it).
+    if enabled {
+        if let Some(w) = app.get_webview_window(CHAT_WINDOW_LABEL) {
+            if let Err(e) = w.set_zoom(chat_zoom as f64 / 100.0) {
+                app.state::<mcp::Shared>()
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .error = Some(format!("聊天視窗縮放失敗：{e}"));
+            }
+        }
+    }
+}
+/// How often the chat window reloads its feed while it stays open.
+const CHAT_RELOAD_INTERVAL: Duration = Duration::from_secs(60);
+/// Start the chat feed's reload loop (called once, from setup). The
+/// t.me/s page loads its messages once and never pushes new ones in
+/// this webview host, so an open window would otherwise sit on the
+/// messages from when it was opened. Each tick posts the reload to
+/// the event loop through the same spawn → run_on_main_thread hop
+/// `sync_chat_window` uses — the loop thread itself never touches a
+/// window. A round whose window is missing or whose setting is off
+/// is skipped (reloading never creates the window), and a failed
+/// reload lands in the core's error field without killing the loop.
+fn start_chat_reload_loop(app: &tauri::AppHandle) {
+    let handle = app.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(CHAT_RELOAD_INTERVAL);
+        let worker = handle.clone();
+        let _ = handle.run_on_main_thread(move || reload_chat_window(&worker));
+    });
+}
+/// The event-loop half of the reload loop: reload the chat page when
+/// the window exists and the setting is on; do nothing otherwise.
+fn reload_chat_window(app: &tauri::AppHandle) {
+    let enabled = {
+        let shared = app.state::<mcp::Shared>();
+        let core = shared.lock().unwrap_or_else(PoisonError::into_inner);
+        core.saved.settings.chat_window
+    };
+    if !enabled {
+        return;
+    }
+    if let Some(w) = app.get_webview_window(CHAT_WINDOW_LABEL) {
+        if let Err(e) = w.reload() {
+            app.state::<mcp::Shared>()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .error = Some(format!("聊天視窗重新載入失敗：{e}"));
+        }
     }
 }
 #[tauri::command]
@@ -809,6 +878,9 @@ pub fn run() {
             // from the event loop once it is running, and a failure lands
             // in the core's error field (see apply_chat_window).
             sync_chat_window(app.handle());
+            // Keep an open chat window's feed fresh: the hosted page
+            // never pushes, so the loop reloads it once a minute.
+            start_chat_reload_loop(app.handle());
             // A long-running test instance must not take the user's own hide shortcut from them.
             let skip_shortcut = std::env::var_os("SMALLSTOCKS_NO_GLOBAL_SHORTCUT").is_some();
             let registered = if skip_shortcut {

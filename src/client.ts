@@ -31,6 +31,7 @@ let preview: Snapshot = {
     backupEnabled: false,
     backupDir: "",
     chatWindow: false,
+    chatZoom: 100,
   },
   quotes: {},
   rules: [],
