@@ -552,14 +552,23 @@ pub struct Settings {
     /// webview's native set_zoom whenever it reconciles the window.
     #[serde(default = "default_chat_zoom")]
     pub chat_zoom: u64,
+    /// How the PTT chat window renders its feed: "text" (the app fetches
+    /// the public preview itself and serves a plain monospace text page,
+    /// CMD-style) or "web" (the window loads the t.me/s page directly).
+    /// lib.rs reconciles the window's URL with this; see chat_text.rs.
+    #[serde(default = "default_chat_style")]
+    pub chat_style: String,
 }
 fn default_row_display() -> String {
     "numbers".into()
 }
 /// The only zoom levels the PTT chat window offers (integer percents).
-pub const CHAT_ZOOM_LEVELS: [u64; 6] = [80, 90, 100, 110, 125, 150];
+pub const CHAT_ZOOM_LEVELS: [u64; 9] = [50, 60, 70, 80, 90, 100, 110, 125, 150];
 fn default_chat_zoom() -> u64 {
     100
+}
+fn default_chat_style() -> String {
+    "text".into()
 }
 fn default_quote_source() -> String {
     "mis".into()
@@ -614,6 +623,7 @@ impl Default for Settings {
             backup_dir: String::new(),
             chat_window: false,
             chat_zoom: 100,
+            chat_style: default_chat_style(),
         }
     }
 }
@@ -2111,9 +2121,18 @@ impl Core {
                 if let Some(v) = args.get("chatZoom") {
                     let v = v.as_u64().ok_or("聊天視窗縮放需為整數百分比")?;
                     if !CHAT_ZOOM_LEVELS.contains(&v) {
-                        return Err("聊天視窗縮放需為 80、90、100、110、125 或 150".into());
+                        return Err(
+                            "聊天視窗縮放需為 50、60、70、80、90、100、110、125 或 150".into(),
+                        );
                     }
                     next.saved.settings.chat_zoom = v;
+                }
+                if let Some(v) = args.get("chatStyle") {
+                    let v = v.as_str().ok_or("聊天視窗樣式需為文字")?;
+                    if !["web", "text"].contains(&v) {
+                        return Err("聊天視窗樣式需為 web 或 text".into());
+                    }
+                    next.saved.settings.chat_style = v.into();
                 }
                 next.next_poll = 0;
             }
@@ -4446,6 +4465,40 @@ mod tests {
         assert!(c2.execute("set_settings", json!({"chatZoom": "125"})).is_err());
         assert!(c2.execute("set_settings", json!({"chatZoom": 12.5})).is_err());
         assert_eq!(c2.saved.settings.chat_zoom, 150);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn chat_style_setting_validates_and_defaults_to_text() {
+        // Absent from an old state file, the style defaults to "text":
+        // the plain-text rendering is what the user asked for.
+        let old: Settings = serde_json::from_str(
+            r#"{"alwaysOnTop":true,"showCodes":false,"appearance":"small","paused":false,"refreshSeconds":15}"#,
+        )
+        .unwrap();
+        assert_eq!(old.chat_style, "text");
+        let dir = std::env::temp_dir().join(format!(
+            "smallstocks-chatstyle-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let mut c = Core::load(path.clone(), true).unwrap();
+        assert_eq!(c.saved.settings.chat_style, "text");
+        assert_eq!(c.snapshot()["settings"]["chatStyle"], json!("text"));
+        // Both styles round-trip through the snapshot…
+        for s in ["web", "text"] {
+            c.execute("set_settings", json!({"chatStyle": s})).unwrap();
+            assert_eq!(c.saved.settings.chat_style, s);
+            assert_eq!(c.snapshot()["settings"]["chatStyle"], json!(s));
+        }
+        // …and the last one persists across a reload.
+        let restored = Core::load(path, true).unwrap();
+        assert_eq!(restored.saved.settings.chat_style, "text");
+        // Anything else is refused and leaves the setting alone.
+        let mut c2 = restored;
+        assert!(c2.execute("set_settings", json!({"chatStyle": "cmd"})).is_err());
+        assert!(c2.execute("set_settings", json!({"chatStyle": 42})).is_err());
+        assert_eq!(c2.saved.settings.chat_style, "text");
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]

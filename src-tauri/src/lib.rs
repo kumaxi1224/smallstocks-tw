@@ -1,4 +1,9 @@
+// The MCP tool list is one large json! literal; its expansion needs
+// more macro recursion than the default limit leaves room for.
+#![recursion_limit = "256"]
+
 mod calendar;
+mod chat_text;
 mod core;
 mod daily;
 mod history;
@@ -562,12 +567,49 @@ fn ensure_sidecar(app: &tauri::AppHandle, manual: bool) -> String {
         }
     }
 }
-/// The PTT chat window: a plain decorated webview on the channel's public
-/// preview feed (t.me/s renders server-side, so no Telegram login is
-/// needed). The label appears in no capability file, so the remote page
-/// gets no IPC access at all — it is a browser pane, nothing more.
+/// The PTT chat window: an auxiliary decorated webview on the channel's
+/// public preview feed (t.me/s renders server-side, so no Telegram
+/// login is needed). Two styles (the `chatStyle` setting): "web" loads
+/// the t.me/s page directly; "text" loads a local `chattext://` page
+/// the app renders itself from the same feed (see chat_text.rs). The
+/// label appears in no capability file, so neither page gets any IPC
+/// access — the window is a browser pane, nothing more. (The text page
+/// comes from a first-party scheme, so Tauri may inject its IPC bridge
+/// script into it; with no capability granting this label a single
+/// permission, every command call is still denied, and the page never
+/// calls it anyway — it is static HTML plus a scroll-anchor script.)
 const CHAT_WINDOW_LABEL: &str = "ptt-chat";
 const CHAT_URL: &str = "https://t.me/s/ptt_stock_follow_chat";
+/// The text style's local page (served from the ChatCache by the
+/// protocol registered in `run`). On Windows WebView2 this surfaces as
+/// http://chattext.localhost/; Tauri handles the conversion.
+const CHAT_TEXT_URL: &str = "chattext://localhost/";
+/// The chat settings as the window machinery needs them:
+/// (window enabled, zoom percent, style).
+fn chat_settings(app: &tauri::AppHandle) -> (bool, u64, String) {
+    let shared = app.state::<mcp::Shared>();
+    let core = shared.lock().unwrap_or_else(PoisonError::into_inner);
+    (
+        core.saved.settings.chat_window,
+        core.saved.settings.chat_zoom,
+        core.saved.settings.chat_style.clone(),
+    )
+}
+/// Surface a chat-window failure where the settings page shows it.
+fn set_core_error(app: &tauri::AppHandle, msg: String) {
+    app.state::<mcp::Shared>()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .error = Some(msg);
+}
+/// Which style the live chat window was built for, so apply can rebuild
+/// it when the setting flips: the two styles live at different URLs and
+/// a window cannot swap between them in place. Managed state, not core
+/// state — it describes this process's window, not a user preference.
+#[derive(Default)]
+struct ChatWindowState {
+    built_style: Mutex<Option<String>>,
+}
 /// Ask for the chat window to be reconciled with the `chatWindow`
 /// setting. This never touches a window itself: building a WebviewWindow
 /// runs WebView2 controller setup, which needs the main-thread message
@@ -597,48 +639,96 @@ fn sync_chat_window(app: &tauri::AppHandle) {
 /// copy. Runs only as an event-loop callback, so WebView2 controller
 /// initialization can proceed.
 fn apply_chat_window(app: &tauri::AppHandle) {
-    let (enabled, chat_zoom) = {
-        let shared = app.state::<mcp::Shared>();
-        let core = shared.lock().unwrap_or_else(PoisonError::into_inner);
-        (
-            core.saved.settings.chat_window,
-            core.saved.settings.chat_zoom,
-        )
-    };
+    let (enabled, chat_zoom, chat_style) = chat_settings(app);
+    // A window built for the other style sits at the wrong URL (the
+    // t.me page vs the local text page). Destroy it — destroy emits no
+    // CloseRequested, so the manual-close write-back cannot mistake
+    // this for the user closing the window and flip the setting off —
+    // and let the next sync pass rebuild it at the new URL, once the
+    // label is free again.
+    if let Some(w) = app.get_webview_window(CHAT_WINDOW_LABEL) {
+        let built = app
+            .state::<ChatWindowState>()
+            .built_style
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if built.as_deref() != Some(chat_style.as_str()) {
+            let _ = w.destroy();
+            *app
+                .state::<ChatWindowState>()
+                .built_style
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = None;
+            sync_chat_window(app);
+            return;
+        }
+    }
     let result = match app.get_webview_window(CHAT_WINDOW_LABEL) {
         Some(w) if enabled => {
             let _ = w.show();
             let _ = w.unminimize();
             let _ = w.set_focus();
             // Bringing the window forward also refreshes the feed:
-            // the hosted page loads once and never pushes new
-            // messages in this webview host, so without a reload the
-            // user would keep reading the messages from when the
-            // window was opened. The feed anchors at the newest
-            // message, so no scroll position is worth preserving.
-            if let Err(e) = w.reload() {
-                app.state::<mcp::Shared>()
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .error = Some(format!("聊天視窗重新載入失敗：{e}"));
+            // neither source pushes new messages into this webview
+            // host, so without a reload the user would keep reading
+            // the messages from when the window was opened. Text style
+            // reloads outright — the served page's own script puts the
+            // reading position back. Web style goes through the
+            // scroll guard (see reload_web_chat_window): the hosted
+            // page anchors at the newest message, so an unguarded
+            // reload would yank the user away from older messages
+            // they scrolled up to read.
+            if chat_style == "text" {
+                if let Err(e) = w.reload() {
+                    set_core_error(app, format!("聊天視窗重新載入失敗：{e}"));
+                }
+            } else {
+                reload_web_chat_window(app, &w);
             }
             Ok(())
         }
-        Some(w) => w.close().map_err(|e| e.to_string()),
-        None if enabled => tauri::Url::parse(CHAT_URL)
-            .map_err(|_| "聊天視窗網址無效".to_string())
-            .and_then(|url| {
-                tauri::WebviewWindowBuilder::new(
-                    app,
-                    CHAT_WINDOW_LABEL,
-                    tauri::WebviewUrl::External(url),
-                )
-                .title("PTT 股票閒聊")
-                .inner_size(440., 640.)
-                .build()
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-            }),
+        Some(w) => {
+            *app
+                .state::<ChatWindowState>()
+                .built_style
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = None;
+            w.close().map_err(|e| e.to_string())
+        }
+        None if enabled => {
+            let url = if chat_style == "text" {
+                tauri::Url::parse(CHAT_TEXT_URL).map(tauri::WebviewUrl::CustomProtocol)
+            } else {
+                tauri::Url::parse(CHAT_URL).map(tauri::WebviewUrl::External)
+            };
+            let built = url
+                .map_err(|_| "聊天視窗網址無效".to_string())
+                .and_then(|url| {
+                    tauri::WebviewWindowBuilder::new(app, CHAT_WINDOW_LABEL, url)
+                        .title("PTT 股票閒聊")
+                        .inner_size(440., 640.)
+                        .build()
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                });
+            if built.is_ok() {
+                *app
+                    .state::<ChatWindowState>()
+                    .built_style
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) =
+                    Some(chat_style.clone());
+                // A first open in text style can beat the fetch loop's
+                // first page; kick a fetch so the "載入中…" page clears
+                // within seconds instead of at the next minute tick.
+                if chat_style == "text" && app.state::<chat_text::ChatCache>().page().is_none()
+                {
+                    kick_chat_fetch(&app.state::<chat_text::ChatCache>());
+                }
+            }
+            built
+        }
         None => Ok(()),
     };
     if let Err(e) = result {
@@ -683,25 +773,135 @@ fn start_chat_reload_loop(app: &tauri::AppHandle) {
         let _ = handle.run_on_main_thread(move || reload_chat_window(&worker));
     });
 }
-/// The event-loop half of the reload loop: reload the chat page when
+/// The event-loop half of the reload loop: refresh the chat page when
 /// the window exists and the setting is on; do nothing otherwise.
+/// Text style reloads outright (the served page restores the reading
+/// position itself); web style goes through the scroll guard.
 fn reload_chat_window(app: &tauri::AppHandle) {
-    let enabled = {
-        let shared = app.state::<mcp::Shared>();
-        let core = shared.lock().unwrap_or_else(PoisonError::into_inner);
-        core.saved.settings.chat_window
-    };
+    let (enabled, _, chat_style) = chat_settings(app);
     if !enabled {
         return;
     }
     if let Some(w) = app.get_webview_window(CHAT_WINDOW_LABEL) {
-        if let Err(e) = w.reload() {
-            app.state::<mcp::Shared>()
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .error = Some(format!("聊天視窗重新載入失敗：{e}"));
+        if chat_style == "text" {
+            if let Err(e) = w.reload() {
+                set_core_error(app, format!("聊天視窗重新載入失敗：{e}"));
+            }
+        } else {
+            reload_web_chat_window(app, &w);
         }
     }
+}
+/// Scroll probe for the web style: true when the page is scrolled to
+/// (within 80px of) the bottom — or when the scroll state cannot be
+/// read at all, in which case refreshing is the safer default.
+const CHAT_SCROLL_PROBE_JS: &str = "(function(){try{var e=document.scrollingElement;\
+if(!e)return true;return (e.scrollHeight-e.scrollTop-e.clientHeight)<=80;}catch(_){return true;}})()";
+/// Reload the hosted t.me page only while the user is at the bottom of
+/// the feed. The page anchors at the newest message, so the v0.1.35
+/// unconditional reload teleported anyone who had scrolled up to read
+/// older messages straight back to the latest one. The probe result
+/// returns through eval_with_callback (a JSON "true"/"false"); the
+/// reload itself is dispatched back onto the event loop like every
+/// other window operation and re-reads the settings there, so a style
+/// flip in between makes it a no-op. Only an explicit "false" — user
+/// scrolled up — skips the round; a missing or garbled result reloads.
+fn reload_web_chat_window(app: &tauri::AppHandle, w: &tauri::WebviewWindow) {
+    let handle = app.clone();
+    let probed = w.eval_with_callback(CHAT_SCROLL_PROBE_JS, move |result| {
+        if result.trim() == "false" {
+            return;
+        }
+        let worker = handle.clone();
+        let _ = handle.run_on_main_thread(move || {
+            let (enabled, _, chat_style) = chat_settings(&worker);
+            if !enabled || chat_style != "web" {
+                return;
+            }
+            if let Some(w) = worker.get_webview_window(CHAT_WINDOW_LABEL) {
+                if let Err(e) = w.reload() {
+                    set_core_error(&worker, format!("聊天視窗重新載入失敗：{e}"));
+                }
+            }
+        });
+    });
+    if let Err(e) = probed {
+        set_core_error(app, format!("聊天視窗重新載入失敗：{e}"));
+    }
+}
+/// Browser UA for the feed fetch: t.me serves the same server-rendered
+/// page it gives any browser (verified from the dev VM).
+const CHAT_FETCH_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36";
+/// How often the app re-fetches the feed for the text style.
+const CHAT_FETCH_INTERVAL: Duration = Duration::from_secs(60);
+/// Guards the one-off fetch kicked when the window opens before the
+/// first page is cached, so repeated opens cannot pile fetches up.
+static CHAT_FETCH_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Start the text style's fetch loop (called once, from setup). Rounds
+/// run every minute but only while the chat window is wanted in text
+/// style — nothing reads the cache otherwise. The loop thread does the
+/// network and parsing itself; it never touches a window.
+fn start_chat_fetch_loop(shared: mcp::Shared, cache: chat_text::ChatCache) {
+    std::thread::spawn(move || {
+        let Ok(client) = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .user_agent(CHAT_FETCH_UA)
+            .build()
+        else {
+            return;
+        };
+        loop {
+            let wanted = {
+                let core = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                core.saved.settings.chat_window && core.saved.settings.chat_style == "text"
+            };
+            if wanted {
+                fetch_chat_page(&client, &cache);
+            }
+            std::thread::sleep(CHAT_FETCH_INTERVAL);
+        }
+    });
+}
+/// One fetch + parse + render into the cache. Any failure — network,
+/// HTTP status, or a page that parses to zero messages (an error page,
+/// a markup change) — leaves the previous cached page untouched, so
+/// the window keeps showing the last good feed.
+fn fetch_chat_page(client: &reqwest::blocking::Client, cache: &chat_text::ChatCache) {
+    let html = client
+        .get(CHAT_URL)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .and_then(|r| r.text());
+    let Ok(html) = html else {
+        return;
+    };
+    let messages = chat_text::parse_messages(&html);
+    if messages.is_empty() {
+        return;
+    }
+    let title = chat_text::channel_title(&html).unwrap_or_else(|| "PTT 股票閒聊".to_string());
+    let fetched = chrono::Local::now().format("%H:%M").to_string();
+    cache.store(chat_text::render_page(&title, &messages, &fetched));
+}
+/// Spawn a one-off fetch for a window opened in text style before the
+/// loop produced a page. At most one runs at a time.
+fn kick_chat_fetch(cache: &chat_text::ChatCache) {
+    use std::sync::atomic::Ordering;
+    if CHAT_FETCH_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let cache = cache.clone();
+    std::thread::spawn(move || {
+        if let Ok(client) = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .user_agent(CHAT_FETCH_UA)
+            .build()
+        {
+            fetch_chat_page(&client, &cache);
+        }
+        CHAT_FETCH_IN_FLIGHT.store(false, Ordering::SeqCst);
+    });
 }
 #[tauri::command]
 async fn search_stocks(query: String) -> Result<Value, String> {
@@ -773,6 +973,11 @@ pub fn run() {
         .unwrap_or_else(PoisonError::into_inner)
         .maybe_backup(false);
     let setup_state = state.clone();
+    // The chat window's text style serves its page from this cache
+    // through the chattext:// protocol registered below; the fetch
+    // loop (started in setup) keeps it fresh.
+    let chat_cache = chat_text::ChatCache::new();
+    let protocol_cache = chat_cache.clone();
     if let Some(window) = context
         .config_mut()
         .app
@@ -809,7 +1014,25 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_opener::init())
         .manage(state)
+        .manage(chat_cache)
+        .manage(ChatWindowState::default())
         .manage(SidecarStartGate::default())
+        // The chat text style's page: answered purely from the cache
+        // the fetch loop maintains — never a blocking fetch here. No
+        // page yet means "still loading" (or every fetch so far
+        // failed); the note points at the web style as the way out.
+        .register_uri_scheme_protocol("chattext", move |_ctx, _request| {
+            let body = protocol_cache.page().unwrap_or_else(|| {
+                chat_text::render_status_page(
+                    "PTT 股票閒聊",
+                    "載入中…若長時間沒有內容，可能是抓取失敗，可到設定把「聊天視窗樣式」切回網頁版。",
+                )
+            });
+            tauri::http::Response::builder()
+                .header("Content-Type", "text/html; charset=utf-8")
+                .body(body.into_bytes())
+                .unwrap_or_else(|_| tauri::http::Response::new(Vec::new()))
+        })
         .invoke_handler(tauri::generate_handler![
             mcp_exe,
             privacy_toggle,
@@ -881,6 +1104,12 @@ pub fn run() {
             // Keep an open chat window's feed fresh: the hosted page
             // never pushes, so the loop reloads it once a minute.
             start_chat_reload_loop(app.handle());
+            // Text style: keep a freshly rendered plain-text page in
+            // the cache the chattext:// protocol serves.
+            start_chat_fetch_loop(
+                setup_state.clone(),
+                app.state::<chat_text::ChatCache>().inner().clone(),
+            );
             // A long-running test instance must not take the user's own hide shortcut from them.
             let skip_shortcut = std::env::var_os("SMALLSTOCKS_NO_GLOBAL_SHORTCUT").is_some();
             let registered = if skip_shortcut {

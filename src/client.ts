@@ -32,6 +32,7 @@ let preview: Snapshot = {
     backupDir: "",
     chatWindow: false,
     chatZoom: 100,
+    chatStyle: "text",
   },
   quotes: {},
   rules: [],
