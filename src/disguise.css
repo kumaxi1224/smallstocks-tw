@@ -410,6 +410,31 @@ body[data-skin="native"] #content {
 .console-field.state {
   width: 9ch;
 }
+/* Notepad body: same fixed-width field boxes as the terminal, so the
+   value/change columns align structurally instead of by text padding. */
+.notepad-fields {
+  white-space: pre;
+}
+.note-field {
+  display: inline-block;
+  vertical-align: top;
+  overflow: hidden;
+  white-space: pre;
+}
+.note-field.code {
+  width: 7ch;
+}
+.note-field.name {
+  width: 14ch;
+}
+.note-field.value {
+  width: 12ch;
+  text-align: right;
+}
+.note-field.change {
+  width: 10ch;
+  text-align: right;
+}
 .console-command {
   display: flex;
   align-items: center;

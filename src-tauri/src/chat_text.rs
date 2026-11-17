@@ -1,20 +1,26 @@
-//! Plain-text (CMD-style) rendering of the PTT chat channel's public
-//! preview feed, for the chat window's "text" style.
+//! Plain-text (notepad-style) rendering of the PTT chat channel's
+//! public preview feed, for the chat window's "text" style.
 //!
 //! The app fetches https://t.me/s/ptt_stock_follow_chat itself (the
 //! window never loads t.me directly in this style), parses the
 //! server-rendered widget HTML with `parse_messages`, and serves a
 //! cached monospace page through a custom protocol (see lib.rs). The
-//! page is deliberately boring: black background, light-gray monospace
-//! text, one message per block, `HH:MM 作者：` up front — a .txt file,
+//! page is deliberately boring: white background, dark monospace
+//! text — the same document look as the main window's txt skin —
+//! one message per block, `HH:MM 作者：` up front — a .txt file,
 //! not a chat UI.
 //!
-//! Reading position: the hosted t.me page anchors at the newest
-//! message, so a reload used to yank the user away from older messages
-//! they had scrolled up to read. The rendered page carries a small
-//! script that keeps the data-post id of the topmost visible message
-//! (plus its offset) in sessionStorage and scrolls back to it after a
-//! reload; only a first load with nothing stored goes to the bottom.
+//! Reading position: the page refreshes itself in place — a small
+//! script re-fetches this same URL every minute, swaps the `#feed`
+//! contents (and the header's fetch time) via DOMParser, and never
+//! touches the scroll position unless the reader is already at the
+//! bottom, so someone scrolled up reading older messages stays put
+//! while new ones append below. The earlier design — a shell-side
+//! full reload every minute plus a sessionStorage scroll anchor —
+//! broke on Windows, where chattext:// surfaces as
+//! http://chattext.localhost and sessionStorage does not survive
+//! those reloads: every round found no anchor, force-scrolled to the
+//! bottom, and the page felt unscrollable. No reload, no anchor now.
 
 use scraper::{Html, Selector};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -23,9 +29,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 /// author and render centered/dim instead of with the `作者：` prefix.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChatMessage {
-    /// The message's `data-post` id (e.g. "ptt_stock_follow_chat/1083812");
-    /// the page script anchors scroll restoration on it. Empty when the
-    /// source block carried none.
+    /// The message's `data-post` id (e.g. "ptt_stock_follow_chat/1083812"),
+    /// carried through to the rendered page as the block's attribute.
+    /// Empty when the source block carried none.
     pub id: String,
     pub author: String,
     /// Plain text body; line breaks from the source are `\n`.
@@ -253,54 +259,54 @@ fn esc(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// Keeps the reading position across reloads: remembers the topmost
-/// visible message's data-post (and its viewport offset) in
-/// sessionStorage — on scroll and before unload — and scrolls back to
-/// it on load. With nothing stored, goes to the bottom (newest).
-const ANCHOR_SCRIPT: &str = r#"<script>
+/// In-page self-update (see the module note for why there is no
+/// reload-and-anchor design anymore): every minute the page fetches
+/// its own URL — the protocol handler answers with the freshest
+/// cached render — and swaps the `#feed` contents plus the header's
+/// fetch time via DOMParser. The scroll position is only adjusted
+/// when the reader is already at the bottom (within 80px), where it
+/// re-pins to the newest message; a reader scrolled up keeps their
+/// exact position while new messages append below. A failed fetch or
+/// parse keeps the current page and waits for the next round. The
+/// shell can trigger the same update when the window is brought
+/// forward, through `window.__chatTextUpdate`.
+const UPDATE_SCRIPT: &str = r#"<script>
 (function () {
-  var KEY = "chatTextAnchor";
-  function escAttr(v) { return v.replace(/\\/g, "\\\\").replace(/"/g, '\\"'); }
-  function save() {
-    try {
-      var msgs = document.querySelectorAll("[data-post]");
-      for (var i = 0; i < msgs.length; i++) {
-        var r = msgs[i].getBoundingClientRect();
-        if (r.bottom > 0) {
-          sessionStorage.setItem(KEY, JSON.stringify({ id: msgs[i].getAttribute("data-post"), off: r.top }));
-          return;
-        }
-      }
-    } catch (e) {}
+  var INTERVAL_MS = 60000;
+  function scroller() { return document.scrollingElement || document.documentElement; }
+  function atBottom() {
+    var e = scroller();
+    if (!e) return true;
+    return (e.scrollTop + e.clientHeight) >= (e.scrollHeight - 80);
   }
-  window.addEventListener("beforeunload", save);
-  var pending = false;
-  window.addEventListener("scroll", function () {
-    if (!pending) {
-      pending = true;
-      setTimeout(function () { pending = false; save(); }, 150);
-    }
-  }, { passive: true });
-  function restore() {
-    var el = document.scrollingElement || document.documentElement;
-    try {
-      var raw = sessionStorage.getItem(KEY);
-      if (raw) {
-        var a = JSON.parse(raw);
-        var t = document.querySelector('[data-post="' + escAttr(a.id) + '"]');
-        if (t) {
-          el.scrollTop += t.getBoundingClientRect().top - a.off;
-          return;
-        }
-      }
-    } catch (e) {}
-    el.scrollTop = el.scrollHeight;
+  function toBottom() {
+    var e = scroller();
+    if (e) e.scrollTop = e.scrollHeight;
   }
+  function update() {
+    fetch(location.href, { cache: "no-store" })
+      .then(function (r) { return r.text(); })
+      .then(function (html) {
+        var doc = new DOMParser().parseFromString(html, "text/html");
+        var newFeed = doc.getElementById("feed");
+        var feed = document.getElementById("feed");
+        if (!newFeed || !feed) return;
+        var stick = atBottom();
+        feed.innerHTML = newFeed.innerHTML;
+        var newHdr = doc.getElementById("hdr");
+        var hdr = document.getElementById("hdr");
+        if (newHdr && hdr) hdr.innerHTML = newHdr.innerHTML;
+        if (stick) toBottom();
+      })
+      .catch(function () { /* keep the current page; retry next round */ });
+  }
+  window.__chatTextUpdate = update;
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", restore);
+    document.addEventListener("DOMContentLoaded", toBottom);
   } else {
-    restore();
+    toBottom();
   }
+  setInterval(update, INTERVAL_MS);
 })();
 </script>"#;
 
@@ -311,29 +317,31 @@ fn page_shell(channel_title: &str, fetched_hhmm: Option<&str>, body: &str, scrip
     format!(
         "<!DOCTYPE html>\n<html lang=\"zh-Hant\"><head><meta charset=\"utf-8\">\
 <title>{title}</title><style>\
-html{{background:#0C0C0C}}\
-body{{margin:0;padding:6px 8px;background:#0C0C0C;color:#C0C0C0;\
-font-family:Consolas,\"Courier New\",monospace;font-size:13px;line-height:1.45}}\
-.hdr{{color:#FFFFFF;border-bottom:1px solid #444444;padding-bottom:4px;margin-bottom:6px;\
+html{{background:#FFFFFF}}\
+body{{margin:0;padding:6px 8px;background:#FFFFFF;color:#202020;\
+font-family:\"Cascadia Mono\",Consolas,\"Microsoft JhengHei UI\",monospace;font-size:13px;line-height:1.45}}\
+.hdr{{color:#202020;border-bottom:1px solid #E1E1E1;padding-bottom:4px;margin-bottom:6px;\
 white-space:pre-wrap;word-break:break-all}}\
 .msg{{white-space:pre-wrap;word-break:break-all;margin:0 0 2px}}\
 .time{{color:#808080}}\
-.author{{color:#FFFFFF;font-weight:bold}}\
+.author{{color:#202020;font-weight:bold}}\
 .svc{{color:#808080;text-align:center;white-space:pre-wrap;word-break:break-all;margin:4px 0}}\
 </style></head><body>\
-<div class=\"hdr\">{title}{fetched}</div>\n{body}\n{script}</body></html>",
+<div class=\"hdr\" id=\"hdr\">{title}{fetched}</div>\n{body}\n{script}</body></html>",
         title = esc(channel_title),
         fetched = esc(&fetched),
         body = body,
-        script = if script { ANCHOR_SCRIPT } else { "" },
+        script = if script { UPDATE_SCRIPT } else { "" },
     )
 }
 
 /// Render the whole feed page: header line (channel + fetch time), then
 /// one block per message — `HH:MM 作者：內文` — oldest first, newest at
-/// the bottom, exactly like the source page's order.
+/// the bottom, exactly like the source page's order. The blocks sit in
+/// `<div id="feed">` so the page's self-update script can swap them
+/// (and the `#hdr` header) without a reload.
 pub fn render_page(channel_title: &str, messages: &[ChatMessage], fetched_hhmm: &str) -> String {
-    let mut body = String::new();
+    let mut body = String::from("<div id=\"feed\">\n");
     for m in messages {
         let post_attr = if m.id.is_empty() {
             String::new()
@@ -355,14 +363,20 @@ pub fn render_page(channel_title: &str, messages: &[ChatMessage], fetched_hhmm: 
             ));
         }
     }
+    body.push_str("</div>");
     page_shell(channel_title, Some(fetched_hhmm), &body, true)
 }
 
 /// A shell page with a single centered line — the "載入中…" first-run
-/// page and the could-not-load explanation page. No anchor script:
-/// there is nothing to anchor to yet.
+/// page and the could-not-load explanation page. Same shell structure
+/// (header + `#feed`) as the feed page, but deliberately no script:
+/// there is nothing to update in place yet, and the real page takes
+/// over on the next window (re)build once the cache has one.
 pub fn render_status_page(channel_title: &str, message: &str) -> String {
-    let body = format!("<div class=\"svc\">{}</div>", esc(message));
+    let body = format!(
+        "<div id=\"feed\"><div class=\"svc\">{}</div></div>",
+        esc(message)
+    );
     page_shell(channel_title, None, &body, false)
 }
 
@@ -435,12 +449,12 @@ mod tests {
     }
 
     #[test]
-    fn renders_cmd_style_page_with_escaping_and_anchor_script() {
+    fn renders_notepad_style_page_with_escaping_and_update_script() {
         let msgs = parse_messages(FIXTURE);
         let page = render_page("PTT 11/16盤中閒聊·台指強空", &msgs, "13:41");
         // Header line: channel title + fetch time.
         assert!(page.contains("PTT 11/16盤中閒聊·台指強空（抓取時間 13:41）"), "{page}");
-        // Message line format: HH:MM 作者：內文, anchored by data-post.
+        // Message line format: HH:MM 作者：內文, carrying its data-post.
         assert!(
             page.contains("data-post=\"ptt_stock_follow_chat/101\""),
             "{page}"
@@ -448,20 +462,39 @@ mod tests {
         assert!(page.contains("13:35"), "{page}");
         assert!(page.contains("作者甲："), "{page}");
         // The message's literal <script> text is escaped, never raw —
-        // the only <script> in the page is the anchor script itself.
+        // the only <script> in the page is the update script itself.
         assert!(page.contains("&lt;script&gt;alert(1)&lt;/script&gt;"), "{page}");
         assert!(!page.contains("<script>alert"), "{page}");
         // Photo placeholder and the centered service line render.
         assert!(page.contains("[圖片]"), "{page}");
         assert!(page.contains("class=\"svc\""), "{page}");
-        // CMD look + the scroll-anchor machinery.
-        assert!(page.contains("#0C0C0C"), "{page}");
+        // Notepad look: white page, dark text, the main window txt
+        // skin's font stack.
+        assert!(page.contains("#FFFFFF"), "{page}");
+        assert!(page.contains("#202020"), "{page}");
+        assert!(!page.contains("#0C0C0C"), "{page}");
+        assert!(page.contains("Cascadia Mono"), "{page}");
         assert!(page.contains("Consolas"), "{page}");
-        assert!(page.contains("sessionStorage"), "{page}");
-        // Status pages carry the message and no anchor script.
+        assert!(page.contains("Microsoft JhengHei UI"), "{page}");
+        // Self-update machinery: messages live in #feed under a #hdr
+        // header; the script re-fetches this URL, swaps both via
+        // DOMParser, sticks to the bottom only when already there
+        // (scrollHeight/scrollTop), and is exposed for the shell.
+        assert!(page.contains("id=\"feed\""), "{page}");
+        assert!(page.contains("id=\"hdr\""), "{page}");
+        assert!(page.contains("fetch(location.href"), "{page}");
+        assert!(page.contains("no-store"), "{page}");
+        assert!(page.contains("DOMParser"), "{page}");
+        assert!(page.contains("scrollHeight"), "{page}");
+        assert!(page.contains("__chatTextUpdate"), "{page}");
+        // The reload-era sessionStorage anchor is gone for good.
+        assert!(!page.contains("sessionStorage"), "{page}");
+        // Status pages share the shell structure but carry no script.
         let status = render_status_page("PTT 股票閒聊", "載入中…");
         assert!(status.contains("載入中…"), "{status}");
+        assert!(status.contains("id=\"feed\""), "{status}");
         assert!(!status.contains("sessionStorage"), "{status}");
+        assert!(!status.contains("__chatTextUpdate"), "{status}");
     }
 
     #[test]

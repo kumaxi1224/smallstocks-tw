@@ -40,4 +40,4 @@ jobs:
       - run: npm run tauri build -- --no-bundle
       - name: The app was built
         shell: pwsh
-        run: Get-Item src-tauri/target/release/smallstocks-tw.exe | Format-List Name, Length
+        run: Get-Item src-tauri/target/release/MaxiStocks.exe | Format-List Name, Length

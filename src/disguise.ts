@@ -17,7 +17,6 @@ import { stockDetail } from "./stock-view.ts";
 import { isMac, primaryPressed, shellPrompt } from "./platform.ts";
 export type SkinAction =
   | "watch"
-  | "daily"
   | "rules"
   | "history"
   | "settings"
@@ -164,6 +163,52 @@ function terminalText(s: Snapshot): string {
   if (commandLog.length) lines.push("", ...commandLog);
   return lines.join("\n");
 }
+/**
+ * The notepad body as fixed-width field spans (the terminalMarkup
+ * approach): each column is an inline-block box of a set width, so the
+ * value and change columns start at the same x on every row no matter
+ * what the name contains. Padding the text alone cannot promise that —
+ * in WebView2 the CJK glyphs of the fallback font are not exactly two
+ * half-width cells, so padded rows drifted apart. The plain-text twin
+ * (notepadText) stays the canonical text for the character count and
+ * copy-all; both render the same values() rows.
+ */
+export function notepadMarkup(s: Snapshot): string {
+  const lines = notepadText(s).split("\n");
+  const header =
+    (s.settings.showCodes ? pad("代號", 7) : "") +
+    pad("名稱", 14) +
+    pad("數值", 12) +
+    pad("變化", 10);
+  const index = lines.indexOf(header);
+  if (index < 0) return esc(lines.join("\n"));
+  const cell = (value: string, kind: string) =>
+    `<span class="note-field ${kind}">${esc(value)}</span>`;
+  const head =
+    (s.settings.showCodes ? cell("代號", "code") : "") +
+    cell("名稱", "name") +
+    cell("數值  ", "value") +
+    cell("變化", "change");
+  const rows = s.watchlist.map((c) => {
+    const v = values(s, c);
+    return (
+      (s.settings.showCodes ? cell(pad(v.code, 7), "code") : "") +
+      cell(pad(v.name || v.code, 14), "name") +
+      cell((v.book ? "~" : "") + number(v.price) + "  ", "value") +
+      cell(change(v.pct), "change") +
+      (v.date && v.date !== latestCloseDate(s)
+        ? esc(`  (${v.date.slice(5).replace("-", "/")})`)
+        : "")
+    );
+  });
+  return (
+    esc(lines.slice(0, index).join("\n") + "\n") +
+    head +
+    "\n" +
+    rows.join("\n") +
+    esc("\n" + lines.slice(index + 1 + s.watchlist.length).join("\n"))
+  );
+}
 function terminalMarkup(s: Snapshot): string {
   const all = terminalText(s).split("\n");
   const index = all.findIndex((l) =>
@@ -223,7 +268,7 @@ function macMarkup(
   const titlebar = `<div class="native-title mac-titlebar" data-tauri-drag-region>${trafficLights}<span class="mac-document-title" data-tauri-drag-region>${title}</span><div class="native-drag" data-tauri-drag-region></div><div class="mac-view-menu">${menu("⋯", actions + (terminal ? "" : editing))}</div></div>`;
   if (terminal)
     return `<section class="native-frame terminal-view mac-terminal" data-disguise="terminal" data-row-mode="${s.settings.rowDisplay ?? "numbers"}">${titlebar}<div class="terminal-screen">${minimal ? mini : ""}<pre class="console-output${minimal ? " console-minimal-log" : ""}"></pre><form class="console-command" autocomplete="off"><span>${shellPrompt}</span><input aria-label="終端機模式指令" spellcheck="false" autocomplete="off" autocapitalize="off"></form></div></section>`;
-  return `<section class="native-frame text-view mac-textedit" data-disguise="txt" data-row-mode="${s.settings.rowDisplay ?? "numbers"}">${titlebar}${minimal ? mini : '<textarea class="notepad-editor" aria-label="工作紀錄文字內容" readonly spellcheck="false" wrap="off"></textarea>'}<div class="notepad-status" hidden><span class="caret-status"></span><span class="character-status"></span><span class="zoom-status">100%</span></div></section>`;
+  return `<section class="native-frame text-view mac-textedit" data-disguise="txt" data-row-mode="${s.settings.rowDisplay ?? "numbers"}">${titlebar}${minimal ? mini : '<div class="notepad-editor notepad-fields" tabindex="0" aria-label="工作紀錄文字內容"></div>'}<div class="notepad-status" hidden><span class="caret-status"></span><span class="character-status"></span><span class="zoom-status">100%</span></div></section>`;
 }
 export function disguiseMarkup(s: Snapshot): string {
   const terminal = s.settings.appearance === "terminal";
@@ -232,7 +277,23 @@ export function disguiseMarkup(s: Snapshot): string {
   if (isMac) return macMarkup(s, mini, minimal, terminal);
   if (terminal)
     return `<section class="native-frame terminal-view windows-terminal" data-disguise="terminal" data-row-mode="${s.settings.rowDisplay ?? "numbers"}"><div class="native-title terminal-titlebar" data-tauri-drag-region><div class="terminal-tab"><span class="console-icon" aria-hidden="true">&gt;_</span><span>PowerShell</span><button data-skin-action="hide" aria-label="關閉分頁">×</button></div><button class="native-add" data-skin-action="manage" aria-label="新增監看項目" title="新增監看項目">＋</button>${menu("⌄", item("自選清單…", "manage") + item("提醒設定…", "rules") + item("事件紀錄", "history") + "<hr>" + item("設定", "settings", "Ctrl+,") + item("返回 small", "small") + item("隱藏視窗", "hide"))}<div class="native-drag" data-tauri-drag-region></div>${controls()}</div><div class="terminal-screen">${minimal ? mini : ""}<pre class="console-output${minimal ? " console-minimal-log" : ""}"></pre><form class="console-command" autocomplete="off"><span>PS C:\Work&gt;</span><input aria-label="終端機模式指令" spellcheck="false" autocomplete="off" autocapitalize="off"></form></div></section>`;
-  return `<section class="native-frame text-view windows-notepad" data-disguise="txt" data-row-mode="${s.settings.rowDisplay ?? "numbers"}"><div class="native-title notepad-titlebar" data-tauri-drag-region><span class="notepad-icon" aria-hidden="true"></span><div class="notepad-tab"><span>工作紀錄.txt</span><button data-skin-action="hide" aria-label="關閉分頁">×</button></div><button class="native-add" data-skin-action="manage" aria-label="新增監看項目" title="新增監看項目">＋</button><div class="native-drag" data-tauri-drag-region></div>${controls()}</div><div class="notepad-menubar">${menu("檔案", item("自選清單…", "manage") + item("提醒設定…", "rules") + "<hr>" + item("返回 small", "small") + item("關閉視窗", "hide"))}${menu("編輯", '<button data-note-edit="select-all" role="menuitem"><span>全選</span><small>Ctrl+A</small></button><button data-note-edit="copy" role="menuitem"><span>複製</span><small>Ctrl+C</small></button>')}${menu("檢視", '<button data-zoom="in" role="menuitem"><span>放大</span><small>Ctrl++</small></button><button data-zoom="out" role="menuitem"><span>縮小</span><small>Ctrl+-</small></button><button data-zoom="reset" role="menuitem"><span>還原預設縮放</span><small>Ctrl+0</small></button><hr><button data-note-edit="status" role="menuitemcheckbox" aria-checked="true"><span>狀態列</span></button>' + item("事件紀錄", "history"))}<div class="notepad-menu-space"></div><button class="native-settings" data-skin-action="settings" aria-label="設定" title="設定">⚙︎</button></div>${minimal ? mini : '<textarea class="notepad-editor" aria-label="工作紀錄文字內容" readonly spellcheck="false" wrap="off"></textarea>'}<div class="notepad-status"><span class="caret-status">第 1 行，第 1 欄</span><span class="character-status"></span><span class="zoom-status">100%</span><span>Windows (CRLF)</span><span>UTF-8</span></div></section>`;
+  const groups = s.groups?.length
+    ? s.groups
+    : [{ name: "自選1", codes: s.watchlist }];
+  const activeGroup = Math.max(
+    0,
+    Math.min(s.activeGroup ?? 0, groups.length - 1),
+  );
+  const groupMenu = menu(
+    "分組",
+    groups
+      .map(
+        (g, i) =>
+          `<button data-note-group="${i}" role="menuitem"><span>${esc(g.name)}</span><small>${i === activeGroup ? "✓" : ""}</small></button>`,
+      )
+      .join(""),
+  );
+  return `<section class="native-frame text-view windows-notepad" data-disguise="txt" data-row-mode="${s.settings.rowDisplay ?? "numbers"}"><div class="native-title notepad-titlebar" data-tauri-drag-region><span class="notepad-icon" aria-hidden="true"></span><div class="notepad-tab"><span>工作紀錄.txt</span><button data-skin-action="hide" aria-label="關閉分頁">×</button></div><button class="native-add" data-skin-action="manage" aria-label="新增監看項目" title="新增監看項目">＋</button><div class="native-drag" data-tauri-drag-region></div>${controls()}</div><div class="notepad-menubar">${menu("檔案", item("自選清單…", "manage") + item("提醒設定…", "rules") + "<hr>" + item("返回 small", "small") + item("關閉視窗", "hide"))}${menu("編輯", '<button data-note-edit="select-all" role="menuitem"><span>全選</span><small>Ctrl+A</small></button><button data-note-edit="copy" role="menuitem"><span>複製</span><small>Ctrl+C</small></button>')}${menu("檢視", '<button data-zoom="in" role="menuitem"><span>放大</span><small>Ctrl++</small></button><button data-zoom="out" role="menuitem"><span>縮小</span><small>Ctrl+-</small></button><button data-zoom="reset" role="menuitem"><span>還原預設縮放</span><small>Ctrl+0</small></button><hr><button data-note-edit="status" role="menuitemcheckbox" aria-checked="true"><span>狀態列</span></button>' + item("事件紀錄", "history"))}${groupMenu}<div class="notepad-menu-space"></div><button class="native-settings" data-skin-action="settings" aria-label="設定" title="設定">⚙︎</button></div>${minimal ? mini : '<div class="notepad-editor notepad-fields" tabindex="0" aria-label="工作紀錄文字內容"></div>'}<div class="notepad-status"><span class="caret-status">第 1 行，第 1 欄</span><span class="character-status"></span><span class="zoom-status">100%</span><span>Windows (CRLF)</span><span>UTF-8</span></div></section>`;
 }
 function closeMenus(root: HTMLElement) {
   root
@@ -240,16 +301,32 @@ function closeMenus(root: HTMLElement) {
     .forEach((d) => (d.open = false));
 }
 function caret(root: HTMLElement) {
-  const editor = root.querySelector<HTMLTextAreaElement>(".notepad-editor");
-  if (!editor) return;
-  const before = editor.value.slice(0, editor.selectionStart);
+  const status = root.querySelector(".caret-status");
+  if (!status) return;
+  const editor = root.querySelector<HTMLElement>(".notepad-editor");
   const copy = root.querySelector<HTMLButtonElement>('[data-note-edit="copy"]');
-  if (copy) copy.disabled = editor.selectionStart === editor.selectionEnd;
-  root.querySelector(".caret-status")!.textContent =
+  let before = "",
+    collapsed = true;
+  const selection = document.getSelection();
+  if (
+    editor &&
+    selection &&
+    selection.rangeCount > 0 &&
+    selection.anchorNode &&
+    editor.contains(selection.anchorNode)
+  ) {
+    collapsed = selection.isCollapsed;
+    const range = document.createRange();
+    range.selectNodeContents(editor);
+    range.setEnd(selection.anchorNode, selection.anchorOffset);
+    before = range.toString();
+  }
+  if (copy) copy.disabled = collapsed;
+  status.textContent =
     `第 ${before.split("\n").length} 行，第 ${before.length - (before.lastIndexOf("\n") + 1) + 1} 欄`;
 }
 function setZoom(root: HTMLElement) {
-  const editor = root.querySelector<HTMLTextAreaElement>(".notepad-editor");
+  const editor = root.querySelector<HTMLElement>(".notepad-editor");
   if (editor) editor.style.fontSize = `${(13 * zoom) / 100}px`;
   const minimal = root.querySelector<HTMLElement>(".text-view .minimal-native");
   if (minimal) minimal.style.fontSize = `${(13 * zoom) / 100}px`;
@@ -262,12 +339,20 @@ export function bindDisguise(
   onAction: SkinHandler,
   onStock?: (code: string) => void,
   onLayout?: () => void,
+  onGroup?: (index: number) => void,
 ) {
   handler = onAction;
   lastState = s;
   relayout = onLayout ?? (() => {});
   if (s.settings.rowDisplay === "minimal")
-    bindMinimal(root, s, (c) => (onStock ? onStock(c) : onAction("daily")));
+    bindMinimal(root, s, (c) => onStock?.(c));
+  root.querySelectorAll<HTMLButtonElement>("[data-note-group]").forEach(
+    (b) =>
+      (b.onclick = () => {
+        closeMenus(root);
+        onGroup?.(Number(b.dataset.noteGroup));
+      }),
+  );
   root.querySelectorAll<HTMLButtonElement>("[data-skin-action]").forEach(
     (b) =>
       (b.onclick = () => {
@@ -290,8 +375,7 @@ export function bindDisguise(
     (b) =>
       (b.onclick = async () => {
         closeMenus(root);
-        const editor =
-          root.querySelector<HTMLTextAreaElement>(".notepad-editor");
+        const editor = root.querySelector<HTMLElement>(".notepad-editor");
         if (b.dataset.noteEdit === "status") {
           showStatus = !showStatus;
           root.querySelector<HTMLElement>(".notepad-status")!.hidden =
@@ -321,15 +405,21 @@ export function bindDisguise(
           return;
         }
         editor.focus();
-        if (b.dataset.noteEdit === "select-all") editor.select();
+        const selectAll = () => {
+          const range = document.createRange();
+          range.selectNodeContents(editor);
+          const selection = document.getSelection();
+          selection?.removeAllRanges();
+          selection?.addRange(range);
+        };
+        if (b.dataset.noteEdit === "select-all") selectAll();
         else {
           const text =
-            editor.value.slice(editor.selectionStart, editor.selectionEnd) ||
-            editor.value;
+            document.getSelection()?.toString() || notepadText(lastState);
           try {
             await navigator.clipboard.writeText(text);
           } catch {
-            editor.select();
+            if (!document.getSelection()?.toString()) selectAll();
             document.execCommand("copy");
           }
         }
@@ -351,10 +441,10 @@ export function bindDisguise(
         relayout();
       }),
   );
-  const editor = root.querySelector<HTMLTextAreaElement>(".notepad-editor");
+  const editor = root.querySelector<HTMLElement>(".notepad-editor");
   editor?.addEventListener("click", () => caret(root));
   editor?.addEventListener("keyup", () => caret(root));
-  editor?.addEventListener("select", () => caret(root));
+  editor?.addEventListener("mouseup", () => caret(root));
   root
     .querySelector<HTMLFormElement>(".console-command")
     ?.addEventListener("submit", (event) => {
@@ -453,27 +543,25 @@ export function updateDisguise(root: HTMLElement, s: Snapshot) {
     }
     return;
   }
-  const editor = root.querySelector<HTMLTextAreaElement>(".notepad-editor");
+  const editor = root.querySelector<HTMLElement>(".notepad-editor");
   if (!editor) return;
   const next = notepadText(s);
+  const selection = document.getSelection();
   const selecting =
-    document.activeElement === editor &&
-    editor.selectionStart !== editor.selectionEnd;
-  if (editor.value !== next && !selecting) {
-    const start = editor.selectionStart,
-      end = editor.selectionEnd,
-      top = editor.scrollTop,
+    !!selection &&
+    !selection.isCollapsed &&
+    !!selection.anchorNode &&
+    editor.contains(selection.anchorNode);
+  if (editor.dataset.snapshot !== next && !selecting) {
+    const top = editor.scrollTop,
       left = editor.scrollLeft;
-    editor.value = next;
-    editor.setSelectionRange(
-      Math.min(start, next.length),
-      Math.min(end, next.length),
-    );
+    editor.innerHTML = notepadMarkup(s);
+    editor.dataset.snapshot = next;
     editor.scrollTop = top;
     editor.scrollLeft = left;
   }
   root.querySelector(".character-status")!.textContent =
-    `${editor.value.length} 個字元`;
+    `${next.length} 個字元`;
   root.querySelector<HTMLElement>(".notepad-status")!.hidden = !showStatus;
   caret(root);
   setZoom(root);

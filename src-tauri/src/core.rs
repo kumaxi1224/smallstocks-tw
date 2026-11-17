@@ -554,7 +554,7 @@ pub struct Settings {
     pub chat_zoom: u64,
     /// How the PTT chat window renders its feed: "text" (the app fetches
     /// the public preview itself and serves a plain monospace text page,
-    /// CMD-style) or "web" (the window loads the t.me/s page directly).
+    /// notepad-style) or "web" (the window loads the t.me/s page directly).
     /// lib.rs reconciles the window's URL with this; see chat_text.rs.
     #[serde(default = "default_chat_style")]
     pub chat_style: String,

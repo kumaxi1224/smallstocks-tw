@@ -577,7 +577,7 @@ fn ensure_sidecar(app: &tauri::AppHandle, manual: bool) -> String {
 /// comes from a first-party scheme, so Tauri may inject its IPC bridge
 /// script into it; with no capability granting this label a single
 /// permission, every command call is still denied, and the page never
-/// calls it anyway — it is static HTML plus a scroll-anchor script.)
+/// calls it anyway — it is static HTML plus a small self-update script.)
 const CHAT_WINDOW_LABEL: &str = "ptt-chat";
 const CHAT_URL: &str = "https://t.me/s/ptt_stock_follow_chat";
 /// The text style's local page (served from the ChatCache by the
@@ -669,20 +669,23 @@ fn apply_chat_window(app: &tauri::AppHandle) {
             let _ = w.show();
             let _ = w.unminimize();
             let _ = w.set_focus();
-            // Bringing the window forward also refreshes the feed:
-            // neither source pushes new messages into this webview
-            // host, so without a reload the user would keep reading
-            // the messages from when the window was opened. Text style
-            // reloads outright — the served page's own script puts the
-            // reading position back. Web style goes through the
-            // scroll guard (see reload_web_chat_window): the hosted
-            // page anchors at the newest message, so an unguarded
-            // reload would yank the user away from older messages
-            // they scrolled up to read.
+            // Bringing the window forward also refreshes the feed.
+            // Web style goes through the scroll guard (see
+            // reload_web_chat_window): the hosted page anchors at the
+            // newest message, so an unguarded reload would yank the
+            // user away from older messages they scrolled up to read.
+            // Text style instead asks the page to update itself in
+            // place via its own window.__chatTextUpdate hook. A full
+            // reload is deliberately NOT the fallback when that hook
+            // is missing: a pre-v0.1.37 page still carries the old
+            // sessionStorage anchor script, and reloading under it is
+            // exactly what kept yanking readers back to the bottom.
+            // A page without the hook — the static "載入中…" status
+            // page — simply stays until the window is rebuilt, and a
+            // failed eval is ignored: the trigger is best-effort and
+            // the page's own minute timer covers a missed round.
             if chat_style == "text" {
-                if let Err(e) = w.reload() {
-                    set_core_error(app, format!("聊天視窗重新載入失敗：{e}"));
-                }
+                let _ = w.eval("if (window.__chatTextUpdate) { window.__chatTextUpdate(); }");
             } else {
                 reload_web_chat_window(app, &w);
             }
@@ -754,9 +757,11 @@ fn apply_chat_window(app: &tauri::AppHandle) {
         }
     }
 }
-/// How often the chat window reloads its feed while it stays open.
+/// How often the web style's chat window reloads its feed while it
+/// stays open. (The text style's page refreshes itself in place on
+/// the same cadence, inside the page.)
 const CHAT_RELOAD_INTERVAL: Duration = Duration::from_secs(60);
-/// Start the chat feed's reload loop (called once, from setup). The
+/// Start the web style's reload loop (called once, from setup). The
 /// t.me/s page loads its messages once and never pushes new ones in
 /// this webview host, so an open window would otherwise sit on the
 /// messages from when it was opened. Each tick posts the reload to
@@ -775,21 +780,18 @@ fn start_chat_reload_loop(app: &tauri::AppHandle) {
 }
 /// The event-loop half of the reload loop: refresh the chat page when
 /// the window exists and the setting is on; do nothing otherwise.
-/// Text style reloads outright (the served page restores the reading
-/// position itself); web style goes through the scroll guard.
+/// Web style only, through the scroll guard — the text style's page
+/// updates itself in place (see chat_text.rs), and a shell-side
+/// reload is precisely what used to break its scrolling, so text
+/// rounds are skipped entirely. (The text style's background fetch
+/// loop still refreshes the cache the page pulls from.)
 fn reload_chat_window(app: &tauri::AppHandle) {
     let (enabled, _, chat_style) = chat_settings(app);
-    if !enabled {
+    if !enabled || chat_style == "text" {
         return;
     }
     if let Some(w) = app.get_webview_window(CHAT_WINDOW_LABEL) {
-        if chat_style == "text" {
-            if let Err(e) = w.reload() {
-                set_core_error(app, format!("聊天視窗重新載入失敗：{e}"));
-            }
-        } else {
-            reload_web_chat_window(app, &w);
-        }
+        reload_web_chat_window(app, &w);
     }
 }
 /// Scroll probe for the web style: true when the page is scrolled to
@@ -1101,8 +1103,10 @@ pub fn run() {
             // from the event loop once it is running, and a failure lands
             // in the core's error field (see apply_chat_window).
             sync_chat_window(app.handle());
-            // Keep an open chat window's feed fresh: the hosted page
-            // never pushes, so the loop reloads it once a minute.
+            // Keep an open web-style chat window's feed fresh: the
+            // hosted page never pushes, so the loop reloads it once
+            // a minute. (Text style pages refresh themselves in
+            // place; the loop skips them.)
             start_chat_reload_loop(app.handle());
             // Text style: keep a freshly rendered plain-text page in
             // the cache the chattext:// protocol serves.

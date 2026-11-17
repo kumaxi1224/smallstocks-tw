@@ -16,7 +16,7 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { mcpSetup } from "./mcp-setup.ts";
 import type { McpKind } from "./mcp-setup.ts";
-import { desktop, request, search, daily, exportData, exportDataFile, importData, telegramTest, backupNow, shioajiKeysStatus, shioajiKeysSet, shioajiKeysClear, sidecarStartNow } from "./client.ts";
+import { desktop, request, search, exportData, exportDataFile, importData, telegramTest, backupNow, shioajiKeysStatus, shioajiKeysSet, shioajiKeysClear, sidecarStartNow } from "./client.ts";
 import {
   esc,
   number,
@@ -45,7 +45,6 @@ import {
   formatMoney,
   BOOK_NOTE,
 } from "./model.ts";
-import { historyBody } from "./daily-view.ts";
 import { trendCell, portfolioChart } from "./inline-trend.ts";
 import { disguiseMarkup, bindDisguise, updateDisguise } from "./disguise.ts";
 import {
@@ -56,7 +55,6 @@ import {
 } from "./minimal.ts";
 import type { SkinAction } from "./disguise.ts";
 import type {
-  DailyView,
   Snapshot,
   Appearance,
   Rule,
@@ -77,15 +75,6 @@ let scrollResetPending = false;
 let editing: Rule | undefined;
 let busy = false;
 let searchVersion = 0;
-let dailySymbol = "";
-let dailyMonth = new Intl.DateTimeFormat("sv-SE", {
-  timeZone: "Asia/Taipei",
-  year: "numeric",
-  month: "2-digit",
-}).format(new Date());
-let dailyVersion = 0;
-let dailyData: DailyView | undefined;
-let dailyBusy = false;
 let lastWindowTitle = "";
 let mcpMessage = "";
 let mcpExe = "";
@@ -105,58 +94,7 @@ async function copyText(text: string) {
     if (!ok) throw error;
   }
 }
-async function loadDaily() {
-  if (dailyBusy) return;
-  const version = ++dailyVersion;
-  const requestedSymbol = dailySymbol,
-    requestedMonth = dailyMonth;
-  dailyBusy = true;
-  try {
-    const data = await daily(requestedSymbol, requestedMonth);
-    if (
-      version !== dailyVersion ||
-      tab !== "daily" ||
-      requestedSymbol !== dailySymbol ||
-      requestedMonth !== dailyMonth
-    )
-      return;
-    dailyData = data;
-    const el = document.querySelector("#daily-body");
-    if (el) el.innerHTML = historyBody(data);
-  } catch (e) {
-    showError(e);
-  } finally {
-    dailyBusy = false;
-    if (
-      tab === "daily" &&
-      dailySymbol &&
-      (requestedSymbol !== dailySymbol || requestedMonth !== dailyMonth)
-    )
-      void loadDaily();
-  }
-}
-function dailyPage() {
-  if (!state.watchlist.includes(dailySymbol))
-    dailySymbol = state.watchlist[0] ?? "";
-  content.innerHTML = `<div class="pane"><h1>一天一點，回看走勢</h1><p class="intro">正式日行情與收盤摘要，不會觸發即時通知。</p><div class="daily-controls"><label>自選標的<select id="daily-symbol">${state.watchlist.map((c) => `<option value="${esc(c)}" ${c === dailySymbol ? "selected" : ""}>${esc(state.quotes[c]?.name ?? displaySymbol(c))} · ${esc(displaySymbol(c))}</option>`).join("")}</select></label><label>月份<input id="daily-month" type="month" min="2000-01" max="${new Date(state.now).toLocaleDateString("sv-SE", { timeZone: "Asia/Taipei" }).slice(0, 7)}" value="${dailyMonth}"></label></div><div id="daily-body">${dailyData && dailyData.symbol === dailySymbol ? historyBody(dailyData) : '<div class="empty">正在取得每日行情…</div>'}</div></div>`;
-  document.querySelector("#daily-symbol")!.addEventListener("change", (e) => {
-    dailySymbol = (e.target as HTMLSelectElement).value;
-    dailyData = undefined;
-    dailyVersion++;
-    dailyBusy = false;
-    void loadDaily();
-  });
-  document.querySelector("#daily-month")!.addEventListener("change", (e) => {
-    dailyMonth = (e.target as HTMLInputElement).value;
-    dailyData = undefined;
-    dailyVersion++;
-    dailyBusy = false;
-    void loadDaily();
-  });
-  if (dailySymbol) void loadDaily();
-  else document.querySelector("#daily-body")!.textContent = "請先加入自選股。";
-}
-app.innerHTML = `<main class="shell"><header data-tauri-drag-region><span class="brand" data-tauri-drag-region><i></i><b>Maxi</b><span>stocks</span></span><span id="header-assets" class="header-assets"></span><div class="window-actions"><button id="row-display" title="切換數字、走勢與極簡" aria-label="切換顯示內容">數字</button><button id="manage" aria-label="＋ 管理自選" title="管理自選">＋</button><button id="pin" class="pin-btn" aria-pressed="true" aria-label="視窗保持置頂" title="已置頂：點一下取消置頂"><svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M9.8 1.2 14.8 6.2 13.4 7.6 12.3 7.2 9.4 10.1 9.9 12 8.5 13.4 5.6 10.5 2.2 13.9 1.5 13.2 4.9 9.8 2 6.9 3.4 5.5 5.3 6 8.2 3.1 7.8 2z" fill="currentColor"/></svg></button><button id="stealth" class="stealth-btn" aria-label="隱藏全部視窗" title="完全隱藏（含通知），監看持續。叫回：${privacyShortcutLabel}"><svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M8 3.5C4.6 3.5 2 6 1 8c1 2 3.6 4.5 7 4.5s6-2.5 7-4.5c-1-2-3.6-4.5-7-4.5zm0 1.8a2.7 2.7 0 1 1 0 5.4 2.7 2.7 0 0 1 0-5.4z" fill="currentColor"/><path d="M2.3 2.3 13.7 13.7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button><button id="hide" aria-label="縮到工作列" title="縮到工作列；監看持續。叫回：點工作列按鈕，或按 ${privacyShortcutLabel}">−</button><button id="quit" aria-label="結束程式" title="結束程式；監看也會停止">✕</button></div></header><nav aria-label="主選單"><button data-tab="watch" class="active">自選</button><button data-tab="positions">持股</button><button data-tab="daily">行情</button><button data-tab="rules">提醒 <span id="rule-count"></span></button><button data-tab="history">紀錄</button><button data-tab="settings" class="gear">外觀與設定</button></nav><div id="banner"></div><section id="content"></section><footer><span id="health"></span><span id="source">TWSE MIS</span></footer><div id="message" role="status" aria-live="polite"></div></main>`;
+app.innerHTML = `<main class="shell"><header data-tauri-drag-region><span class="brand" data-tauri-drag-region><i></i><b>Maxi</b><span>stocks</span></span><span id="header-assets" class="header-assets"></span><div class="window-actions"><button id="row-display" title="切換數字、走勢與極簡" aria-label="切換顯示內容">數字</button><button id="manage" aria-label="＋ 管理自選" title="管理自選">＋</button><button id="pin" class="pin-btn" aria-pressed="true" aria-label="視窗保持置頂" title="已置頂：點一下取消置頂"><svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M9.8 1.2 14.8 6.2 13.4 7.6 12.3 7.2 9.4 10.1 9.9 12 8.5 13.4 5.6 10.5 2.2 13.9 1.5 13.2 4.9 9.8 2 6.9 3.4 5.5 5.3 6 8.2 3.1 7.8 2z" fill="currentColor"/></svg></button><button id="stealth" class="stealth-btn" aria-label="隱藏全部視窗" title="完全隱藏（含通知），監看持續。叫回：${privacyShortcutLabel}"><svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M8 3.5C4.6 3.5 2 6 1 8c1 2 3.6 4.5 7 4.5s6-2.5 7-4.5c-1-2-3.6-4.5-7-4.5zm0 1.8a2.7 2.7 0 1 1 0 5.4 2.7 2.7 0 0 1 0-5.4z" fill="currentColor"/><path d="M2.3 2.3 13.7 13.7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button><button id="hide" aria-label="縮到工作列" title="縮到工作列；監看持續。叫回：點工作列按鈕，或按 ${privacyShortcutLabel}">−</button><button id="quit" aria-label="結束程式" title="結束程式；監看也會停止">✕</button></div></header><nav aria-label="主選單"><button data-tab="watch" class="active">自選</button><button data-tab="positions">持股</button><button data-tab="rules">提醒 <span id="rule-count"></span></button><button data-tab="history">紀錄</button><button data-tab="settings" class="gear">外觀與設定</button></nav><div id="banner"></div><section id="content"></section><footer><span id="health"></span><span id="source">TWSE MIS</span></footer><div id="message" role="status" aria-live="polite"></div></main>`;
 const content = app.querySelector<HTMLElement>("#content")!;
 const showError = (e: unknown) => {
   const el = document.querySelector<HTMLElement>("#message")!;
@@ -375,12 +313,6 @@ function observeMinimal() {
   if (!list) return;
   minimalObserver = new ResizeObserver(() => void fitMinimal());
   minimalObserver.observe(list);
-}
-function openStock(code: string) {
-  dailySymbol = code;
-  dailyData = undefined;
-  tab = "daily";
-  render();
 }
 /** Live slider preview while the opacity setting is being dragged; the
  * persisted value only lands on the slider's change event. */
@@ -605,7 +537,7 @@ function rows() {
         const sign = (pct ?? 0) > 0 ? "up" : (pct ?? 0) < 0 ? "down" : "flat";
         const trend =
           state.settings.rowDisplay === "trend" ? trendCell(state, c) : null;
-        return `<button class="quote ${sign}${numbersMode ? " two-line" : ""}${!closed && stale(q, state.now) ? " stale" : !closed && aging(q, state.now) ? " aging" : ""}" data-quote="${esc(c)}" title="${esc(name && name !== c ? `${name}（${displaySymbol(c)}）` : displaySymbol(c))} · ${closed ? "正式收盤" : "來源時間"} ${esc(stamp)} · ${!closed && live.basis === "book" ? BOOK_NOTE : "價格"} ${number(closed ? d?.close : live.price)}${trend ? " · " + esc(trend.title) : ""} · 點擊查看行情"><span class="stock-name">${hideName || state.settings.showCodes || !name ? `<span class="stock-code">${esc(displaySymbol(c))}</span>` : ""}${hideName ? "" : `<strong>${esc(name)}</strong>`}</span>${trend ? `<span class="trend-slot">${trend.html}</span>` : `<span class="price${!closed && live.basis === "book" ? " book" : ""}">${number(closed ? d?.close : live.price)}</span>`}<span class="change">${showPts ? `<span class="change-points">${pts != null ? points(pts) : ""}</span>` : ""}<span class="change-pct">${change(pct)}</span></span>${numbersMode ? `<span class="day-range"><span class="dr-line"><i>低</i>${number(dayLo)}</span><span class="dr-line"><i>高</i>${number(dayHi)}</span></span>` : ""}${closed && d && d.date !== commonDate ? `<span class="as-of">${d.date.slice(5).replace("-", "/")}</span>` : ""}</button>`;
+        return `<button class="quote ${sign}${numbersMode ? " two-line" : ""}${!closed && stale(q, state.now) ? " stale" : !closed && aging(q, state.now) ? " aging" : ""}" data-quote="${esc(c)}" title="${esc(name && name !== c ? `${name}（${displaySymbol(c)}）` : displaySymbol(c))} · ${closed ? "正式收盤" : "來源時間"} ${esc(stamp)} · ${!closed && live.basis === "book" ? BOOK_NOTE : "價格"} ${number(closed ? d?.close : live.price)}${trend ? " · " + esc(trend.title) : ""}"><span class="stock-name">${hideName || state.settings.showCodes || !name ? `<span class="stock-code">${esc(displaySymbol(c))}</span>` : ""}${hideName ? "" : `<strong>${esc(name)}</strong>`}</span>${trend ? `<span class="trend-slot">${trend.html}</span>` : `<span class="price${!closed && live.basis === "book" ? " book" : ""}">${number(closed ? d?.close : live.price)}</span>`}<span class="change">${showPts ? `<span class="change-points">${pts != null ? points(pts) : ""}</span>` : ""}<span class="change-pct">${change(pct)}</span></span>${numbersMode ? `<span class="day-range"><span class="dr-line"><i>低</i>${number(dayLo)}</span><span class="dr-line"><i>高</i>${number(dayHi)}</span></span>` : ""}${closed && d && d.date !== commonDate ? `<span class="as-of">${d.date.slice(5).replace("-", "/")}</span>` : ""}</button>`;
       })
       .join("") || '<div class="empty">加入第一檔自選，讓重要變化來找你。</div>'
   );
@@ -1009,7 +941,6 @@ function render() {
     ensurePositionIntraday();
     ensurePortfolioHistory();
   }
-  if (tab === "daily") dailyPage();
   if (tab === "settings")
     content.innerHTML = `<div class="pane"><h1>讓它融入你的桌面</h1><p class="intro">同一份自選與提醒，換一種工作時的樣子。</p><div class="appearance-grid">${[
       ["small", "small", "品牌配色 · 紅漲綠跌"],
@@ -1031,7 +962,7 @@ function render() {
       )
       .join(
         "",
-      )}</div><div class="setting-row"><label>顯示內容<select id="display-mode"><option value="numbers" ${state.settings.rowDisplay === "numbers" || !state.settings.rowDisplay ? "selected" : ""}>純數字</option><option value="trend" ${state.settings.rowDisplay === "trend" ? "selected" : ""}>單行走勢</option><option value="minimal" ${state.settings.rowDisplay === "minimal" ? "selected" : ""}>極簡：方向與名稱</option></select></label><label class="setting-check"><input id="show-codes" type="checkbox" ${state.settings.showCodes ? "checked" : ""}> 顯示代號</label><label class="setting-check"><input id="hide-names" type="checkbox" ${state.settings.hideNames ? "checked" : ""}> 只顯示代號（隱藏名稱）</label><label class="setting-check"><input id="show-change-points" type="checkbox" ${state.settings.showChangePoints !== false ? "checked" : ""}> 顯示漲跌點數</label></div><div class="note density-note">極簡方向為當日漲跌；— 平盤，○ 資料未確認。名稱尚未取得時會使用代號。</div><div class="setting-row"><label class="setting-check"><input id="always-on-top" type="checkbox" ${state.settings.alwaysOnTop !== false ? "checked" : ""}> 視窗保持置頂</label></div><div class="setting-row"><div><strong>視窗透明度</strong><small>只讓主視窗背景變透明，文字與數字維持不透明。</small></div><span class="opacity-control"><input id="window-opacity" type="range" min="40" max="100" step="5" value="${Math.round(shellOpacity(state.settings.windowOpacity) * 100)}"><output id="window-opacity-value">${Math.round(shellOpacity(state.settings.windowOpacity) * 100)}%</output></span></div><div class="setting-row"><div><strong>監看狀態</strong><small>隱藏視窗仍會監看，暫停則停止判定。</small></div><button id="pause" class="secondary">${state.settings.paused ? "繼續監看" : "暫停監看"}</button></div>${desktop ? `<div class="setting-row"><div><strong>程式</strong><small>找不到系統匣時，從這裡重新啟動或結束。結束後就不再監看。</small></div><span class="update-actions"><button id="restart-app" class="secondary">重新啟動</button><button id="quit-app" class="secondary">結束程式</button></span></div>` : ""}<label class="setting-row">更新間隔（秒）<input id="refresh" type="number" min="5" max="300" value="${state.settings.refreshSeconds}"></label><button id="save-refresh" class="secondary">儲存更新間隔</button><div class="setting-row"><label>行情來源<select id="quote-source"><option value="mis" ${state.settings.quoteSource !== "shioaji" ? "selected" : ""}>證交所 MIS（快照，約 1–2 分鐘）</option><option value="shioaji" ${state.settings.quoteSource === "shioaji" ? "selected" : ""}>永豐 Shioaji（即時逐筆）</option></select></label><label>sidecar 連接埠<input id="sidecar-port" type="number" min="1024" max="65535" value="${state.settings.sidecarPort ?? 18765}"></label></div><div class="note">Shioaji 需先完成永豐 API 開通並在本機啟動 sidecar（見 sidecar/README）；sidecar 無回應或缺檔時自動退回 MIS，頁尾會註明。${state.sourceNote ? `<br>目前狀態：${esc(state.sourceNote)}` : ""}</div>${desktop ? `<div class="setting-row"><div><strong>Shioaji 自動啟動</strong><small>開啟後，程式啟動時會自動把 sidecar 跑起來（行情來源需為永豐 Shioaji），不用再手動執行 run-sidecar.bat。金鑰只存放在這台電腦 %APPDATA%\\MaxiStocks 資料夾的獨立檔案，不進設定檔、不上傳，也不會被自動備份或匯出帶走。</small></div><label class="setting-check"><input id="sidecar-autostart" type="checkbox" ${state.settings.sidecarAutoStart ? "checked" : ""}> 自動啟動 sidecar</label></div><div class="setting-row"><label>API Key<input id="shioaji-api-key" type="password" autocomplete="off" placeholder="${shioajiKeys.apiKeySet ? "已設定，輸入新值可更換" : "尚未設定"}"></label><label>Secret Key<input id="shioaji-secret-key" type="password" autocomplete="off" placeholder="${shioajiKeys.secretKeySet ? "已設定，輸入新值可更換" : "尚未設定"}"></label></div><div class="setting-row"><label>sidecar 資料夾路徑<input id="sidecar-dir" type="text" placeholder="例如 C:\\MaxiStocks-Sidecar" value="${esc(state.settings.sidecarDir ?? "")}"></label></div><div class="setting-row"><span class="update-actions"><button id="shioaji-keys-save" class="secondary">儲存金鑰</button><button id="shioaji-keys-clear" class="secondary">清除金鑰</button><button id="sidecar-dir-save" class="secondary">儲存資料夾路徑</button><button id="sidecar-start-now" class="secondary">立即啟動 sidecar</button></span></div><div class="note">金鑰狀態：${esc(shioajiKeysLabel(shioajiKeys))}。更換金鑰時兩欄都要重新輸入。${sidecarMessage ? `<br>${esc(sidecarMessage)}` : ""}</div>` : ""}${desktop ? `<div class="setting-row"><div><strong>agent（MCP，選配）</strong><small id="mcp-status">${esc(mcpMessage || "複製後貼到 Claude、Codex、Gemini 或其他支援本機 MCP 的程式；基本監看不需要它")}</small></div><span class="update-actions"><button id="mcp-json" class="secondary">複製 JSON 設定</button><button id="mcp-claude" class="secondary">Claude Code 指令</button><button id="mcp-codex" class="secondary">Codex 指令</button><button id="mcp-gemini" class="secondary">Gemini 指令</button></span></div>` : ""}<div class="setting-row"><div><strong>自選與持股資料</strong><small>把自選分組、持股（全部購入批次）與月度紀錄匯出成一份 JSON 備份，設定與規則不包含在內；匯入會整份覆蓋目前的自選分組、持股與月度紀錄。</small></div><span class="update-actions"><button id="export-data" class="secondary">匯出自選與持股</button><button id="import-data-btn" class="secondary">匯入自選與持股</button><input id="import-file" type="file" accept=".json,application/json" hidden></span></div>${dataMessage ? `<div class="note">${esc(dataMessage)}</div>` : ""}${desktop ? `<div class="setting-row"><div><strong>Telegram 推播</strong><small>提醒觸發（細條／卡片）時，同步發一則訊息到你的 Telegram。bot token 只保存在這台電腦的設定檔裡，不會出現在狀態、匯出或任何紀錄中。</small></div><label class="setting-check"><input id="tg-enabled" type="checkbox" ${state.settings.telegramEnabled ? "checked" : ""}> 啟用推播</label></div><div class="setting-row"><div><strong>持股跌幅警報</strong><small>任一持股今日跌幅達到 5% 或 10% 時，各發一次卡片通知（同一檔同一級別每天只發一次）。仍需啟用上方 Telegram 推播，才會同步送到 Telegram。</small></div><label class="setting-check"><input id="position-drop-alert" type="checkbox" ${state.settings.positionDropAlert !== false ? "checked" : ""}> 啟用警報</label></div><div class="setting-row"><label>chat id<input id="tg-chat" type="text" inputmode="numeric" placeholder="例如 1926601428" value="${esc(state.settings.telegramChatId ?? "")}"></label><label>bot token<input id="tg-token" type="password" autocomplete="off" placeholder="${state.settings.telegramTokenSet ? "已設定，輸入新值可更換" : "尚未設定"}"></label></div><div class="setting-row"><span class="update-actions"><button id="tg-save" class="secondary">儲存 Telegram 設定</button><button id="tg-clear-token" class="secondary">清除 token</button><button id="tg-test" class="secondary">發送測試訊息</button></span></div>${telegramMessage ? `<div class="note">${esc(telegramMessage)}</div>` : ""}<div class="setting-row"><div><strong>PTT 股票聊天視窗</strong><small>開啟後另開小視窗顯示 PTT 股票聊天室的公開預覽（免登入 Telegram）；關閉開關或直接關掉小視窗都會收起來。</small></div><label class="setting-check"><input id="chat-window" type="checkbox" ${state.settings.chatWindow ? "checked" : ""}> 開啟小視窗</label></div><div class="setting-row"><label>聊天視窗縮放<select id="chat-zoom">${[50, 60, 70, 80, 90, 100, 110, 125, 150].map((z) => `<option value="${z}" ${(state.settings.chatZoom ?? 100) === z ? "selected" : ""}>${z}%</option>`).join("")}</select></label><label>聊天視窗樣式<select id="chat-style"><option value="text" ${(state.settings.chatStyle ?? "text") === "text" ? "selected" : ""}>純文字（CMD 風）</option><option value="web" ${state.settings.chatStyle === "web" ? "selected" : ""}>網頁版</option></select></label></div><div class="setting-row"><div><strong>自動備份</strong><small>每天把設定檔（自選、持股、規則與設定）備份一份到指定資料夾，保留最新 14 份。把資料夾指向雲端同步目錄（例如 Google 雲端硬碟的本機同步資料夾）就會自動上雲。</small></div><label class="setting-check"><input id="backup-enabled" type="checkbox" ${state.settings.backupEnabled ? "checked" : ""}> 啟用自動備份</label></div><div class="setting-row"><label>備份資料夾路徑<input id="backup-dir" type="text" placeholder="例如 D:\\Google Drive\\MaxiStocks 備份" value="${esc(state.settings.backupDir ?? "")}"></label></div><div class="setting-row"><span class="update-actions"><button id="backup-save" class="secondary">儲存備份設定</button><button id="backup-now" class="secondary">立即備份</button></span></div><div class="note">${backupMessage ? esc(backupMessage) + "<br>" : ""}${state.lastBackupAt ? `上次備份：${esc(state.lastBackupAt.at)} → ${esc(state.lastBackupAt.path)}` : state.lastBackupError ? `上次備份失敗：${esc(state.lastBackupError)}` : "尚無備份紀錄"}</div>` : ""}<div class="note">所有外觀預設無聲。灰階通知跟隨外觀。<br>${privacyShortcutLabel} 隱藏全部視窗，從系統匣恢復。<br>${state.privacyShortcutError ? esc(state.privacyShortcutError) + "<br>" : ""}資料：TWSE MIS；來源時間與取得時間分開顯示。<br>首次觀測只建立基準；過期或缺少成交價時不觸發。<br>${desktop ? "agent：上方按鈕複製連接設定，說明見 README。" : "瀏覽器僅顯示合成預覽；桌面版才會實際監看與提供 MCP。"}</div></div>`;
+      )}</div><div class="setting-row"><label>顯示內容<select id="display-mode"><option value="numbers" ${state.settings.rowDisplay === "numbers" || !state.settings.rowDisplay ? "selected" : ""}>純數字</option><option value="trend" ${state.settings.rowDisplay === "trend" ? "selected" : ""}>單行走勢</option><option value="minimal" ${state.settings.rowDisplay === "minimal" ? "selected" : ""}>極簡：方向與名稱</option></select></label><label class="setting-check"><input id="show-codes" type="checkbox" ${state.settings.showCodes ? "checked" : ""}> 顯示代號</label><label class="setting-check"><input id="hide-names" type="checkbox" ${state.settings.hideNames ? "checked" : ""}> 只顯示代號（隱藏名稱）</label><label class="setting-check"><input id="show-change-points" type="checkbox" ${state.settings.showChangePoints !== false ? "checked" : ""}> 顯示漲跌點數</label></div><div class="note density-note">極簡方向為當日漲跌；— 平盤，○ 資料未確認。名稱尚未取得時會使用代號。</div><div class="setting-row"><label class="setting-check"><input id="always-on-top" type="checkbox" ${state.settings.alwaysOnTop !== false ? "checked" : ""}> 視窗保持置頂</label></div><div class="setting-row"><div><strong>視窗透明度</strong><small>只讓主視窗背景變透明，文字與數字維持不透明。</small></div><span class="opacity-control"><input id="window-opacity" type="range" min="40" max="100" step="5" value="${Math.round(shellOpacity(state.settings.windowOpacity) * 100)}"><output id="window-opacity-value">${Math.round(shellOpacity(state.settings.windowOpacity) * 100)}%</output></span></div><div class="setting-row"><div><strong>監看狀態</strong><small>隱藏視窗仍會監看，暫停則停止判定。</small></div><button id="pause" class="secondary">${state.settings.paused ? "繼續監看" : "暫停監看"}</button></div>${desktop ? `<div class="setting-row"><div><strong>程式</strong><small>找不到系統匣時，從這裡重新啟動或結束。結束後就不再監看。</small></div><span class="update-actions"><button id="restart-app" class="secondary">重新啟動</button><button id="quit-app" class="secondary">結束程式</button></span></div>` : ""}<label class="setting-row">更新間隔（秒）<input id="refresh" type="number" min="5" max="300" value="${state.settings.refreshSeconds}"></label><button id="save-refresh" class="secondary">儲存更新間隔</button><div class="setting-row"><label>行情來源<select id="quote-source"><option value="mis" ${state.settings.quoteSource !== "shioaji" ? "selected" : ""}>證交所 MIS（快照，約 1–2 分鐘）</option><option value="shioaji" ${state.settings.quoteSource === "shioaji" ? "selected" : ""}>永豐 Shioaji（即時逐筆）</option></select></label><label>sidecar 連接埠<input id="sidecar-port" type="number" min="1024" max="65535" value="${state.settings.sidecarPort ?? 18765}"></label></div><div class="note">Shioaji 需先完成永豐 API 開通並在本機啟動 sidecar（見 sidecar/README）；sidecar 無回應或缺檔時自動退回 MIS，頁尾會註明。${state.sourceNote ? `<br>目前狀態：${esc(state.sourceNote)}` : ""}</div>${desktop ? `<div class="setting-row"><div><strong>Shioaji 自動啟動</strong><small>開啟後，程式啟動時會自動把 sidecar 跑起來（行情來源需為永豐 Shioaji），不用再手動執行 run-sidecar.bat。金鑰只存放在這台電腦 %APPDATA%\\MaxiStocks 資料夾的獨立檔案，不進設定檔、不上傳，也不會被自動備份或匯出帶走。</small></div><label class="setting-check"><input id="sidecar-autostart" type="checkbox" ${state.settings.sidecarAutoStart ? "checked" : ""}> 自動啟動 sidecar</label></div><div class="setting-row"><label>API Key<input id="shioaji-api-key" type="password" autocomplete="off" placeholder="${shioajiKeys.apiKeySet ? "已設定，輸入新值可更換" : "尚未設定"}"></label><label>Secret Key<input id="shioaji-secret-key" type="password" autocomplete="off" placeholder="${shioajiKeys.secretKeySet ? "已設定，輸入新值可更換" : "尚未設定"}"></label></div><div class="setting-row"><label>sidecar 資料夾路徑<input id="sidecar-dir" type="text" placeholder="例如 C:\\MaxiStocks-Sidecar" value="${esc(state.settings.sidecarDir ?? "")}"></label></div><div class="setting-row"><span class="update-actions"><button id="shioaji-keys-save" class="secondary">儲存金鑰</button><button id="shioaji-keys-clear" class="secondary">清除金鑰</button><button id="sidecar-dir-save" class="secondary">儲存資料夾路徑</button><button id="sidecar-start-now" class="secondary">立即啟動 sidecar</button></span></div><div class="note">金鑰狀態：${esc(shioajiKeysLabel(shioajiKeys))}。更換金鑰時兩欄都要重新輸入。${sidecarMessage ? `<br>${esc(sidecarMessage)}` : ""}</div>` : ""}${desktop ? `<div class="setting-row"><div><strong>agent（MCP，選配）</strong><small id="mcp-status">${esc(mcpMessage || "複製後貼到 Claude、Codex、Gemini 或其他支援本機 MCP 的程式；基本監看不需要它")}</small></div><span class="update-actions"><button id="mcp-json" class="secondary">複製 JSON 設定</button><button id="mcp-claude" class="secondary">Claude Code 指令</button><button id="mcp-codex" class="secondary">Codex 指令</button><button id="mcp-gemini" class="secondary">Gemini 指令</button></span></div>` : ""}<div class="setting-row"><div><strong>自選與持股資料</strong><small>把自選分組、持股（全部購入批次）與月度紀錄匯出成一份 JSON 備份，設定與規則不包含在內；匯入會整份覆蓋目前的自選分組、持股與月度紀錄。</small></div><span class="update-actions"><button id="export-data" class="secondary">匯出自選與持股</button><button id="import-data-btn" class="secondary">匯入自選與持股</button><input id="import-file" type="file" accept=".json,application/json" hidden></span></div>${dataMessage ? `<div class="note">${esc(dataMessage)}</div>` : ""}${desktop ? `<div class="setting-row"><div><strong>Telegram 推播</strong><small>提醒觸發（細條／卡片）時，同步發一則訊息到你的 Telegram。bot token 只保存在這台電腦的設定檔裡，不會出現在狀態、匯出或任何紀錄中。</small></div><label class="setting-check"><input id="tg-enabled" type="checkbox" ${state.settings.telegramEnabled ? "checked" : ""}> 啟用推播</label></div><div class="setting-row"><div><strong>持股跌幅警報</strong><small>任一持股今日跌幅達到 5% 或 10% 時，各發一次卡片通知（同一檔同一級別每天只發一次）。仍需啟用上方 Telegram 推播，才會同步送到 Telegram。</small></div><label class="setting-check"><input id="position-drop-alert" type="checkbox" ${state.settings.positionDropAlert !== false ? "checked" : ""}> 啟用警報</label></div><div class="setting-row"><label>chat id<input id="tg-chat" type="text" inputmode="numeric" placeholder="例如 1926601428" value="${esc(state.settings.telegramChatId ?? "")}"></label><label>bot token<input id="tg-token" type="password" autocomplete="off" placeholder="${state.settings.telegramTokenSet ? "已設定，輸入新值可更換" : "尚未設定"}"></label></div><div class="setting-row"><span class="update-actions"><button id="tg-save" class="secondary">儲存 Telegram 設定</button><button id="tg-clear-token" class="secondary">清除 token</button><button id="tg-test" class="secondary">發送測試訊息</button></span></div>${telegramMessage ? `<div class="note">${esc(telegramMessage)}</div>` : ""}<div class="setting-row"><div><strong>PTT 股票聊天視窗</strong><small>開啟後另開小視窗顯示 PTT 股票聊天室的公開預覽（免登入 Telegram）；關閉開關或直接關掉小視窗都會收起來。</small></div><label class="setting-check"><input id="chat-window" type="checkbox" ${state.settings.chatWindow ? "checked" : ""}> 開啟小視窗</label></div><div class="setting-row"><label>聊天視窗縮放<select id="chat-zoom">${[50, 60, 70, 80, 90, 100, 110, 125, 150].map((z) => `<option value="${z}" ${(state.settings.chatZoom ?? 100) === z ? "selected" : ""}>${z}%</option>`).join("")}</select></label><label>聊天視窗樣式<select id="chat-style"><option value="text" ${(state.settings.chatStyle ?? "text") === "text" ? "selected" : ""}>純文字（記事本風）</option><option value="web" ${state.settings.chatStyle === "web" ? "selected" : ""}>網頁版</option></select></label></div><div class="setting-row"><div><strong>自動備份</strong><small>每天把設定檔（自選、持股、規則與設定）備份一份到指定資料夾，保留最新 14 份。把資料夾指向雲端同步目錄（例如 Google 雲端硬碟的本機同步資料夾）就會自動上雲。</small></div><label class="setting-check"><input id="backup-enabled" type="checkbox" ${state.settings.backupEnabled ? "checked" : ""}> 啟用自動備份</label></div><div class="setting-row"><label>備份資料夾路徑<input id="backup-dir" type="text" placeholder="例如 D:\\Google Drive\\MaxiStocks 備份" value="${esc(state.settings.backupDir ?? "")}"></label></div><div class="setting-row"><span class="update-actions"><button id="backup-save" class="secondary">儲存備份設定</button><button id="backup-now" class="secondary">立即備份</button></span></div><div class="note">${backupMessage ? esc(backupMessage) + "<br>" : ""}${state.lastBackupAt ? `上次備份：${esc(state.lastBackupAt.at)} → ${esc(state.lastBackupAt.path)}` : state.lastBackupError ? `上次備份失敗：${esc(state.lastBackupError)}` : "尚無備份紀錄"}</div>` : ""}<div class="note">所有外觀預設無聲。灰階通知跟隨外觀。<br>${privacyShortcutLabel} 隱藏全部視窗，從系統匣恢復。<br>${state.privacyShortcutError ? esc(state.privacyShortcutError) + "<br>" : ""}資料：TWSE MIS；來源時間與取得時間分開顯示。<br>首次觀測只建立基準；過期或缺少成交價時不觸發。<br>${desktop ? "agent：上方按鈕複製連接設定，說明見 README。" : "瀏覽器僅顯示合成預覽；桌面版才會實際監看與提供 MCP。"}</div></div>`;
   if (tab === "rules")
     content.innerHTML = `<div class="pane"><h1>只在你在意的時候</h1><p class="intro">首次觀測建立基準，之後跨過門檻才提醒。</p><form id="rule-form"><div class="form-grid"><label>股票代號<input name="symbol" required placeholder="2330" value="${esc(editing?.symbol ?? state.watchlist.find((c) => c !== "t00") ?? "2330")}"></label><label>觀測項目<select name="metric"><option value="price">成交價（元）</option><option value="changePercent" ${editing?.metric === "changePercent" ? "selected" : ""}>漲跌幅（成交價，%）</option><option value="mid" ${editing?.metric === "mid" ? "selected" : ""}>買賣中間價（委託價，元）</option><option value="midChangePercent" ${editing?.metric === "midChangePercent" ? "selected" : ""}>漲跌幅（買賣中間價，%）</option></select></label><label>方向<select name="direction"><option value="above">由下往上跨過</option><option value="below" ${editing?.direction === "below" ? "selected" : ""}>由上往下跨過</option></select></label><label>門檻<input name="threshold" type="number" step="any" required placeholder="例如 1000" value="${editing?.threshold ?? ""}"></label><label>通知<select name="channel">${[
       ["strip", "細條"],
@@ -1058,8 +989,14 @@ function render() {
       content,
       state,
       skinAction,
-      openStock,
+      undefined,
       () => void fitMinimal(),
+      (index) => {
+        // Same path as the small skin's group tabs: the core command
+        // swaps the monitored list, and the note starts at the top.
+        scrollResetPending = true;
+        void mutate("set_active_group", { index });
+      },
     );
   bind();
   if (tab === "watch" && state.settings.rowDisplay === "minimal")
@@ -1563,14 +1500,8 @@ function bind() {
     state.settings.rowDisplay === "minimal" &&
     !content.querySelector("[data-disguise]")
   ) {
-    bindMinimal(content, state, openStock);
+    bindMinimal(content, state, () => {});
   }
-  document.querySelectorAll<HTMLButtonElement>("[data-quote]").forEach(
-    (b) =>
-      (b.onclick = () => {
-        openStock(b.dataset.quote!);
-      }),
-  );
   document.querySelector<HTMLButtonElement>("#manage")!.onclick = () => {
     tab = "manage";
     manage();
@@ -1788,7 +1719,6 @@ async function poll() {
     const previous = state;
     state = next;
     apply();
-    if (tab === "daily" && dailyData?.pending) void loadDaily();
     if (!previous) render();
     else if (tab === "watch") {
       if (["terminal", "txt"].includes(state.settings.appearance)) {
