@@ -179,7 +179,13 @@ fn fetch_tw(
                 if missing.is_empty() {
                     Ok((quotes, None))
                 } else {
-                    match fetch_mis(client, &missing) {
+                    // On this fill path only, one fresh retry: MIS
+                    // occasionally answers with an empty or truncated body
+                    // ("EOF while parsing"), and a single bad response
+                    // should not fail the whole fill round.
+                    let filled =
+                        fetch_mis(client, &missing).or_else(|_| fetch_mis(client, &missing));
+                    match filled {
                         Ok(mis) => Ok((
                             core::fill_missing(quotes, mis),
                             Some(format!("Shioaji 缺 {} 檔，已用 TWSE MIS 補", missing.len())),

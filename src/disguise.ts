@@ -7,7 +7,8 @@ import {
   stale,
   livePrice,
   closeDay,
-  oldestDataAt,
+  dataFreshness,
+  FRESH_MS,
   displaySymbol,
   isYahooSymbol,
 } from "./model.ts";
@@ -79,13 +80,18 @@ function values(s: Snapshot, c: string) {
 }
 function dateLabel(s: Snapshot) {
   const d = latestCloseDate(s);
-  return !s.marketOpen && !s.demo
-    ? d
-      ? d.replaceAll("-", "/") + " 收盤"
-      : "等待收盤資料"
-    : oldestDataAt(s)
-      ? `資料 ${time(oldestDataAt(s)!)}（取得 ${time(s.lastFetch)}）`
-      : time(s.lastFetch);
+  if (!s.marketOpen && !s.demo)
+    return d ? d.replaceAll("-", "/") + " 收盤" : "等待收盤資料";
+  // Same majority snapshot time as the small footer: one parked quote must
+  // not pin the header to its own old timestamp. Laggards are noted in the
+  // label; the disguise skins have no health lamp, so nothing is "expired".
+  const { majorityAt, staleCount } = dataFreshness(s, s.now);
+  if (majorityAt == null) return time(s.lastFetch);
+  const staleNote =
+    staleCount > 0 && s.now - majorityAt <= FRESH_MS
+      ? `（${staleCount} 檔較舊）`
+      : "";
+  return `資料 ${time(majorityAt)}${staleNote}（取得 ${time(s.lastFetch)}）`;
 }
 export function notepadText(s: Snapshot): string {
   const lines = [

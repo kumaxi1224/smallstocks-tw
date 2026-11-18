@@ -35,7 +35,8 @@ import {
   livePrice,
   closeDay,
   aging,
-  oldestDataAt,
+  dataFreshness,
+  FRESH_MS,
   portfolioSummary,
   combinedTotals,
   monthlyRows,
@@ -368,7 +369,14 @@ function apply() {
     ? '<span class="demo-label">示範資料</span><span>合成行情 · 不代表真實市場</span>'
     : "";
   const missing = state.watchlist.filter((c) => !state.quotes[c]).length;
-  const old = state.watchlist.some((c) => stale(state.quotes[c], state.now));
+  // Footer health follows the majority snapshot time, not the single oldest
+  // quote: a few laggards are noted on the source line instead of expiring
+  // the whole feed. Per-row aging/stale marks and the core's alert freshness
+  // rule are unaffected.
+  const freshness = dataFreshness(state, state.now);
+  const old =
+    freshness.majorityAt != null &&
+    state.now - freshness.majorityAt > FRESH_MS;
   document.querySelector("#health")!.textContent = state.settings.paused
     ? "Ⅱ 已暫停監看"
     : state.error
@@ -390,17 +398,19 @@ function apply() {
   )
     ? "Shioaji"
     : "TWSE MIS";
+  const staleNote =
+    !old && freshness.staleCount > 0 ? `（${freshness.staleCount} 檔較舊）` : "";
   document.querySelector("#source")!.textContent =
     (state.demo
       ? "DEMO"
-      : state.marketOpen && oldestDataAt(state)
-        ? `${sourceLabel} · 資料 ${time(oldestDataAt(state)!)}`
+      : state.marketOpen && freshness.majorityAt != null
+        ? `${sourceLabel} · 資料 ${time(freshness.majorityAt)}${staleNote}`
         : `${sourceLabel} · 取得 ${time(state.lastFetch)}`) +
     (state.sourceNote ? ` · ${state.sourceNote}` : "");
   document.querySelector<HTMLElement>("#source")!.title =
     state.sourceNote ??
-    (state.marketOpen && oldestDataAt(state)
-      ? `各檔資料時間不同，顯示最舊的一筆（最新取得於 ${time(state.lastFetch)}）。證交所個股約每 1 至 2 分鐘更新一次；Shioaji 為即時逐筆。`
+    (state.marketOpen && freshness.majorityAt != null
+      ? `各檔資料時間不同，顯示多數股票的資料時間（約一成以內的較舊股票另行註記；最新取得於 ${time(state.lastFetch)}）。證交所個股約每 1 至 2 分鐘更新一次；Shioaji 為即時逐筆。`
       : "");
   // Header combined total (≈ TWD), updated with the footer: the
   // per-currency portfolio totals with USD converted at the internal

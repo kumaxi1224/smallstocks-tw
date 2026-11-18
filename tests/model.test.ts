@@ -225,7 +225,13 @@ describe("what a closed session shows", () => {
     expect(closeDay(noRange, "2330")).toMatchObject({ high: null, low: null });
   });
 });
-import { aging, ageSeconds, oldestDataAt, points } from "../src/model.ts";
+import {
+  aging,
+  ageSeconds,
+  dataFreshness,
+  oldestDataAt,
+  points,
+} from "../src/model.ts";
 describe("how old the data is", () => {
   const quote = (ageMs: number, now = 1_000_000) =>
     ({ sourceAt: now - ageMs }) as Quote;
@@ -245,6 +251,39 @@ describe("how old the data is", () => {
     } as unknown as Parameters<typeof oldestDataAt>[0];
     expect(oldestDataAt(s)).toBe(300);
     expect(oldestDataAt({ watchlist: ["x"], quotes: {} })).toBeNull();
+  });
+  describe("majority data time", () => {
+    const NOW = 10_000_000;
+    const snap = (agesMs: number[]) =>
+      ({
+        watchlist: agesMs.map((_, i) => `s${i}`),
+        quotes: Object.fromEntries(
+          agesMs.map((age, i) => [`s${i}`, { sourceAt: NOW - age }]),
+        ),
+      }) as unknown as Parameters<typeof dataFreshness>[0];
+    it("uses a fresh time and counts no laggards when everything is fresh", () => {
+      const f = dataFreshness(snap(Array(20).fill(30_000)), NOW);
+      expect(f.majorityAt).toBe(NOW - 30_000);
+      expect(f.staleCount).toBe(0);
+    });
+    it("is not dragged by one ancient quote among sixty, but counts it", () => {
+      const ages = [...Array(59).fill(20_000), 86_400_000];
+      const f = dataFreshness(snap(ages), NOW);
+      expect(f.majorityAt).toBe(NOW - 20_000);
+      expect(f.staleCount).toBe(1);
+    });
+    it("reflects the old time when most quotes are old", () => {
+      const ages = [...Array(9).fill(600_000), 10_000];
+      const f = dataFreshness(snap(ages), NOW);
+      expect(f.majorityAt).toBe(NOW - 600_000);
+      expect(f.staleCount).toBe(9);
+    });
+    it("is null when nothing is quoted", () => {
+      expect(dataFreshness({ watchlist: ["x"], quotes: {} }, NOW)).toEqual({
+        majorityAt: null,
+        staleCount: 0,
+      });
+    });
   });
   it("formats a signed point change, trimmed like the price", () => {
     expect(points(12.5)).toBe("+12.5");

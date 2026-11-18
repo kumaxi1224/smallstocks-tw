@@ -138,3 +138,37 @@ it("the Windows Notepad skin lists the watch groups in a 分組 menu after 檢�
   expect(html).toContain('class="notepad-editor notepad-fields"');
   expect(html).not.toContain("<textarea");
 });
+it("the Notepad header shows the majority data time and notes laggards", () => {
+  const at = Date.parse("2026-11-09T10:00:00+08:00");
+  const codes = Array.from({ length: 10 }, (_, i) => `s${i}`);
+  const quotes: Record<string, unknown> = {};
+  for (const c of codes)
+    quotes[c] = { name: c, price: 100, changePercent: 0, sourceAt: at };
+  // One laggard parked ten minutes back: it must not pin the header time.
+  quotes["s9"] = {
+    name: "s9",
+    price: 100,
+    changePercent: 0,
+    sourceAt: at - 600_000,
+  };
+  const base = {
+    marketOpen: true,
+    demo: false,
+    watchlist: codes,
+    dailySummaries: {},
+    quotes,
+    settings: { paused: false },
+    events: [],
+    lastFetch: at,
+  };
+  const fresh = { ...base, now: at } as unknown as Snapshot;
+  expect(notepadText(fresh)).toContain(
+    "資料 10:00:00（1 檔較舊）（取得 10:00:00）",
+  );
+  expect(notepadText(fresh)).not.toContain("09:50:00");
+  // When the majority itself is past the freshness window the note is
+  // dropped: the label never claims laggards against an already-old feed.
+  const old = { ...base, now: at + 600_000 } as unknown as Snapshot;
+  expect(notepadText(old)).toContain("資料 10:00:00（取得 10:00:00）");
+  expect(notepadText(old)).not.toContain("較舊");
+});

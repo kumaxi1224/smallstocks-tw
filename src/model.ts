@@ -393,6 +393,32 @@ export function oldestDataAt(
     .filter((t): t is number => typeof t === "number");
   return times.length ? Math.min(...times) : null;
 }
+export interface DataFreshness {
+  /**
+   * The "majority" snapshot time: the ~10th percentile of the quoted times,
+   * oldest first. Up to about a tenth of the symbols may be older without
+   * moving it, so one illiquid symbol parked at yesterday's closing-auction
+   * price cannot drag the whole feed's freshness down with it.
+   */
+  majorityAt: number | null;
+  /** How many quoted symbols are older than the freshness threshold. */
+  staleCount: number;
+}
+/** Majority snapshot time plus the laggard count, for the footer health line. */
+export function dataFreshness(
+  s: Pick<Snapshot, "watchlist" | "quotes">,
+  now: number,
+): DataFreshness {
+  const times = s.watchlist
+    .map((c) => s.quotes[c]?.sourceAt)
+    .filter((t): t is number => typeof t === "number")
+    .sort((a, b) => a - b);
+  if (!times.length) return { majorityAt: null, staleCount: 0 };
+  const majorityAt =
+    times[Math.min(times.length - 1, Math.floor(times.length * 0.1))] ?? null;
+  const staleCount = times.filter((t) => now - t > FRESH_MS).length;
+  return { majorityAt, staleCount };
+}
 export type PriceBasis = "trade" | "book" | "none";
 export function livePrice(q: Quote | undefined): {
   price: number | null;
