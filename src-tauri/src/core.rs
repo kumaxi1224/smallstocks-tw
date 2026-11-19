@@ -714,6 +714,68 @@ pub struct PositionDropAlert {
     /// Drop threshold, stored as a positive percent: 5 or 10.
     pub level: u8,
 }
+/// One daily-close crossing ("add signal") the core detected from completed
+/// daily bars: the close crossed back up through a line it had been under
+/// the previous trading day. `kind` is "exit" (back above the Donchian
+/// 20-day exit line), "ma20" or "ma60" (above that moving average of closes,
+/// the average including the crossing day itself). Persisted in Saved and
+/// deduplicated by (code, kind, date) so a restart never re-reports the
+/// same crossing; only the last 14 days are kept, for the main window's
+/// signal marquee. Display-only: these never become rule Events, notices
+/// or Telegram alerts.
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AddSignal {
+    pub code: String,
+    /// "exit" | "ma20" | "ma60".
+    pub kind: String,
+    /// The crossing day's trading date, YYYY-MM-DD.
+    pub date: String,
+    /// That day's close and the line it crossed.
+    pub close: f64,
+    pub line: f64,
+}
+/// Every daily-close crossing in a completed daily series, oldest first.
+/// Pure: the caller supplies the bars (official TWSE/TPEx days for Taiwan
+/// codes, Yahoo daily bars for the rest) and owns deduplication and
+/// retention. A crossing needs the previous day's close under the line
+/// and the day's close at or above it; the exit line is the Donchian
+/// 20-day low of the 20 sessions BEFORE the day (levels_engine's don_lo),
+/// the moving averages include the day itself, and a kind is not judged
+/// at all until its full window exists (21 / 20 / 60 bars).
+pub fn add_signal_crossings(code: &str, days: &[daily::Day]) -> Vec<AddSignal> {
+    let mut out = Vec::new();
+    for i in 1..days.len() {
+        let (prev, day) = (&days[i - 1], &days[i]);
+        let mut judge = |kind: &str, line: f64| {
+            if prev.close < line && day.close >= line {
+                out.push(AddSignal {
+                    code: code.into(),
+                    kind: kind.into(),
+                    date: day.date.clone(),
+                    close: day.close,
+                    line,
+                });
+            }
+        };
+        if i >= 20 {
+            let line = days[i - 20..i]
+                .iter()
+                .map(|d| d.low)
+                .fold(f64::INFINITY, f64::min);
+            judge("exit", line);
+        }
+        if i >= 19 {
+            let line = days[i - 19..=i].iter().map(|d| d.close).sum::<f64>() / 20.;
+            judge("ma20", line);
+        }
+        if i >= 59 {
+            let line = days[i - 59..=i].iter().map(|d| d.close).sum::<f64>() / 60.;
+            judge("ma60", line);
+        }
+    }
+    out
+}
 /// One month's portfolio snapshot for the positions page's monthly tab:
 /// the combined total (TWD equivalent) the app computed the first time it
 /// ran that month with complete quotes, with the TWD/USD legs and the
@@ -760,6 +822,10 @@ pub struct Saved {
     /// empty on pre-alert saves and pruned back to one date on evaluation.
     #[serde(default)]
     pub position_drop_alerts: Vec<PositionDropAlert>,
+    /// Daily-close add signals (see AddSignal), newest first, pruned to
+    /// the last 14 days on every evaluation; empty on pre-signal saves.
+    #[serde(default)]
+    pub add_signals: Vec<AddSignal>,
     /// Monthly portfolio snapshots (see MonthlySnapshot); empty on
     /// pre-monthly saves.
     #[serde(default)]
@@ -942,6 +1008,15 @@ pub struct Core {
     pub history_queue: std::collections::VecDeque<String>,
     pub history_pending: std::collections::HashSet<String>,
     pub history_errors: HashMap<String, (String, i64)>,
+    /// Yahoo daily bars for Yahoo-routed codes, the daily input of the
+    /// add-signal crossings (Taiwan codes judge from the official
+    /// daily_cache instead). In memory only, like history_cache: the bars
+    /// are refetched on launch, while the signals they produced persist
+    /// in Saved.
+    pub signal_daily_cache: HashMap<String, daily::Series>,
+    pub signal_daily_queue: std::collections::VecDeque<String>,
+    pub signal_daily_pending: std::collections::HashSet<String>,
+    pub signal_daily_errors: HashMap<String, (String, i64)>,
     pub calendar_errors: HashMap<i32, (String, i64)>,
     pub saved: Saved,
     pub quotes: HashMap<String, Quote>,
@@ -996,6 +1071,10 @@ impl Core {
             history_queue: Default::default(),
             history_pending: Default::default(),
             history_errors: Default::default(),
+            signal_daily_cache: Default::default(),
+            signal_daily_queue: Default::default(),
+            signal_daily_pending: Default::default(),
+            signal_daily_errors: Default::default(),
             calendar_errors: Default::default(),
             saved,
             quotes: HashMap::new(),
@@ -1224,7 +1303,7 @@ impl Core {
             .iter()
             .map(|c| (c.clone(), self.intraday_view(c)))
             .collect();
-        json!({"watchlist":self.saved.watchlist,"groups":self.saved.groups,"activeGroup":self.saved.active_group,"positions":self.saved.positions,"monthlySnapshots":self.saved.monthly_snapshots,"names":self.saved.names,"settings":self.settings_view(),"privacyShortcutError":self.privacy_shortcut_error,"rules":self.saved.rules,"events":self.saved.events,"quotes":self.quotes,"demo":self.demo,"error":self.error,"sourceNote":self.source_note,"lastBackupAt":self.last_backup_at.as_ref().map(|(at, path)| json!({"at":at,"path":path})),"lastBackupError":self.last_backup_error,"lastFetch":self.last_fetch,"nextPoll":self.next_poll,"marketOpen":self.market_open(now()),"marketClosedReason":self.closed_reason(now()),"calendar":self.calendar_view(),"revision":self.revision,"now":now(),"dailySummaries":summaries,"intraday":intraday,"portfolioHistory":self.portfolio_history_view()})
+        json!({"watchlist":self.saved.watchlist,"groups":self.saved.groups,"activeGroup":self.saved.active_group,"positions":self.saved.positions,"monthlySnapshots":self.saved.monthly_snapshots,"names":self.saved.names,"settings":self.settings_view(),"privacyShortcutError":self.privacy_shortcut_error,"rules":self.saved.rules,"events":self.saved.events,"addSignals":self.saved.add_signals,"quotes":self.quotes,"demo":self.demo,"error":self.error,"sourceNote":self.source_note,"lastBackupAt":self.last_backup_at.as_ref().map(|(at, path)| json!({"at":at,"path":path})),"lastBackupError":self.last_backup_error,"lastFetch":self.last_fetch,"nextPoll":self.next_poll,"marketOpen":self.market_open(now()),"marketClosedReason":self.closed_reason(now()),"calendar":self.calendar_view(),"revision":self.revision,"now":now(),"dailySummaries":summaries,"intraday":intraday,"portfolioHistory":self.portfolio_history_view()})
     }
     pub fn queue_intraday(&mut self, code: &str) {
         let at = now();
@@ -1389,11 +1468,105 @@ impl Core {
             .daily_errors
             .get(&key)
             .is_some_and(|(_, t)| at - t < 300_000);
-        if !fresh && !cooldown && !self.daily_pending.contains(&key) && self.daily_queue.len() < 64
+        if !fresh && !cooldown && !self.daily_pending.contains(&key) && self.daily_queue.len() < 256
         {
             self.daily_pending.insert(key);
             self.daily_queue.push_back((code.into(), month.into()));
         }
+    }
+    /// Queues a Yahoo daily-bars fetch for one Yahoo-routed code unless
+    /// the cached series is under 30 minutes old or a recent failure is
+    /// cooling down — the history queue's discipline, on the same clock.
+    pub fn queue_signal_daily(&mut self, code: &str) {
+        let at = now();
+        let fresh = self
+            .signal_daily_cache
+            .get(code)
+            .is_some_and(|s| at - s.fetched_at < 1_800_000);
+        let cooldown = self
+            .signal_daily_errors
+            .get(code)
+            .is_some_and(|(_, t)| at - t < 300_000);
+        if !fresh
+            && !cooldown
+            && !self.signal_daily_pending.contains(code)
+            && self.signal_daily_queue.len() < 64
+        {
+            self.signal_daily_pending.insert(code.into());
+            self.signal_daily_queue.push_back(code.into());
+        }
+    }
+    /// The completed daily bars the add-signal judge reads for one code:
+    /// Taiwan codes merge every cached official month (the cache holds
+    /// about four months, enough for MA60), Yahoo-routed codes use their
+    /// Yahoo daily series. Sorted by date, one row per date.
+    fn signal_days(&self, code: &str) -> Vec<daily::Day> {
+        let mut days: Vec<daily::Day> = if is_tw_symbol(code) {
+            self.saved
+                .daily_cache
+                .values()
+                .filter(|s| s.symbol == code)
+                .flat_map(|s| s.days.iter().cloned())
+                .collect()
+        } else {
+            self.signal_daily_cache
+                .get(code)
+                .map(|s| s.days.clone())
+                .unwrap_or_default()
+        };
+        days.sort_by(|a, b| a.date.cmp(&b.date));
+        days.dedup_by(|a, b| a.date == b.date);
+        days
+    }
+    /// Judges every monitored code's daily bars for add-signal crossings
+    /// and records the new ones in Saved (deduplicated by code + kind +
+    /// date, pruned to the last 14 days, newest first). Returns how many
+    /// were added. Runs whenever fresh daily data lands and on get_status,
+    /// so a restart re-judges from the persisted Taiwan cache without
+    /// re-reporting what is already recorded. A failed persist leaves the
+    /// signals in memory; the next successful persist (the daily worker
+    /// and ingest persist the whole Saved) carries them to disk.
+    pub fn evaluate_add_signals(&mut self) -> usize {
+        let today = local(now()).date_naive();
+        let cutoff = (today - chrono::Duration::days(14)).format("%Y-%m-%d").to_string();
+        let mut added = 0;
+        for code in self.saved.all_codes() {
+            let days = self.signal_days(&code);
+            if days.len() < 2 {
+                continue;
+            }
+            for sig in add_signal_crossings(&code, &days) {
+                if sig.date >= cutoff
+                    && !self.saved.add_signals.iter().any(|s| {
+                        s.code == sig.code && s.kind == sig.kind && s.date == sig.date
+                    })
+                {
+                    self.saved.add_signals.push(sig);
+                    added += 1;
+                }
+            }
+        }
+        let before = self.saved.add_signals.len();
+        self.saved.add_signals.retain(|s| s.date >= cutoff);
+        // Newest first; within one date the stronger line first (ma60,
+        // ma20, exit), then by code, so the marquee order is stable.
+        let rank = |kind: &str| match kind {
+            "ma60" => 0,
+            "ma20" => 1,
+            _ => 2,
+        };
+        self.saved
+            .add_signals
+            .sort_by(|a, b| {
+                b.date
+                    .cmp(&a.date)
+                    .then(rank(&a.kind).cmp(&rank(&b.kind)))
+                    .then(a.code.cmp(&b.code))
+            });
+        if added > 0 || self.saved.add_signals.len() != before {
+            let _ = self.persist();
+        }
+        added
     }
     pub fn daily_view(&self, code: &str, months: &[String]) -> Value {
         let mut days = Vec::new();
@@ -1442,22 +1615,26 @@ impl Core {
                 }
             }
             if !self.market_open(now()) || self.demo {
-                let months = daily::months(now());
-                // Held Taiwan codes need their official closes too, even when
-                // they sit in no watch group.
-                let mut daily_codes = self.saved.watchlist.clone();
-                for p in &self.saved.positions {
-                    if is_tw_symbol(&p.code) && !daily_codes.contains(&p.code) {
-                        daily_codes.push(p.code.clone());
-                    }
-                }
-                for c in daily_codes {
+                // Four months of official bars: the close-day view reads
+                // two, and the add-signal judge needs 60+ trading days for
+                // MA60. The queue covers the whole monitoring union (all
+                // groups plus positions), not just the visible group, so
+                // a held code in no group still gets its closes.
+                let months = daily::recent_months(now(), 4);
+                for c in self.saved.all_codes() {
                     if is_tw_symbol(&c) {
                         for m in &months {
                             self.queue_daily(&c, m)
                         }
+                    } else if !is_taifex_symbol(&c) {
+                        // Yahoo-routed codes judge from Yahoo daily bars;
+                        // TAIFEX codes have no daily-bar source here.
+                        self.queue_signal_daily(&c);
                     }
                 }
+                // Judge from whatever daily data is already cached; fresh
+                // arrivals are judged again by their workers.
+                self.evaluate_add_signals();
             }
             return Ok(self.snapshot());
         }
@@ -2696,6 +2873,152 @@ mod tests {
         assert_eq!(symbol("大盤"), Some("t00".into()));
         assert!(trading(ts()));
         assert!(!trading(ts() + 86400000));
+    }
+    /// Builds daily bars from (close, low) pairs on consecutive calendar
+    /// days from 2026-09-01; the crossing judge only reads sequence order.
+    fn bars(pairs: &[(f64, f64)]) -> Vec<daily::Day> {
+        let start = chrono::NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+        pairs
+            .iter()
+            .enumerate()
+            .map(|(i, (close, low))| daily::Day {
+                date: (start + chrono::Duration::days(i as i64))
+                    .format("%Y-%m-%d")
+                    .to_string(),
+                open: *close,
+                high: close.max(*low),
+                low: *low,
+                close: *close,
+                change: None,
+                change_percent: None,
+                volume: None,
+                volume_unit: String::new(),
+            })
+            .collect()
+    }
+    #[test]
+    fn add_signal_exit_line_crossing_needs_21_bars() {
+        // 20 prior lows at 95, previous close 90 (under), day close 96 (back
+        // above): exactly one exit signal, and MA20 stays silent because
+        // both closes sit under the 99.3 average.
+        let mut pairs: Vec<(f64, f64)> = (0..19).map(|_| (100., 95.)).collect();
+        pairs.push((90., 95.));
+        pairs.push((96., 95.));
+        let out = add_signal_crossings("2330", &bars(&pairs));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, "exit");
+        assert_eq!(out[0].line, 95.);
+        assert_eq!(out[0].close, 96.);
+        // One bar short: the exit line has no full 20-day window yet.
+        let out = add_signal_crossings("2330", &bars(&pairs[..20]));
+        assert!(out.iter().all(|s| s.kind != "exit"));
+    }
+    #[test]
+    fn add_signal_ma20_crossing_and_no_cross_in_a_steady_rise() {
+        let mut pairs: Vec<(f64, f64)> = (0..18).map(|_| (100., 99.)).collect();
+        pairs.push((90., 89.));
+        pairs.push((101., 100.));
+        let out = add_signal_crossings("2330", &bars(&pairs));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, "ma20");
+        assert!((out[0].line - 99.55).abs() < 1e-9);
+        // 19 bars: MA20 is never judged.
+        let out = add_signal_crossings("2330", &bars(&pairs[..19]));
+        assert!(out.is_empty());
+        // A steady rise never crosses up: every close is already above the
+        // lines the judge computes.
+        let rising: Vec<(f64, f64)> = (0..30)
+            .map(|i| {
+                let c = 100. * 1.1f64.powi(i);
+                (c, c * 0.99)
+            })
+            .collect();
+        assert!(add_signal_crossings("2330", &bars(&rising)).is_empty());
+    }
+    #[test]
+    fn add_signal_ma60_crossing_needs_60_bars() {
+        let mut pairs: Vec<(f64, f64)> = (0..58).map(|_| (100., 99.)).collect();
+        pairs.push((90., 89.));
+        pairs.push((101., 100.));
+        let out = add_signal_crossings("2330", &bars(&pairs));
+        let ma60: Vec<_> = out.iter().filter(|s| s.kind == "ma60").collect();
+        assert_eq!(ma60.len(), 1);
+        assert!((ma60[0].line - 99.85).abs() < 1e-9);
+        // 59 bars: the MA60 window is incomplete, so no ma60 verdict.
+        let out = add_signal_crossings("2330", &bars(&pairs[..59]));
+        assert!(out.iter().all(|s| s.kind != "ma60"));
+    }
+    #[test]
+    fn add_signals_are_deduped_persistent_and_pruned() {
+        let dir = std::env::temp_dir().join(format!("smallstocks-signal-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let mut c = Core::load(path.clone(), true).unwrap();
+        c.saved.groups = vec![WatchGroup {
+            name: "自選1".into(),
+            codes: vec!["2330".into()],
+        }];
+        c.saved.positions = Vec::new();
+        c.saved.normalize_groups();
+        // 25 completed bars ending today: flat 100s, a dip to 90, then a
+        // close at 96 back above the 95 exit line on the last day.
+        let today = local(now()).date_naive();
+        let mut pairs: Vec<(f64, f64)> = (0..23).map(|_| (100., 95.)).collect();
+        pairs.push((90., 95.));
+        pairs.push((96., 95.));
+        let days: Vec<daily::Day> = pairs
+            .iter()
+            .enumerate()
+            .map(|(i, (close, low))| daily::Day {
+                date: (today - chrono::Duration::days((24 - i) as i64))
+                    .format("%Y-%m-%d")
+                    .to_string(),
+                open: *close,
+                high: *close,
+                low: *low,
+                close: *close,
+                change: None,
+                change_percent: None,
+                volume: None,
+                volume_unit: String::new(),
+            })
+            .collect();
+        c.saved.daily_cache.insert(
+            "2330:test".into(),
+            daily::Series {
+                symbol: "2330".into(),
+                month: "test".into(),
+                source: "test".into(),
+                fetched_at: now(),
+                days,
+            },
+        );
+        assert_eq!(c.evaluate_add_signals(), 1);
+        assert_eq!(c.saved.add_signals.len(), 1);
+        assert_eq!(c.saved.add_signals[0].kind, "exit");
+        assert_eq!(
+            c.saved.add_signals[0].date,
+            today.format("%Y-%m-%d").to_string()
+        );
+        // Same data judged again: no duplicate.
+        assert_eq!(c.evaluate_add_signals(), 0);
+        // The signal persisted: a rebuilt core keeps it and stays silent.
+        let mut restored = Core::load(path, true).unwrap();
+        assert_eq!(restored.saved.add_signals.len(), 1);
+        assert_eq!(restored.evaluate_add_signals(), 0);
+        // A signal older than 14 days is pruned on the next evaluation.
+        restored.saved.add_signals.push(AddSignal {
+            code: "2330".into(),
+            kind: "ma20".into(),
+            date: (today - chrono::Duration::days(20))
+                .format("%Y-%m-%d")
+                .to_string(),
+            close: 1.,
+            line: 1.,
+        });
+        restored.evaluate_add_signals();
+        assert_eq!(restored.saved.add_signals.len(), 1);
+        assert_eq!(restored.saved.add_signals[0].kind, "exit");
     }
     #[test]
     fn persistence_validation_and_pause_are_shared() {

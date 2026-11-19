@@ -8,7 +8,9 @@
 //! page is deliberately boring: white background, dark monospace
 //! text — the same document look as the main window's txt skin —
 //! one message per block, `HH:MM 作者：` up front — a .txt file,
-//! not a chat UI.
+//! not a chat UI. The one concession to it being HTML at all: URLs in
+//! message bodies render as links, and hovering an image link floats
+//! a preview of the picture next to it (see `linkify`).
 //!
 //! Reading position: the page refreshes itself in place — a small
 //! script re-fetches this same URL every minute, swaps the `#feed`
@@ -259,6 +261,87 @@ fn esc(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// Render message text as HTML: plain segments escaped as before,
+/// `http://` / `https://` URLs turned into links. The split happens on
+/// the raw text and each piece is escaped separately, so a query
+/// string's `&` becomes `&amp;` in both the href and the label, and
+/// markup-looking text elsewhere stays inert. A URL runs from its
+/// scheme to the first whitespace or non-ASCII byte (a CJK character
+/// right after a link never gets swallowed), minus trailing ASCII
+/// punctuation that belongs to the sentence around it. URLs whose
+/// path ends in an image extension get the extra `img` class — the
+/// page script hangs the hover preview off it.
+fn linkify(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut plain_from = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(scheme_len) = scheme_len_at(bytes, i) {
+            let mut end = i + scheme_len;
+            while end < bytes.len() && is_url_byte(bytes[end]) {
+                end += 1;
+            }
+            while end > i + scheme_len && is_trailing_punct(bytes[end - 1]) {
+                end -= 1;
+            }
+            if end > i + scheme_len {
+                out.push_str(&esc(&text[plain_from..i]));
+                let url = &text[i..end];
+                let class = if is_image_url(url) { "lnk img" } else { "lnk" };
+                let url = esc(url);
+                out.push_str(&format!(
+                    "<a class=\"{class}\" href=\"{url}\" target=\"_blank\" rel=\"noreferrer\">{url}</a>"
+                ));
+                i = end;
+                plain_from = end;
+                continue;
+            }
+        }
+        i += utf8_len(bytes[i]);
+    }
+    out.push_str(&esc(&text[plain_from..]));
+    out
+}
+
+/// Length of the `http://` / `https://` scheme starting at byte `i`
+/// (ASCII case-insensitive), if one starts there.
+fn scheme_len_at(bytes: &[u8], i: usize) -> Option<usize> {
+    let rest = &bytes[i..];
+    if rest.len() >= 8 && rest[..8].eq_ignore_ascii_case(b"https://") {
+        Some(8)
+    } else if rest.len() >= 7 && rest[..7].eq_ignore_ascii_case(b"http://") {
+        Some(7)
+    } else {
+        None
+    }
+}
+
+/// Bytes a URL may consist of here: printable ASCII except whitespace
+/// and the HTML delimiters `<`, `>`, `"` (the text is plain, so those
+/// can only be sentence characters, never part of a pasted link).
+fn is_url_byte(b: u8) -> bool {
+    (0x21..=0x7e).contains(&b) && !matches!(b, b'<' | b'>' | b'"')
+}
+
+/// Sentence punctuation commonly typed right after a pasted URL.
+fn is_trailing_punct(b: u8) -> bool {
+    matches!(
+        b,
+        b'.' | b',' | b')' | b']' | b'}' | b'!' | b'?' | b';' | b':' | b'\''
+    )
+}
+
+/// Image link = the path (query/fragment ignored) ends in a common
+/// image extension, any case.
+fn is_image_url(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let lower = path.to_ascii_lowercase();
+    [".jpg", ".jpeg", ".png", ".gif", ".webp"]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
+}
+
 /// In-page self-update (see the module note for why there is no
 /// reload-and-anchor design anymore): every minute the page fetches
 /// its own URL — the protocol handler answers with the freshest
@@ -310,34 +393,113 @@ const UPDATE_SCRIPT: &str = r#"<script>
 })();
 </script>"#;
 
+/// Hover preview for image links, companion to the update script.
+/// Delegation on `document` (mouseover/mouseout), never per-element
+/// bindings, because the update above swaps `#feed`'s innerHTML every
+/// minute and would drop them. One shared `<img id="imgprev">` is
+/// created lazily and reused; it is positioned next to the hovered
+/// link, clamped to the viewport, and hidden again on mouse-out, on
+/// hovering anything else, and when the image fails to load (no broken
+/// frame left behind).
+const HOVER_SCRIPT: &str = r#"<script>
+(function () {
+  var prev = null;
+  function ensure() {
+    if (!prev) {
+      prev = document.createElement("img");
+      prev.id = "imgprev";
+      prev.alt = "";
+      prev.addEventListener("error", hide);
+      document.body.appendChild(prev);
+    }
+    return prev;
+  }
+  function hide() {
+    if (prev) {
+      prev.style.display = "none";
+      prev.removeAttribute("src");
+    }
+  }
+  function place(a) {
+    var r = a.getBoundingClientRect();
+    var w = prev.offsetWidth || 320;
+    var h = prev.offsetHeight || 320;
+    var x = Math.min(r.left, window.innerWidth - w - 8);
+    if (x < 8) x = 8;
+    var y = r.bottom + 6;
+    if (y + h > window.innerHeight - 8) y = Math.max(8, r.top - h - 6);
+    prev.style.left = x + "px";
+    prev.style.top = y + "px";
+  }
+  function anchorOf(e) {
+    return e.target && e.target.closest ? e.target.closest("a.img") : null;
+  }
+  document.addEventListener("mouseover", function (e) {
+    var a = anchorOf(e);
+    if (!a) {
+      hide();
+      return;
+    }
+    var p = ensure();
+    p.onload = function () { place(a); };
+    if (p.getAttribute("src") !== a.href) p.src = a.href;
+    p.style.display = "block";
+    place(a);
+  });
+  document.addEventListener("mouseout", function (e) {
+    var a = anchorOf(e);
+    if (!a) return;
+    if (e.relatedTarget && a.contains(e.relatedTarget)) return;
+    hide();
+  });
+})();
+</script>"#;
+
 fn page_shell(channel_title: &str, fetched_hhmm: Option<&str>, body: &str, script: bool) -> String {
     let fetched = fetched_hhmm
         .map(|t| format!("（抓取時間 {t}）"))
         .unwrap_or_default();
+    let scripts = if script {
+        format!("{UPDATE_SCRIPT}\n{HOVER_SCRIPT}")
+    } else {
+        String::new()
+    };
     format!(
         "<!DOCTYPE html>\n<html lang=\"zh-Hant\"><head><meta charset=\"utf-8\">\
 <title>{title}</title><style>\
 html{{background:#FFFFFF}}\
 body{{margin:0;padding:6px 8px;background:#FFFFFF;color:#202020;\
 font-family:\"Cascadia Mono\",Consolas,\"Microsoft JhengHei UI\",monospace;font-size:13px;line-height:1.45}}\
+::-webkit-scrollbar{{width:12px}}\
+::-webkit-scrollbar-track{{background:#F0F0F0}}\
+::-webkit-scrollbar-thumb{{background:#B5B5B5;border-radius:6px}}\
+::-webkit-scrollbar-thumb:hover{{background:#8F8F8F}}\
 .hdr{{color:#202020;border-bottom:1px solid #E1E1E1;padding-bottom:4px;margin-bottom:6px;\
 white-space:pre-wrap;word-break:break-all}}\
 .msg{{white-space:pre-wrap;word-break:break-all;margin:0 0 2px}}\
 .time{{color:#808080}}\
 .author{{color:#202020;font-weight:bold}}\
 .svc{{color:#808080;text-align:center;white-space:pre-wrap;word-break:break-all;margin:4px 0}}\
+.lnk{{color:#0645AD;text-decoration:underline}}\
+#imgprev{{position:fixed;display:none;max-width:320px;max-height:320px;z-index:9999;\
+background:#FFFFFF;border:1px solid #FFFFFF;box-shadow:0 4px 24px rgba(0,0,0,0.35);pointer-events:none}}\
 </style></head><body>\
 <div class=\"hdr\" id=\"hdr\">{title}{fetched}</div>\n{body}\n{script}</body></html>",
         title = esc(channel_title),
         fetched = esc(&fetched),
         body = body,
-        script = if script { UPDATE_SCRIPT } else { "" },
+        script = scripts,
     )
 }
 
 /// Render the whole feed page: header line (channel + fetch time), then
 /// one block per message — `HH:MM 作者：內文` — oldest first, newest at
-/// the bottom, exactly like the source page's order. The blocks sit in
+/// the bottom, exactly like the source page's order. One exception:
+/// channel posts carry the channel title itself as their author, and
+/// the title already heads the page, so those blocks drop the redundant
+/// `作者：` segment and render as plain `HH:MM 內文`. Message bodies go
+/// through `linkify` (URLs become links, image URLs get a hover
+/// preview); service lines stay plain escaped text. The blocks sit in
 /// `<div id="feed">` so the page's self-update script can swap them
 /// (and the `#hdr` header) without a reload.
 pub fn render_page(channel_title: &str, messages: &[ChatMessage], fetched_hhmm: &str) -> String {
@@ -353,13 +515,19 @@ pub fn render_page(channel_title: &str, messages: &[ChatMessage], fetched_hhmm: 
                 "<div class=\"svc\"{post_attr}>{}</div>\n",
                 esc(&m.text)
             ));
+        } else if !m.author.is_empty() && m.author.trim() == channel_title.trim() {
+            body.push_str(&format!(
+                "<div class=\"msg\"{post_attr}><span class=\"time\">{}</span> {}</div>\n",
+                esc(&m.time_hhmm),
+                linkify(&m.text),
+            ));
         } else {
             body.push_str(&format!(
                 "<div class=\"msg\"{post_attr}><span class=\"time\">{}</span> \
 <span class=\"author\">{}：</span>{}</div>\n",
                 esc(&m.time_hhmm),
                 esc(&m.author),
-                esc(&m.text),
+                linkify(&m.text),
             ));
         }
     }
@@ -476,6 +644,12 @@ mod tests {
         assert!(page.contains("Cascadia Mono"), "{page}");
         assert!(page.contains("Consolas"), "{page}");
         assert!(page.contains("Microsoft JhengHei UI"), "{page}");
+        // Always-visible classic scrollbar (WebView2's overlay bar is
+        // too thin and auto-hides): styled webkit track/thumb, ~12px.
+        assert!(page.contains("::-webkit-scrollbar"), "{page}");
+        assert!(page.contains("width:12px"), "{page}");
+        assert!(page.contains("::-webkit-scrollbar-thumb"), "{page}");
+        assert!(page.contains("::-webkit-scrollbar-thumb:hover"), "{page}");
         // Self-update machinery: messages live in #feed under a #hdr
         // header; the script re-fetches this URL, swaps both via
         // DOMParser, sticks to the bottom only when already there
@@ -495,6 +669,116 @@ mod tests {
         assert!(status.contains("id=\"feed\""), "{status}");
         assert!(!status.contains("sessionStorage"), "{status}");
         assert!(!status.contains("__chatTextUpdate"), "{status}");
+    }
+
+    #[test]
+    fn render_omits_author_segment_when_author_duplicates_channel_title() {
+        let msgs = parse_messages(FIXTURE);
+        let title = "PTT 11/16盤中閒聊·台指強空";
+        let page = render_page(title, &msgs, "13:41");
+        // Channel posts (msgs 102/103, author == title) render as
+        // `HH:MM 內文` — no author span carrying the title.
+        assert!(
+            !page.contains(&format!("<span class=\"author\">{title}：</span>")),
+            "{page}"
+        );
+        assert!(page.contains("<span class=\"time\">00:05</span> 推"), "{page}");
+        assert!(page.contains("<span class=\"time\">13:40</span> [圖片]"), "{page}");
+        // A different author (msg 101) keeps the `作者：` segment.
+        assert!(page.contains("<span class=\"author\">作者甲：</span>"), "{page}");
+        // When the header title differs, the same author is not the
+        // channel title anymore and renders normally.
+        let other = render_page("PTT 11/17盤中閒聊·台指強多", &msgs, "13:41");
+        assert!(
+            other.contains(&format!("<span class=\"author\">{title}：</span>")),
+            "{other}"
+        );
+    }
+
+    #[test]
+    fn linkify_turns_plain_and_image_urls_into_links() {
+        // Plain URL: linked, label == href, new-window attributes.
+        assert_eq!(
+            linkify("看 https://example.com/page 這篇"),
+            "看 <a class=\"lnk\" href=\"https://example.com/page\" target=\"_blank\" rel=\"noreferrer\">https://example.com/page</a> 這篇"
+        );
+        // Image URL (the shape Maxi hovers): extra `img` class.
+        assert_eq!(
+            linkify("https://i.imgur.com/Bz8nYmr.jpeg"),
+            "<a class=\"lnk img\" href=\"https://i.imgur.com/Bz8nYmr.jpeg\" target=\"_blank\" rel=\"noreferrer\">https://i.imgur.com/Bz8nYmr.jpeg</a>"
+        );
+        // Extension check ignores case and the query string.
+        assert!(
+            linkify("https://i.mopix.cc/Do7HI8.JPG?x=1").contains("class=\"lnk img\""),
+            "{}",
+            linkify("https://i.mopix.cc/Do7HI8.JPG?x=1")
+        );
+        // A non-image URL with a query string stays a plain link, and
+        // the `&` is escaped in both href and label.
+        assert_eq!(
+            linkify("https://example.com/p?a=1&b=2"),
+            "<a class=\"lnk\" href=\"https://example.com/p?a=1&amp;b=2\" target=\"_blank\" rel=\"noreferrer\">https://example.com/p?a=1&amp;b=2</a>"
+        );
+        // http:// works too.
+        assert!(linkify("http://example.com/a").contains("href=\"http://example.com/a\""));
+    }
+
+    #[test]
+    fn linkify_stops_at_cjk_and_trailing_punctuation() {
+        // A CJK comma right after the URL is not swallowed.
+        assert_eq!(
+            linkify("圖 https://example.com/a.png，讚"),
+            "圖 <a class=\"lnk img\" href=\"https://example.com/a.png\" target=\"_blank\" rel=\"noreferrer\">https://example.com/a.png</a>，讚"
+        );
+        // Wrapping parens and a sentence-final period stay outside.
+        assert_eq!(
+            linkify("(see https://example.com/b)."),
+            "(see <a class=\"lnk\" href=\"https://example.com/b\" target=\"_blank\" rel=\"noreferrer\">https://example.com/b</a>)."
+        );
+    }
+
+    #[test]
+    fn linkify_leaves_url_free_text_and_markup_untouched() {
+        // No URL: identical to plain escaping, byte for byte.
+        let plain = "普通訊息 <b>不是</b> 標籤 & 符號";
+        assert_eq!(linkify(plain), esc(plain));
+        assert_eq!(linkify(""), "");
+        // A bare scheme with nothing after it is not a link.
+        assert_eq!(linkify("網址 https:// 後面沒了"), "網址 https:// 後面沒了");
+        // Markup-looking text next to a link is still escaped.
+        let out = linkify("<script>alert(1)</script> https://example.com/");
+        assert!(out.contains("&lt;script&gt;alert(1)&lt;/script&gt;"), "{out}");
+        assert!(out.contains("href=\"https://example.com/\""), "{out}");
+        assert!(!out.contains("<script>alert"), "{out}");
+    }
+
+    #[test]
+    fn rendered_page_linkifies_bodies_and_ships_hover_preview() {
+        let msgs = vec![ChatMessage {
+            id: "x/1".into(),
+            author: "PTT 11/18盤後閒聊·台指震盪".into(),
+            text: "https://i.imgur.com/Bz8nYmr.jpeg\n[圖片]".into(),
+            time_hhmm: "15:04".into(),
+            service: false,
+        }];
+        let page = render_page("PTT 11/18盤後閒聊·台指震盪", &msgs, "15:09");
+        assert!(
+            page.contains("<a class=\"lnk img\" href=\"https://i.imgur.com/Bz8nYmr.jpeg\""),
+            "{page}"
+        );
+        // Link styling + the floating preview's CSS hooks.
+        assert!(page.contains(".lnk{"), "{page}");
+        assert!(page.contains("#imgprev"), "{page}");
+        assert!(page.contains("max-width:320px"), "{page}");
+        // Delegated hover wiring (survives the #feed innerHTML swaps).
+        assert!(page.contains("mouseover"), "{page}");
+        assert!(page.contains("mouseout"), "{page}");
+        assert!(page.contains("a.img"), "{page}");
+        assert!(page.contains("createElement"), "{page}");
+        // The status page stays scriptless — no hover code either.
+        let status = render_status_page("PTT 股票閒聊", "載入中…");
+        assert!(!status.contains("mouseover"), "{status}");
+        assert!(!status.contains("createElement"), "{status}");
     }
 
     #[test]

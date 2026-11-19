@@ -8,6 +8,8 @@ import {
   shouldKeepScroll,
   sizeSignature,
   ruleText,
+  addSignalText,
+  addSignalMarquee,
   latestCloseDate,
   livePrice,
   portfolioSummary,
@@ -647,6 +649,27 @@ describe("window size signature", () => {
     expect(sizeSignature({ ...base, eventCount: 2 })).not.toBe(
       sizeSignature({ ...base, eventCount: 1 }),
     );
+    expect(sizeSignature({ ...base, hasAddSignals: true })).not.toBe(sig);
+  });
+});
+describe("add signal marquee text", () => {
+  it("formats one signal per kind and joins newest first", () => {
+    expect(
+      addSignalText({ code: "2330", kind: "ma20", date: "2026-11-18", close: 1, line: 1 }),
+    ).toBe("2330 站上 MA20（11/18 收盤）");
+    expect(
+      addSignalMarquee([
+        { code: "2330", kind: "ma20", date: "2026-11-18", close: 1, line: 1 },
+        { code: "NVDA", kind: "exit", date: "2026-11-17", close: 1, line: 1 },
+        { code: "^GSPC", kind: "ma60", date: "2026-11-16", close: 1, line: 1 },
+      ]),
+    ).toBe(
+      "加碼訊號 2330 站上 MA20（11/18 收盤）・NVDA 站回出場線（11/17 收盤）・GSPC 站上 MA60（11/16 收盤）",
+    );
+  });
+  it("is empty without signals, so the marquee stays hidden", () => {
+    expect(addSignalMarquee([])).toBe("");
+    expect(addSignalMarquee(undefined)).toBe("");
   });
 });
 describe("money formatting", () => {

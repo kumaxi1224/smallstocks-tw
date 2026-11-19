@@ -63,6 +63,29 @@ export interface StockEvent {
   threshold: number;
   source?: string;
 }
+/** One daily-close add signal from the core (see core.rs AddSignal): the
+ * close crossed back up through a line — "exit" (Donchian 20-day exit
+ * line), "ma20" or "ma60" — on the given trading date. The core keeps
+ * only the last 14 days, newest first; the UI only displays them. */
+export interface AddSignal {
+  code: string;
+  kind: "exit" | "ma20" | "ma60";
+  /** Trading date, YYYY-MM-DD. */
+  date: string;
+  close: number;
+  line: number;
+}
+export const addSignalLabel = (kind: AddSignal["kind"]): string =>
+  kind === "exit" ? "站回出場線" : kind === "ma20" ? "站上 MA20" : "站上 MA60";
+/** One marquee item, e.g. 「2330 站上 MA20（11/18 收盤）」. */
+export const addSignalText = (s: AddSignal): string =>
+  `${displaySymbol(s.code)} ${addSignalLabel(s.kind)}（${s.date.slice(5).replace("-", "/")} 收盤）`;
+/** The full marquee line: every recent signal, newest first, joined by
+ * 「・」 behind one 「加碼訊號」 prefix; empty when there are none. */
+export const addSignalMarquee = (signals: AddSignal[] | undefined): string =>
+  signals?.length
+    ? `加碼訊號 ${signals.map(addSignalText).join("・")}`
+    : "";
 export interface WatchGroup {
   name: string;
   codes: string[];
@@ -200,6 +223,9 @@ export interface Snapshot {
   quotes: Record<string, Quote>;
   rules: Rule[];
   events: StockEvent[];
+  /** Recent daily-close add signals from the core, newest first; absent
+   * on old states. */
+  addSignals?: AddSignal[];
   demo: boolean;
   error: string | null;
   sourceNote?: string | null;
@@ -338,6 +364,9 @@ export const sizeSignature = (f: {
   watchCount: number;
   demo: boolean;
   eventCount: number;
+  /** Whether the add-signal marquee line is visible: it takes one row of
+   * height only while at least one recent signal exists. */
+  hasAddSignals?: boolean;
 }) =>
   [
     f.tab,
@@ -346,6 +375,7 @@ export const sizeSignature = (f: {
     f.watchCount,
     f.demo ? 1 : 0,
     Math.min(f.eventCount, 3),
+    f.hasAddSignals ? 1 : 0,
   ].join("|");
 export const time = (n: number | null | undefined) =>
   n

@@ -197,6 +197,129 @@ pub fn fetch(
     Ok(out)
 }
 
+/// Chart URL for completed daily bars: six months of 1d OHLC, the daily
+/// input of the core's add-signal crossings for Yahoo-routed symbols (the
+/// TWSE adapter in daily.rs is the official source for Taiwan codes and
+/// stays the only daily path for them). Intraday minutes never enter here.
+pub fn daily_bars_url(code: &str) -> String {
+    let symbol = encode_symbol(yahoo_code(code));
+    format!(
+        "https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=6mo"
+    )
+}
+/// Parses one daily-bars chart response into daily::Day rows on the
+/// exchange's own (US Eastern) trading dates. A bar is complete only once
+/// its session has closed: today's Eastern bar is dropped before the
+/// 16:00 ET close, and future bars never count — the same completeness
+/// discipline daily::parse applies to official Taiwan data with its
+/// 15:00 cutoff. Rows with missing or inconsistent OHLC are skipped, a
+/// duplicated date keeps its last bar, and change is recomputed from the
+/// closes rather than trusted from the wire.
+pub fn parse_daily_bars(v: &Value, code: &str, at: i64) -> Result<Vec<crate::daily::Day>, String> {
+    let r = &v["chart"]["result"][0];
+    let meta = &r["meta"];
+    if meta["symbol"].as_str() != Some(yahoo_code(code).as_str())
+        || meta["dataGranularity"].as_str() != Some("1d")
+    {
+        return Err("Yahoo 日線標的或取樣格式不符".into());
+    }
+    let stamps = r["timestamp"].as_array().ok_or("Yahoo 日線沒有時間")?;
+    let quote = &r["indicators"]["quote"][0];
+    let column = |name: &str| quote[name].as_array().cloned().unwrap_or_default();
+    let (opens, highs, lows, closes, volumes) = (
+        column("open"),
+        column("high"),
+        column("low"),
+        column("close"),
+        column("volume"),
+    );
+    if [opens.len(), highs.len(), lows.len(), closes.len()]
+        .iter()
+        .any(|n| *n != stamps.len())
+    {
+        return Err("Yahoo 日線欄位長度不符".into());
+    }
+    let et_now = crate::core::eastern(at);
+    let today = et_now.date_naive();
+    let session_closed = et_now.time() >= chrono::NaiveTime::from_hms_opt(16, 0, 0).unwrap();
+    let mut by_date: std::collections::BTreeMap<String, crate::daily::Day> =
+        std::collections::BTreeMap::new();
+    for i in 0..stamps.len() {
+        let Some(t) = stamps[i].as_i64().and_then(|t| t.checked_mul(1000)) else {
+            continue;
+        };
+        let date = crate::core::eastern(t).date_naive();
+        if date > today || date == today && !session_closed {
+            continue;
+        }
+        let pick = |col: &Vec<Value>| {
+            col[i].as_f64().filter(|n| n.is_finite() && *n > 0.)
+        };
+        let (Some(open), Some(high), Some(low), Some(close)) = (
+            pick(&opens),
+            pick(&highs),
+            pick(&lows),
+            pick(&closes),
+        ) else {
+            continue;
+        };
+        if low > high || close < low || close > high || open < low || open > high {
+            continue;
+        }
+        by_date.insert(
+            date.format("%Y-%m-%d").to_string(),
+            crate::daily::Day {
+                date: date.format("%Y-%m-%d").to_string(),
+                open,
+                high,
+                low,
+                close,
+                change: None,
+                change_percent: None,
+                volume: volumes.get(i).and_then(|n| n.as_f64()).filter(|n| *n >= 0.),
+                volume_unit: String::new(),
+            },
+        );
+    }
+    let mut days: Vec<crate::daily::Day> = by_date.into_values().collect();
+    for i in 1..days.len() {
+        let previous = days[i - 1].close;
+        let change = days[i].close - previous;
+        days[i].change = Some(change);
+        days[i].change_percent = Some(change / previous * 100.);
+    }
+    if days.len() < 2 {
+        return Err("Yahoo 日線不足".into());
+    }
+    Ok(days)
+}
+/// One daily-bars fetch for the core's signal queue, wrapped as a
+/// daily::Series so the core can hold it beside the official Taiwan
+/// series without confusing the two sources.
+pub fn fetch_daily_bars(
+    client: &reqwest::blocking::Client,
+    code: &str,
+) -> Result<crate::daily::Series, String> {
+    if crate::core::symbol(code).is_none() {
+        return Err("無效的標的".into());
+    }
+    let at = now();
+    let v: Value = client
+        .get(daily_bars_url(code))
+        .header("User-Agent", UA)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .and_then(|r| r.json())
+        .map_err(|e| format!("Yahoo 日線無法讀取：{e}"))?;
+    Ok(crate::daily::Series {
+        symbol: code.into(),
+        month: String::new(),
+        source: "Yahoo 日線".into(),
+        fetched_at: at,
+        days: parse_daily_bars(&v, code, at)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,6 +451,53 @@ mod tests {
         let c = chart_url("^GSPC");
         assert!(c.contains("/chart/%5EGSPC?"), "{c}");
         assert!(chart_url("BRK.B").contains("/chart/BRK-B?"));
+    }
+    fn bars_chart(symbol: &str, rows: &[(i64, f64, f64, f64, f64)]) -> Value {
+        // rows: (unix seconds at the bar's Eastern midnight, open, high, low, close)
+        json!({"chart":{"result":[{"meta":{"symbol":symbol,"dataGranularity":"1d"},
+            "timestamp": rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+            "indicators":{"quote":[{
+                "open": rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+                "high": rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+                "low": rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+                "close": rows.iter().map(|r| r.4).collect::<Vec<_>>(),
+                "volume": rows.iter().map(|_| 1000).collect::<Vec<_>>(),
+            }]}}]}})
+    }
+    #[test]
+    fn daily_bars_parse_on_eastern_dates_with_recomputed_change() {
+        // 2026-11-10/11/12 00:00 EST = 05:00 UTC.
+        let rows = [
+            (1794286800, 100., 103., 99., 102.),
+            (1794373200, 102., 104., 100., 101.),
+            (1794459600, 101., 105., 100., 104.),
+        ];
+        let v = bars_chart("VOO", &rows);
+        // Evaluated 2026-11-13 17:00 UTC: every bar is a completed session.
+        let days = parse_daily_bars(&v, "VOO", 1794589200000).unwrap();
+        assert_eq!(days.len(), 3);
+        assert_eq!(days[0].date, "2026-11-10");
+        assert_eq!(days[2].date, "2026-11-12");
+        assert_eq!(days[0].low, 99.);
+        assert_eq!(days[1].change, Some(-1.));
+        assert!(parse_daily_bars(&v, "QQQ", 1794589200000).is_err());
+    }
+    #[test]
+    fn daily_bars_drop_the_in_progress_eastern_bar_until_the_close() {
+        let rows = [
+            (1794200400, 99., 101., 98., 100.),
+            (1794286800, 100., 103., 99., 102.),
+            (1794373200, 102., 104., 100., 101.),
+        ];
+        let v = bars_chart("VOO", &rows);
+        // 2026-11-11 16:30 UTC = 11:30 ET: the 11th's bar is still forming.
+        let days = parse_daily_bars(&v, "VOO", 1794414600000).unwrap();
+        assert_eq!(days.len(), 2);
+        assert_eq!(days[1].date, "2026-11-10");
+        // 2026-11-11 21:30 UTC = 16:30 ET: the session has closed.
+        let days = parse_daily_bars(&v, "VOO", 1794432600000).unwrap();
+        assert_eq!(days.len(), 3);
+        assert_eq!(days[2].date, "2026-11-11");
     }
     #[test]
     fn an_error_envelope_or_empty_batch_parses_to_no_quotes() {

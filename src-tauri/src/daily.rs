@@ -33,6 +33,22 @@ pub fn months(at: i64) -> [String; 2] {
         prev.format("%Y-%m").to_string(),
     ]
 }
+/// The current month and the `n - 1` months before it, newest first. The
+/// two-month window of `months` is enough for the close-day view, but the
+/// core's daily-close crossing signals need at least 60 trading days of
+/// official bars (MA60 plus the day before it), which spans about four
+/// calendar months.
+pub fn recent_months(at: i64, n: usize) -> Vec<String> {
+    let first = local(at).date_naive().with_day(1).unwrap();
+    (0..n)
+        .map(|i| {
+            let m = first
+                .checked_sub_months(chrono::Months::new(i as u32))
+                .unwrap_or(first);
+            m.format("%Y-%m").to_string()
+        })
+        .collect()
+}
 pub fn valid_month(m: &str) -> bool {
     m.len() == 7
         && NaiveDate::parse_from_str(&format!("{m}-01"), "%Y-%m-%d").is_ok()
@@ -290,5 +306,22 @@ mod tests {
         .is_err());
         assert!(!valid_month("2026-13"));
         assert_eq!(months(at(17)), ["2026-11", "2026-10"]);
+    }
+    #[test]
+    fn recent_months_walks_back_across_the_year_boundary() {
+        assert_eq!(
+            recent_months(at(17), 4),
+            ["2026-11", "2026-10", "2026-09", "2026-08"]
+        );
+        let jan = FixedOffset::east_opt(28800)
+            .unwrap()
+            .with_ymd_and_hms(2027, 1, 15, 12, 0, 0)
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(
+            recent_months(jan, 3),
+            ["2027-01", "2026-12", "2026-11"]
+        );
+        assert_eq!(recent_months(at(17), 1), ["2026-11"]);
     }
 }

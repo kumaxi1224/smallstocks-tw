@@ -37,6 +37,12 @@ let preview: Snapshot = {
   quotes: {},
   rules: [],
   events: [],
+  // Synthetic preview signals so the marquee is visible in the browser
+  // preview; the desktop core computes the real ones from daily bars.
+  addSignals: [
+    { code: "2330", kind: "ma20", date: "2026-11-18", close: 1505, line: 1480.2 },
+    { code: "0050", kind: "exit", date: "2026-11-17", close: 98.4, line: 97.9 },
+  ],
   demo: true,
   error: null,
   sourceNote: null,

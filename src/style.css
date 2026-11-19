@@ -770,6 +770,46 @@ footer {
   font-size: 9px;
   color: var(--muted);
 }
+/* Add-signal marquee: one scrolling line above the footer, fed only by
+   the core's recorded daily-close crossings. Hidden entirely while there
+   are no recent signals (the [hidden] attribute), on native skins
+   (disguise.css) and in the minimal strip, which shows the latest signal
+   as a static line instead. */
+#signal-marquee {
+  flex-shrink: 0;
+  overflow: hidden;
+  border-top: 1px solid var(--border);
+  padding: 3px 0;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text);
+  white-space: nowrap;
+}
+#signal-marquee[hidden] {
+  display: none;
+}
+body[data-density="minimal"] #signal-marquee {
+  display: none;
+}
+.signal-marquee-track {
+  display: flex;
+  width: max-content;
+  animation: signal-marquee-scroll 20s linear infinite;
+}
+#signal-marquee:hover .signal-marquee-track {
+  animation-play-state: paused;
+}
+.signal-marquee-text {
+  padding-right: 48px;
+}
+@keyframes signal-marquee-scroll {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
 #source {
   white-space: nowrap;
   font-family: var(--mono);

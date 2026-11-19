@@ -25,6 +25,7 @@ use tauri::{
     Emitter, Manager,
 };
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+use tauri_plugin_opener::OpenerExt;
 
 fn demo() -> bool {
     std::env::args().any(|a| a == "--demo")
@@ -616,6 +617,22 @@ fn set_core_error(app: &tauri::AppHandle, msg: String) {
 struct ChatWindowState {
     built_style: Mutex<Option<String>>,
 }
+/// Whether a URL the chat page asks to open in a *new* window should be
+/// handed to the system browser. The chat window never grows a window
+/// of its own (see the `on_new_window` handler where it is built), so
+/// every request is denied there regardless; ordinary web links are
+/// still worth passing out — the text page linkifies the image URLs in
+/// posts, and a click that silently does nothing reads as a broken
+/// app — while non-web schemes (chattext:, about:, data:) are refused
+/// outright and never opened.
+fn chat_link_opens_externally(url: &str) -> bool {
+    match url.split_once(':') {
+        Some((scheme, _)) => {
+            scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+        }
+        None => false,
+    }
+}
 /// Ask for the chat window to be reconciled with the `chatWindow`
 /// setting. This never touches a window itself: building a WebviewWindow
 /// runs WebView2 controller setup, which needs the main-thread message
@@ -714,9 +731,33 @@ fn apply_chat_window(app: &tauri::AppHandle) {
             let built = url
                 .map_err(|_| "聊天視窗網址無效".to_string())
                 .and_then(|url| {
+                    // The new-window handler needs its own handle: the
+                    // closure outlives this call.
+                    let link_app = app.clone();
                     tauri::WebviewWindowBuilder::new(app, CHAT_WINDOW_LABEL, url)
                         .title("PTT 股票閒聊")
                         .inner_size(440., 640.)
+                        .on_new_window(move |url, _features| {
+                            // Never a second window, and never a
+                            // navigation of this one. Without a handler,
+                            // WebView2 swallows target="_blank" clicks
+                            // whole (SetHandled), so web links go out to
+                            // the system browser through the opener
+                            // plugin's Rust side instead — this window
+                            // has no IPC access, by design — and the
+                            // request itself is denied either way.
+                            if chat_link_opens_externally(url.as_str()) {
+                                if let Err(e) =
+                                    link_app.opener().open_url(url.as_str(), None::<&str>)
+                                {
+                                    set_core_error(
+                                        &link_app,
+                                        format!("聊天連結開啟失敗：{e}"),
+                                    );
+                                }
+                            }
+                            tauri::webview::NewWindowResponse::Deny
+                        })
                         .build()
                         .map(|_| ())
                         .map_err(|e| e.to_string())
@@ -1393,7 +1434,12 @@ pub fn run() {
                         Ok(series) => {
                             s.saved.daily_cache.insert(key.clone(), series);
                             s.daily_errors.remove(&key);
-                            while s.saved.daily_cache.len() > 80 {
+                            // Fresh official bars may complete a daily-close
+                            // crossing; the core judges and records it.
+                            s.evaluate_add_signals();
+                            // Four months per code across the whole
+                            // monitoring union outgrows the old 80-entry cap.
+                            while s.saved.daily_cache.len() > 320 {
                                 let oldest = s
                                     .saved
                                     .daily_cache
@@ -1444,6 +1490,42 @@ pub fn run() {
                         }
                         Err(e) => {
                             s.history_errors.insert(code, (e, now()));
+                        }
+                    }
+                    s.revision += 1;
+                }
+            });
+            let signal_state = setup_state.clone();
+            supervise(setup_state.clone(), "加碼訊號日線佇列", move || {
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(Duration::from_secs(20))
+                    .user_agent("Mozilla/5.0 MaxiStocks")
+                    .build()
+                    .unwrap();
+                loop {
+                    std::thread::sleep(Duration::from_secs(2));
+                    let task = signal_state.lock().unwrap_or_else(PoisonError::into_inner).signal_daily_queue.pop_front();
+                    let Some(code) = task else { continue };
+                    let is_demo = signal_state.lock().unwrap_or_else(PoisonError::into_inner).demo;
+                    // Yahoo daily bars for Yahoo-routed codes: they land in
+                    // the in-memory signal cache only (never persisted,
+                    // never ingested as quotes), and the core judges the
+                    // completed bars for add-signal crossings.
+                    let result = if is_demo {
+                        Ok(daily::demo_series(&code, &daily::months(now())[0]))
+                    } else {
+                        yahoo::fetch_daily_bars(&client, &code)
+                    };
+                    let mut s = signal_state.lock().unwrap_or_else(PoisonError::into_inner);
+                    s.signal_daily_pending.remove(&code);
+                    match result {
+                        Ok(series) => {
+                            s.signal_daily_cache.insert(code.clone(), series);
+                            s.signal_daily_errors.remove(&code);
+                            s.evaluate_add_signals();
+                        }
+                        Err(e) => {
+                            s.signal_daily_errors.insert(code, (e, now()));
                         }
                     }
                     s.revision += 1;
@@ -1526,7 +1608,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::migrate_legacy_data_dir;
+    use super::{chat_link_opens_externally, migrate_legacy_data_dir};
     use std::path::PathBuf;
 
     fn temp_root(tag: &str) -> PathBuf {
@@ -1587,6 +1669,24 @@ mod tests {
         // Not even the other files are copied once the new dir is in use.
         assert!(!new.join("sidecar-token.txt").exists());
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn chat_links_open_externally_only_for_web_schemes() {
+        // The text page's linkified image URLs and the hosted page's
+        // links: ordinary web addresses go to the system browser.
+        assert!(chat_link_opens_externally("https://i.imgur.com/Bz8nYmr.jpeg"));
+        assert!(chat_link_opens_externally("http://example.com/page"));
+        // Schemes are case-insensitive (the URL parser lowercases them,
+        // but the predicate does not rely on that).
+        assert!(chat_link_opens_externally("HTTPS://EXAMPLE.COM/"));
+        // Everything else is denied without opening anything: the text
+        // page's own scheme, blank/data placeholders, scheme-less text.
+        assert!(!chat_link_opens_externally("chattext://localhost/"));
+        assert!(!chat_link_opens_externally("about:blank"));
+        assert!(!chat_link_opens_externally("data:text/html,<p>x</p>"));
+        assert!(!chat_link_opens_externally("i.imgur.com/no-scheme"));
+        assert!(!chat_link_opens_externally(""));
     }
 
     #[test]

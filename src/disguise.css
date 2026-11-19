@@ -2,6 +2,7 @@
 body[data-skin="native"] .shell > header,
 body[data-skin="native"] .shell > nav,
 body[data-skin="native"] #banner,
+body[data-skin="native"] .shell > #signal-marquee,
 body[data-skin="native"] .shell > footer {
   display: none;
 }

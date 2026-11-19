@@ -30,6 +30,7 @@ import {
   stale,
   ruleText,
   displaySymbol,
+  addSignalMarquee,
   isYahooSymbol,
   latestCloseDate,
   livePrice,
@@ -95,7 +96,7 @@ async function copyText(text: string) {
     if (!ok) throw error;
   }
 }
-app.innerHTML = `<main class="shell"><header data-tauri-drag-region><span class="brand" data-tauri-drag-region><i></i><b>Maxi</b><span>stocks</span></span><span id="header-assets" class="header-assets"></span><div class="window-actions"><button id="row-display" title="切換數字、走勢與極簡" aria-label="切換顯示內容">數字</button><button id="manage" aria-label="＋ 管理自選" title="管理自選">＋</button><button id="pin" class="pin-btn" aria-pressed="true" aria-label="視窗保持置頂" title="已置頂：點一下取消置頂"><svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M9.8 1.2 14.8 6.2 13.4 7.6 12.3 7.2 9.4 10.1 9.9 12 8.5 13.4 5.6 10.5 2.2 13.9 1.5 13.2 4.9 9.8 2 6.9 3.4 5.5 5.3 6 8.2 3.1 7.8 2z" fill="currentColor"/></svg></button><button id="stealth" class="stealth-btn" aria-label="隱藏全部視窗" title="完全隱藏（含通知），監看持續。叫回：${privacyShortcutLabel}"><svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M8 3.5C4.6 3.5 2 6 1 8c1 2 3.6 4.5 7 4.5s6-2.5 7-4.5c-1-2-3.6-4.5-7-4.5zm0 1.8a2.7 2.7 0 1 1 0 5.4 2.7 2.7 0 0 1 0-5.4z" fill="currentColor"/><path d="M2.3 2.3 13.7 13.7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button><button id="hide" aria-label="縮到工作列" title="縮到工作列；監看持續。叫回：點工作列按鈕，或按 ${privacyShortcutLabel}">−</button><button id="quit" aria-label="結束程式" title="結束程式；監看也會停止">✕</button></div></header><nav aria-label="主選單"><button data-tab="watch" class="active">自選</button><button data-tab="positions">持股</button><button data-tab="rules">提醒 <span id="rule-count"></span></button><button data-tab="history">紀錄</button><button data-tab="settings" class="gear">外觀與設定</button></nav><div id="banner"></div><section id="content"></section><footer><span id="health"></span><span id="source">TWSE MIS</span></footer><div id="message" role="status" aria-live="polite"></div></main>`;
+app.innerHTML = `<main class="shell"><header data-tauri-drag-region><span class="brand" data-tauri-drag-region><i></i><b>Maxi</b><span>stocks</span></span><span id="header-assets" class="header-assets"></span><div class="window-actions"><button id="row-display" title="切換數字、走勢與極簡" aria-label="切換顯示內容">數字</button><button id="manage" aria-label="＋ 管理自選" title="管理自選">＋</button><button id="pin" class="pin-btn" aria-pressed="true" aria-label="視窗保持置頂" title="已置頂：點一下取消置頂"><svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M9.8 1.2 14.8 6.2 13.4 7.6 12.3 7.2 9.4 10.1 9.9 12 8.5 13.4 5.6 10.5 2.2 13.9 1.5 13.2 4.9 9.8 2 6.9 3.4 5.5 5.3 6 8.2 3.1 7.8 2z" fill="currentColor"/></svg></button><button id="stealth" class="stealth-btn" aria-label="隱藏全部視窗" title="完全隱藏（含通知），監看持續。叫回：${privacyShortcutLabel}"><svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M8 3.5C4.6 3.5 2 6 1 8c1 2 3.6 4.5 7 4.5s6-2.5 7-4.5c-1-2-3.6-4.5-7-4.5zm0 1.8a2.7 2.7 0 1 1 0 5.4 2.7 2.7 0 0 1 0-5.4z" fill="currentColor"/><path d="M2.3 2.3 13.7 13.7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button><button id="hide" aria-label="縮到工作列" title="縮到工作列；監看持續。叫回：點工作列按鈕，或按 ${privacyShortcutLabel}">−</button><button id="quit" aria-label="結束程式" title="結束程式；監看也會停止">✕</button></div></header><nav aria-label="主選單"><button data-tab="watch" class="active">自選</button><button data-tab="positions">持股</button><button data-tab="rules">提醒 <span id="rule-count"></span></button><button data-tab="history">紀錄</button><button data-tab="settings" class="gear">外觀與設定</button></nav><div id="banner"></div><section id="content"></section><div id="signal-marquee" hidden><div class="signal-marquee-track"><span class="signal-marquee-text"></span><span class="signal-marquee-text" aria-hidden="true"></span></div></div><footer><span id="health"></span><span id="source">TWSE MIS</span></footer><div id="message" role="status" aria-live="polite"></div></main>`;
 const content = app.querySelector<HTMLElement>("#content")!;
 const showError = (e: unknown) => {
   const el = document.querySelector<HTMLElement>("#message")!;
@@ -187,6 +188,7 @@ async function resize() {
     watchCount: state.watchlist.length,
     demo: state.demo,
     eventCount: state.events.length,
+    hasAddSignals: Boolean(state.addSignals?.length),
   });
   if (sig === lastSizeSig) return;
   lastSizeSig = sig;
@@ -220,7 +222,12 @@ async function resize() {
               state.watchlist.length *
                 (state.settings.rowDisplay === "trend" ? 24 : 34) +
               (state.demo ? 20 : 0) +
-              (state.events.length ? 18 : 0),
+              (state.events.length ? 18 : 0) +
+              // The signal marquee takes one 18px row, only while it is
+              // visible (compact skins, non-minimal density).
+              (state.addSignals?.length && state.settings.rowDisplay !== "minimal"
+                ? 18
+                : 0),
           ),
         )
       : a === "terminal"
@@ -318,6 +325,10 @@ function observeMinimal() {
 /** Live slider preview while the opacity setting is being dragged; the
  * persisted value only lands on the slider's change event. */
 let opacityPreview: number | null = null;
+/** The marquee line currently on screen: apply() runs on every poll, and
+ * rewriting the text would restart the CSS scroll, so the DOM is touched
+ * only when the line actually changes. */
+let lastMarqueeText = "";
 function apply() {
   document.documentElement.style.setProperty(
     "--bg-alpha",
@@ -368,6 +379,22 @@ function apply() {
   document.querySelector("#banner")!.innerHTML = state.demo
     ? '<span class="demo-label">示範資料</span><span>合成行情 · 不代表真實市場</span>'
     : "";
+  // Add-signal marquee: one scrolling line of the core's recent
+  // daily-close crossings, hidden entirely while there are none (no
+  // placeholder). Native (terminal/txt) skins and the minimal strip hide
+  // it in CSS; the strip shows the latest signal statically instead.
+  const marqueeText = addSignalMarquee(state.addSignals);
+  if (marqueeText !== lastMarqueeText) {
+    lastMarqueeText = marqueeText;
+    const marquee = document.querySelector<HTMLElement>("#signal-marquee")!;
+    marquee.hidden = !marqueeText;
+    if (marqueeText) {
+      for (const span of marquee.querySelectorAll(".signal-marquee-text"))
+        span.textContent = marqueeText;
+      marquee.querySelector<HTMLElement>(".signal-marquee-track")!.style.animationDuration =
+        `${Math.max(12, marqueeText.length * 0.45)}s`;
+    }
+  }
   const missing = state.watchlist.filter((c) => !state.quotes[c]).length;
   // Footer health follows the majority snapshot time, not the single oldest
   // quote: a few laggards are noted on the source line instead of expiring

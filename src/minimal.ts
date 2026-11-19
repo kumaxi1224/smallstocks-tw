@@ -1,7 +1,7 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { stockDetail, detailLabel, detailMarkup } from "./stock-view.ts";
-import { esc, displaySymbol } from "./model.ts";
+import { esc, displaySymbol, addSignalText } from "./model.ts";
 import type { Snapshot } from "./model.ts";
 import { directionMark } from "./direction-mark.ts";
 let activeRoot: HTMLElement | null = null,
@@ -22,7 +22,19 @@ export function minimalMarkup(s: Snapshot): string {
         return `<button type="button" class="minimal-stock ${d.direction}${d.basis === "book" ? " book" : ""}" data-mini-stock="${esc(c)}" aria-label="${esc(detailLabel(d))}"><span class="minimal-mark" data-piece="${s.settings.appearance}:${d.direction}" aria-hidden="true">${directionMark(d.direction, d.mark, s.settings.appearance)}</span><span class="minimal-name">${esc(label)}</span>${!s.settings.hideNames && s.settings.showCodes && d.name !== d.symbol ? `<span class="minimal-code">${esc(d.symbol)}</span>` : ""}</button>`;
       })
       .join(" ") || '<span class="minimal-empty">尚無自選</span>'
-  }</div>`;
+  }${minimalSignalMarkup(s)}</div>`;
+}
+/** The strip has no room for the scrolling marquee: the latest add signal
+ * rides as one static full-width line under the stocks, and only while a
+ * recent signal exists. Text content is the identity updateMinimal
+ * compares against, so keep the format in exactly one place. */
+export function minimalSignalText(s: Snapshot): string {
+  const latest = s.addSignals?.[0];
+  return latest ? `加碼訊號 ${addSignalText(latest)}` : "";
+}
+function minimalSignalMarkup(s: Snapshot): string {
+  const text = minimalSignalText(s);
+  return text ? `<span class="minimal-signal">${esc(text)}</span>` : "";
 }
 export function hideDetail() {
   sequence++;
@@ -135,7 +147,11 @@ export function updateMinimal(root: HTMLElement, s: Snapshot) {
     buttons.map((b) => b.dataset.miniStock).join("|") ===
       s.watchlist.join("|") &&
     list.dataset.codes === String(Boolean(s.settings.showCodes)) &&
-    list.dataset.names === String(Boolean(s.settings.hideNames));
+    list.dataset.names === String(Boolean(s.settings.hideNames)) &&
+    // A changed latest signal rebuilds with the list (it is rare, and the
+    // rebuild path below re-renders the signal line from the snapshot).
+    (list.querySelector(".minimal-signal")?.textContent ?? "") ===
+      minimalSignalText(s);
   if (!structure) {
     hideDetail();
     const wrapper = document.createElement("div");
